@@ -1,0 +1,46 @@
+[package]
+name = "xmtp_mesh"
+edition = "2024"
+license.workspace = true
+version.workspace = true
+description = "Serverless XMTP v3 node emulation, synced peer-to-peer (pyrechat)"
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+diesel = { workspace = true, features = ["sqlite"] }
+diesel_migrations = { workspace = true, features = ["sqlite"] }
+futures = { workspace = true, features = ["std"] }
+hex.workspace = true
+http = "1.2"
+libsqlite3-sys = { version = "0.35", features = ["bundled-sqlcipher-vendored-openssl"] }
+openmls = { workspace = true }
+openmls_rust_crypto = { workspace = true }
+parking_lot.workspace = true
+prost = { workspace = true, features = ["derive", "std"] }
+rand = { workspace = true }
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+tonic = { workspace = true }
+tracing.workspace = true
+xmtp-workspace-hack = { version = "0.1", path = "../xmtp-workspace-hack" }
+xmtp_api_grpc.workspace = true
+xmtp_common.workspace = true
+xmtp_configuration.workspace = true
+xmtp_id.workspace = true
+xmtp_mls.workspace = true
+xmtp_proto.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros", "time"] }
+xmtp_api_d14n = { workspace = true }
+xmtp_common = { workspace = true, features = ["test-utils"] }
+xmtp_cryptography.workspace = true
+xmtp_db = { workspace = true }
+xmtp_id = { workspace = true, features = ["test-utils"] }
+xmtp_mls = { workspace = true, features = ["test-utils"] }

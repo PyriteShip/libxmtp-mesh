@@ -1,0 +1,56 @@
+#![recursion_limit = "256"]
+mod common;
+
+use std::time::Duration;
+
+use bytes::Bytes;
+use common::build_client;
+use futures::StreamExt;
+use http::{request, uri::PathAndQuery};
+use prost::Message;
+use xmtp_mesh::MeshNode;
+use xmtp_mls::groups::send_message_opts::SendMessageOpts;
+use xmtp_proto::api::Client;
+use xmtp_proto::mls_v1::{GroupMessage, SubscribeGroupMessagesRequest, group_message, subscribe_group_messages_request::Filter};
+
+#[tokio::test(flavor = "multi_thread")]
+async fn group_stream_yields_backlog_then_live_without_duplicates() {
+    let node = MeshNode::in_memory().unwrap();
+    let client = build_client(&node).await;
+    let group = client.create_group(None, None).unwrap();
+    group.send_message(b"before", SendMessageOpts::default()).await.unwrap();
+
+    let body = SubscribeGroupMessagesRequest {
+        filters: vec![Filter { group_id: group.group_id.clone(), id_cursor: 0 }],
+    }
+    .encode_to_vec();
+    let mut stream = node
+        .stream(
+            request::Builder::new(),
+            PathAndQuery::from_static("/xmtp.mls.api.v1.MlsApi/SubscribeGroupMessages"),
+            Bytes::from(body),
+        )
+        .await
+        .unwrap()
+        .into_body();
+
+    group.send_message(b"after", SendMessageOpts::default()).await.unwrap();
+    let total = node.max_group_id_for_test(&group.group_id).unwrap() as u64;
+
+    let mut ids = vec![];
+    while (ids.len() as u64) < total {
+        let item = tokio::time::timeout(Duration::from_secs(10), stream.next())
+            .await
+            .expect("stream stalled")
+            .unwrap()
+            .unwrap();
+        let Some(group_message::Version::V1(v1)) = GroupMessage::decode(item).unwrap().version else {
+            panic!("expected V1");
+        };
+        ids.push(v1.id);
+    }
+    // every sequenced message exactly once, in order: backlog then live
+    assert_eq!(ids, (1..=total).collect::<Vec<_>>());
+    // and nothing further arrives
+    assert!(tokio::time::timeout(Duration::from_millis(300), stream.next()).await.is_err());
+}
