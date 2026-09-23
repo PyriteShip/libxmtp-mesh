@@ -11,9 +11,19 @@ async fn capture_creation_commit() {
     let client = common::build_client(&node).await;
     let group = client.create_group(None, None).unwrap();
     group
-        .send_message(b"x", xmtp_mls::groups::send_message_opts::SendMessageOpts::default())
+        .send_message(
+            b"x",
+            xmtp_mls::groups::send_message_opts::SendMessageOpts::default(),
+        )
         .await
         .unwrap();
     let data = node.first_sequenced_data_for_test(&group.group_id).unwrap();
-    std::fs::write(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/creation_commit.bin"), data).unwrap();
+    std::fs::write(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/creation_commit.bin"
+        ),
+        data,
+    )
+    .unwrap();
 }

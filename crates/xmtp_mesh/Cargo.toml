@@ -8,6 +8,10 @@ description = "Serverless XMTP v3 node emulation, synced peer-to-peer (pyrechat)
 [lints]
 workspace = true
 
+[features]
+# Test-only hooks (`*_for_test`, `LoopbackHub::inject`); never enable in production.
+test-utils = []
+
 [dependencies]
 alloy.workspace = true
 async-trait.workspace = true
@@ -37,6 +41,8 @@ xmtp_mls.workspace = true
 xmtp_proto.workspace = true
 
 [dev-dependencies]
+# The integration tests use the crate's test-only hooks.
+xmtp_mesh = { path = ".", features = ["test-utils"] }
 tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros", "time"] }
 xmtp_api_d14n = { workspace = true }
 xmtp_common = { workspace = true, features = ["test-utils"] }

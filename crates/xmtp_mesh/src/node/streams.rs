@@ -34,7 +34,8 @@ impl GroupSub {
                 let page_len = page.len() as i64;
                 for row in page {
                     *cursor = row.id;
-                    self.ready.push_back(Bytes::from(row.to_proto().encode_to_vec()));
+                    self.ready
+                        .push_back(Bytes::from(row.to_proto().encode_to_vec()));
                 }
                 if page_len < BACKLOG_PAGE {
                     break;
@@ -63,7 +64,8 @@ impl WelcomeSub {
                 let page_len = page.len() as i64;
                 for row in page {
                     *cursor = row.id;
-                    self.ready.push_back(Bytes::from(welcome_to_proto(&row)?.encode_to_vec()));
+                    self.ready
+                        .push_back(Bytes::from(welcome_to_proto(&row)?.encode_to_vec()));
                 }
                 if page_len < BACKLOG_PAGE {
                     break;
@@ -75,7 +77,10 @@ impl WelcomeSub {
 }
 
 impl MeshNode {
-    pub(crate) fn subscribe_group_messages(&self, req: SubscribeGroupMessagesRequest) -> Result<MeshStream, MeshError> {
+    pub(crate) fn subscribe_group_messages(
+        &self,
+        req: SubscribeGroupMessagesRequest,
+    ) -> Result<MeshStream, MeshError> {
         // Subscribe before reading the backlog so nothing falls in between.
         let rx = self.subscribe_events();
         let mut newly_known = Vec::new();
@@ -98,7 +103,11 @@ impl MeshNode {
         let mut sub = GroupSub {
             node: self.clone(),
             rx,
-            cursors: req.filters.into_iter().map(|f| (f.group_id, f.id_cursor as i64)).collect(),
+            cursors: req
+                .filters
+                .into_iter()
+                .map(|f| (f.group_id, f.id_cursor as i64))
+                .collect(),
             ready: VecDeque::new(),
         };
         sub.refill()?;
@@ -112,7 +121,8 @@ impl MeshNode {
                         if let Some(cursor) = sub.cursors.get_mut(&row.group_id) {
                             if row.id == *cursor + 1 {
                                 *cursor = row.id;
-                                sub.ready.push_back(Bytes::from(row.to_proto().encode_to_vec()));
+                                sub.ready
+                                    .push_back(Bytes::from(row.to_proto().encode_to_vec()));
                             } else if row.id > *cursor + 1 {
                                 // out-of-order event: read the gap from the store
                                 if sub.refill().is_err() {
@@ -134,7 +144,10 @@ impl MeshNode {
         .boxed())
     }
 
-    pub(crate) fn subscribe_welcome_messages(&self, req: SubscribeWelcomeMessagesRequest) -> Result<MeshStream, MeshError> {
+    pub(crate) fn subscribe_welcome_messages(
+        &self,
+        req: SubscribeWelcomeMessagesRequest,
+    ) -> Result<MeshStream, MeshError> {
         let rx = self.subscribe_events();
         let mut sub = WelcomeSub {
             node: self.clone(),
@@ -205,7 +218,10 @@ mod tests {
         assert_eq!(node.max_group_id_for_test(&group_id).unwrap(), total);
 
         let req = SubscribeGroupMessagesRequest {
-            filters: vec![subscribe_group_messages_request::Filter { group_id: group_id.clone(), id_cursor: 0 }],
+            filters: vec![subscribe_group_messages_request::Filter {
+                group_id: group_id.clone(),
+                id_cursor: 0,
+            }],
         };
         let mut stream = node.subscribe_group_messages(req).unwrap();
 
@@ -216,13 +232,22 @@ mod tests {
                 .expect("stream stalled")
                 .unwrap()
                 .unwrap();
-            let Some(group_message::Version::V1(v1)) = GroupMessage::decode(item).unwrap().version else {
+            let Some(group_message::Version::V1(v1)) = GroupMessage::decode(item).unwrap().version
+            else {
                 panic!("expected V1");
             };
             ids.push(v1.id as i64);
         }
-        assert_eq!(ids, (1..=total).collect::<Vec<_>>(), "every backlog row exactly once, in order");
+        assert_eq!(
+            ids,
+            (1..=total).collect::<Vec<_>>(),
+            "every backlog row exactly once, in order"
+        );
         // nothing further arrives: the whole backlog (both pages) was drained, not just page 1
-        assert!(tokio::time::timeout(Duration::from_millis(300), stream.next()).await.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), stream.next())
+                .await
+                .is_err()
+        );
     }
 }

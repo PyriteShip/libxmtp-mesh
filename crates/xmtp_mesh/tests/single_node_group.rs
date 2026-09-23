@@ -21,12 +21,24 @@ async fn creator_self_sequences_and_messages_publish() {
     let node = MeshNode::in_memory().unwrap();
     let client = build_client(&node).await;
     let group = client.create_group(None, None).unwrap();
-    group.send_message(b"hello", SendMessageOpts::default()).await.unwrap();
-    group.send_message(b"again", SendMessageOpts::default()).await.unwrap();
+    group
+        .send_message(b"hello", SendMessageOpts::default())
+        .await
+        .unwrap();
+    group
+        .send_message(b"again", SendMessageOpts::default())
+        .await
+        .unwrap();
 
-    assert_eq!(app_payloads(&group), vec![b"hello".to_vec(), b"again".to_vec()]);
+    assert_eq!(
+        app_payloads(&group),
+        vec![b"hello".to_vec(), b"again".to_vec()]
+    );
     let all = group.find_messages(&MsgQueryArgs::default()).unwrap();
-    assert!(all.iter().all(|m| m.delivery_status == DeliveryStatus::Published));
+    assert!(
+        all.iter()
+            .all(|m| m.delivery_status == DeliveryStatus::Published)
+    );
     assert_eq!(
         node.group_sequencer_for_test(&group.group_id).unwrap(),
         Some(client.installation_public_key().to_vec())
@@ -39,7 +51,10 @@ async fn query_group_messages_pages_like_v3() {
     let client = build_client(&node).await;
     let group = client.create_group(None, None).unwrap();
     for i in 0..3u8 {
-        group.send_message(&[i], SendMessageOpts::default()).await.unwrap();
+        group
+            .send_message(&[i], SendMessageOpts::default())
+            .await
+            .unwrap();
     }
     let query = |cursor: u64, limit: u32, direction: SortDirection| {
         let node = node.clone();
@@ -47,7 +62,11 @@ async fn query_group_messages_pages_like_v3() {
         async move {
             let body = QueryGroupMessagesRequest {
                 group_id: gid,
-                paging_info: Some(PagingInfo { direction: direction as i32, limit, id_cursor: cursor }),
+                paging_info: Some(PagingInfo {
+                    direction: direction as i32,
+                    limit,
+                    id_cursor: cursor,
+                }),
             }
             .encode_to_vec();
             let resp = node
@@ -66,12 +85,18 @@ async fn query_group_messages_pages_like_v3() {
     assert!(total >= 3);
     let all = query(0, 100, SortDirection::Ascending).await;
     assert_eq!(all.messages.len(), total);
-    assert_eq!(all.paging_info.unwrap().id_cursor, 0, "short page ends paging");
+    assert_eq!(
+        all.paging_info.unwrap().id_cursor,
+        0,
+        "short page ends paging"
+    );
     let page = query(0, 2, SortDirection::Ascending).await;
     assert_eq!(page.messages.len(), 2);
     assert_eq!(page.paging_info.unwrap().id_cursor, 2);
     let newest = query(0, 1, SortDirection::Descending).await;
-    let Some(xmtp_proto::mls_v1::group_message::Version::V1(v1)) = newest.messages[0].version.clone() else {
+    let Some(xmtp_proto::mls_v1::group_message::Version::V1(v1)) =
+        newest.messages[0].version.clone()
+    else {
         panic!("expected V1");
     };
     assert_eq!(v1.id as usize, total);
@@ -96,11 +121,18 @@ async fn send_group_messages_emits_events_for_earlier_items_when_a_later_item_er
     let other_node = MeshNode::in_memory().unwrap();
     let other_client = build_client(&other_node).await;
     let other_group = other_client.create_group(None, None).unwrap();
-    other_group.send_message(b"seed", SendMessageOpts::default()).await.unwrap();
+    other_group
+        .send_message(b"seed", SendMessageOpts::default())
+        .await
+        .unwrap();
 
     let query_body = QueryGroupMessagesRequest {
         group_id: other_group.group_id.clone(),
-        paging_info: Some(PagingInfo { direction: SortDirection::Ascending as i32, limit: 100, id_cursor: 0 }),
+        paging_info: Some(PagingInfo {
+            direction: SortDirection::Ascending as i32,
+            limit: 100,
+            id_cursor: 0,
+        }),
     }
     .encode_to_vec();
     let resp = other_node
@@ -111,8 +143,11 @@ async fn send_group_messages_emits_events_for_earlier_items_when_a_later_item_er
         )
         .await
         .unwrap();
-    let messages = QueryGroupMessagesResponse::decode(resp.into_body()).unwrap().messages;
-    let Some(xmtp_proto::mls_v1::group_message::Version::V1(valid)) = messages[0].version.clone() else {
+    let messages = QueryGroupMessagesResponse::decode(resp.into_body())
+        .unwrap()
+        .messages;
+    let Some(xmtp_proto::mls_v1::group_message::Version::V1(valid)) = messages[0].version.clone()
+    else {
         panic!("expected V1");
     };
 
@@ -145,13 +180,17 @@ async fn send_group_messages_emits_events_for_earlier_items_when_a_later_item_er
             Bytes::from(batch),
         )
         .await;
-    assert!(result.is_err(), "a batch with a garbage second message must error");
+    assert!(
+        result.is_err(),
+        "a batch with a garbage second message must error"
+    );
 
     // The first item (valid, epoch 0) must still have been self-sequenced
     // and its event emitted, even though the whole call errored.
     let mut saw_processed_event = false;
     for _ in 0..2 {
-        let Ok(Ok(event)) = tokio::time::timeout(Duration::from_secs(5), events.recv()).await else {
+        let Ok(Ok(event)) = tokio::time::timeout(Duration::from_secs(5), events.recv()).await
+        else {
             break;
         };
         match event {

@@ -108,14 +108,14 @@ impl MeshNode {
             }
 
             let next_seq = current_count + 1;
-            if let Some(caller_expected_seq) = expected_seq {
-                if caller_expected_seq != next_seq {
-                    return Err(MeshError::IdentityConflict {
-                        inbox_id,
-                        expected: next_seq,
-                        got: caller_expected_seq,
-                    });
-                }
+            if let Some(caller_expected_seq) = expected_seq
+                && caller_expected_seq != next_seq
+            {
+                return Err(MeshError::IdentityConflict {
+                    inbox_id,
+                    expected: next_seq,
+                    got: caller_expected_seq,
+                });
             }
             store.append_identity(
                 &inbox_id,

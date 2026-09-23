@@ -17,18 +17,24 @@ async fn client_registers_against_mesh_node() {
     let client = build_client(&node).await;
     let installation = client.installation_public_key().to_vec();
 
-    assert_eq!(node.local_installation().unwrap(), Some(installation.clone()));
-    assert_eq!(node.local_inbox().unwrap(), Some(client.inbox_id().to_string()));
+    assert_eq!(
+        node.local_installation().unwrap(),
+        Some(installation.clone())
+    );
+    assert_eq!(
+        node.local_inbox().unwrap(),
+        Some(client.inbox_id().to_string())
+    );
     assert!(node.has_key_package(&installation).unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn node_resolves_its_own_address_and_rejects_unknown_key_packages() {
     use prost::Message;
+    use xmtp_proto::mls_v1::FetchKeyPackagesRequest;
     use xmtp_proto::xmtp::identity::api::v1::{
         GetInboxIdsRequest, GetInboxIdsResponse, get_inbox_ids_request,
     };
-    use xmtp_proto::mls_v1::FetchKeyPackagesRequest;
 
     let node = MeshNode::in_memory().unwrap();
     let client = build_client(&node).await;
@@ -55,10 +61,16 @@ async fn node_resolves_its_own_address_and_rejects_unknown_key_packages() {
         .await
         .unwrap();
     let resp = GetInboxIdsResponse::decode(resp.into_body()).unwrap();
-    assert_eq!(resp.responses[0].inbox_id, Some(client.inbox_id().to_string()));
+    assert_eq!(
+        resp.responses[0].inbox_id,
+        Some(client.inbox_id().to_string())
+    );
 
     // A single node serves exactly one installation; strangers have no key package.
-    let body = FetchKeyPackagesRequest { installation_keys: vec![vec![0u8; 32]] }.encode_to_vec();
+    let body = FetchKeyPackagesRequest {
+        installation_keys: vec![vec![0u8; 32]],
+    }
+    .encode_to_vec();
     let err = node
         .request(
             request::Builder::new(),
@@ -119,7 +131,10 @@ async fn second_installations_key_package_is_rejected_and_not_stored() {
         )
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("exactly one local installation"), "{err}");
+    assert!(
+        err.to_string().contains("exactly one local installation"),
+        "{err}"
+    );
     assert!(!node.has_key_package(&other_installation).unwrap());
 }
 
@@ -134,5 +149,8 @@ async fn garbage_identity_update_is_rejected() {
         )
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("rejected") || err.to_string().contains("invalid"), "{err}");
+    assert!(
+        err.to_string().contains("rejected") || err.to_string().contains("invalid"),
+        "{err}"
+    );
 }

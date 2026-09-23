@@ -17,13 +17,19 @@ pub enum MeshError {
     /// id the caller claimed (or, after repeated concurrent appends, the id its
     /// stale snapshot implied).
     #[error("identity log conflict for {inbox_id}: expected {expected}, got {got}")]
-    IdentityConflict { inbox_id: String, expected: i64, got: i64 },
+    IdentityConflict {
+        inbox_id: String,
+        expected: i64,
+        got: i64,
+    },
     #[error("not found: {0}")]
     NotFound(String),
     #[error("node has no local installation yet")]
     NotRegistered,
     #[error("sync not started")]
     SyncNotStarted,
+    #[error("start_sync must be called from within a tokio runtime")]
+    NoRuntime,
     #[error("peer authentication failed: {0}")]
     AuthFailed(String),
     #[error("peer installation is not a member of the inbox it claims")]
@@ -36,6 +42,9 @@ pub enum MeshError {
     Connection(#[from] diesel::ConnectionError),
     #[error("migration: {0}")]
     Migration(String),
+    /// The local client could not report a group's members.
+    #[error("group membership: {0}")]
+    Membership(String),
 }
 
 impl MeshError {
@@ -52,12 +61,10 @@ impl MeshError {
             | MeshError::IdentityRejected(_)
             | MeshError::Decode(_) => Status::invalid_argument(msg),
             MeshError::IdentityConflict { .. } => Status::aborted(msg),
-            MeshError::NotRegistered | MeshError::SyncNotStarted => {
+            MeshError::NotRegistered | MeshError::SyncNotStarted | MeshError::NoRuntime => {
                 Status::failed_precondition(msg)
             }
-            MeshError::AuthFailed(_) | MeshError::PeerNotMember => {
-                Status::permission_denied(msg)
-            }
+            MeshError::AuthFailed(_) | MeshError::PeerNotMember => Status::permission_denied(msg),
             _ => Status::internal(msg),
         }
     }

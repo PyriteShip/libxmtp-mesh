@@ -24,7 +24,7 @@ use xmtp_proto::api::{ApiClientError, Client, IsConnectedCheck};
 
 use crate::MeshError;
 use crate::store::{MeshStore, StoredGroupMessage, StoredWelcome};
-use crate::sync::{HelloSigner, MeshTransport, PeerId, session};
+use crate::sync::{GroupMembership, HelloSigner, MeshTransport, PeerId, session};
 
 pub type MeshStream = Pin<Box<dyn Stream<Item = Result<Bytes, GrpcError>> + Send>>;
 
@@ -40,8 +40,11 @@ pub(crate) struct NodeInner {
     pub(crate) sync: Mutex<Option<SyncConfig>>,
     pub(crate) sessions: Mutex<HashMap<PeerId, session::SessionHandle>>,
     pub(crate) authenticated: Mutex<HashSet<PeerId>>,
+    pub(crate) verified: Mutex<HashMap<PeerId, VerifiedPeer>>,
     /// How long an authenticated peer has to prove inbox membership.
     pub(crate) peer_verify_timeout: Mutex<Duration>,
+    /// How long a session has to complete Hello/Auth.
+    pub(crate) handshake_timeout: Mutex<Duration>,
     /// Test only: never send our identity log to peers.
     pub(crate) suppress_identity_log: AtomicBool,
     /// Test only: sessions drop live GroupSequenced pushes (simulates a lagged stream).
@@ -51,14 +54,57 @@ pub(crate) struct NodeInner {
 /// Default time an authenticated peer has to prove inbox membership.
 pub(crate) const PEER_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Default time a session has to authenticate its peer (Hello/Auth) before
+/// the node disconnects it. Bounds sessions created by stray frames and
+/// devices that never speak the protocol.
+pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub(crate) struct SyncConfig {
     pub(crate) signer: Arc<dyn HelloSigner>,
     pub(crate) transport: Arc<dyn MeshTransport>,
+    /// Group members per the local client: scopes all group traffic.
+    pub(crate) membership: Arc<dyn GroupMembership>,
+    /// Sessions and their timers run here, so the transport may call
+    /// `on_peer_connected` / `on_frame` / `on_peer_lost` from any thread.
+    pub(crate) runtime: tokio::runtime::Handle,
+}
+
+impl SyncConfig {
+    fn spawn_session(&self, node: &MeshNode, peer: &str) -> session::SessionHandle {
+        session::spawn(
+            &self.runtime,
+            node.clone(),
+            peer.to_string(),
+            self.transport.clone(),
+            self.signer.clone(),
+            self.membership.clone(),
+        )
+    }
+}
+
+/// A connected peer whose installation proved membership of the inbox it
+/// claims (presence, for the UI's "nearby").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedPeer {
+    pub peer: PeerId,
+    pub inbox_id: String,
+    pub installation: Vec<u8>,
 }
 
 /// Something changed in the node; sync sessions and subscriptions listen.
 #[derive(Clone, Debug)]
 pub enum NodeEvent {
+    /// A peer's session verified it (see [`VerifiedPeer`]).
+    PeerVerified {
+        peer: PeerId,
+        inbox_id: String,
+        installation: Vec<u8>,
+    },
+    /// A peer reported by `PeerVerified` is gone (link lost, session
+    /// replaced or ended, or sync stopped).
+    PeerLost {
+        peer: PeerId,
+    },
     LocalIdentityChanged,
     LocalKeyPackageChanged,
     GroupSequenced(StoredGroupMessage),
@@ -78,7 +124,9 @@ impl MeshNode {
                 sync: Mutex::new(None),
                 sessions: Default::default(),
                 authenticated: Default::default(),
+                verified: Default::default(),
                 peer_verify_timeout: Mutex::new(PEER_VERIFY_TIMEOUT),
+                handshake_timeout: Mutex::new(HANDSHAKE_TIMEOUT),
                 suppress_identity_log: AtomicBool::new(false),
                 suppress_group_push: AtomicBool::new(false),
             }),
@@ -90,6 +138,10 @@ impl MeshNode {
     }
 
     /// Open a persistent node. `key` is the SQLCipher key (recommended on device).
+    ///
+    /// The mesh database is bound to one installation for life: the first
+    /// key package uploaded fixes the node's local installation. On logout or
+    /// reset, delete and recreate it together with the libxmtp database.
     pub fn open(path: &str, key: Option<[u8; 32]>) -> Result<Self, MeshError> {
         Ok(Self::new(MeshStore::open(Some(path), key)?))
     }
@@ -165,7 +217,11 @@ impl MeshNode {
         Err(MeshError::Unimplemented(path.to_string()))
     }
 
-    pub(crate) async fn route_stream(&self, path: &str, body: Bytes) -> Result<MeshStream, MeshError> {
+    pub(crate) async fn route_stream(
+        &self,
+        path: &str,
+        body: Bytes,
+    ) -> Result<MeshStream, MeshError> {
         use xmtp_proto::mls_v1 as mls;
         if paths::is::<mls::SubscribeGroupMessagesRequest>(path) {
             return self.subscribe_group_messages(decode(body)?);
@@ -178,13 +234,34 @@ impl MeshNode {
 }
 
 impl MeshNode {
-    /// Begin syncing. The signer's installation must be this node's local one.
-    pub fn start_sync(&self, signer: Arc<dyn HelloSigner>, transport: Arc<dyn MeshTransport>) -> Result<(), MeshError> {
+    /// Begin syncing. The signer's installation must be this node's local one,
+    /// and `membership` must report group members as that installation's
+    /// libxmtp client sees them (production: [`crate::ClientGroupMembership`]
+    /// over the same client as [`crate::ClientHelloSigner`]).
+    ///
+    /// Must be called from within a tokio runtime: the node captures that
+    /// runtime's handle and runs every sync session on it, so the transport
+    /// callbacks (`on_peer_connected`, `on_frame`, `on_peer_lost`) may then be
+    /// called from any thread.
+    pub fn start_sync(
+        &self,
+        signer: Arc<dyn HelloSigner>,
+        transport: Arc<dyn MeshTransport>,
+        membership: Arc<dyn GroupMembership>,
+    ) -> Result<(), MeshError> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|_| MeshError::NoRuntime)?;
         let local = self.local_installation()?.ok_or(MeshError::NotRegistered)?;
         if local != signer.installation_key() {
-            return Err(MeshError::InvalidRequest("signer is not this node's installation".into()));
+            return Err(MeshError::InvalidRequest(
+                "signer is not this node's installation".into(),
+            ));
         }
-        *self.inner.sync.lock() = Some(SyncConfig { signer, transport });
+        *self.inner.sync.lock() = Some(SyncConfig {
+            signer,
+            transport,
+            membership,
+            runtime,
+        });
         Ok(())
     }
 
@@ -192,15 +269,26 @@ impl MeshNode {
         let sync = self.inner.sync.lock();
         let config = sync.as_ref()?;
         let mut sessions = self.inner.sessions.lock();
-        let handle = sessions.entry(peer.to_string()).or_insert_with(|| {
-            session::spawn(self.clone(), peer.to_string(), config.transport.clone(), config.signer.clone())
-        });
+        let handle = sessions
+            .entry(peer.to_string())
+            .or_insert_with(|| config.spawn_session(self, peer));
         Some(handle.tx.clone())
     }
 
-    /// The radio connected to `peer`. Frames also create the session implicitly.
+    /// The radio connected a new pipe `peer` (see [`MeshTransport`]): start a
+    /// fresh session, replacing (and cancelling) any session held for `peer`,
+    /// e.g. one a stray frame created. Frames also create a session implicitly
+    /// when they arrive before this call.
     pub fn on_peer_connected(&self, peer: &str) {
-        let _ = self.session_for(peer);
+        let sync = self.inner.sync.lock();
+        let Some(config) = sync.as_ref() else { return };
+        let handle = config.spawn_session(self, peer);
+        let mut sessions = self.inner.sessions.lock();
+        let old = sessions.insert(peer.to_string(), handle);
+        self.forget_peer(peer);
+        drop(sessions);
+        drop(sync);
+        drop(old); // cancels the replaced session
     }
 
     pub fn on_frame(&self, peer: &str, frame: Vec<u8>) {
@@ -211,8 +299,26 @@ impl MeshNode {
 
     pub fn on_peer_lost(&self, peer: &str) {
         let mut sessions = self.inner.sessions.lock();
-        sessions.remove(peer); // dropping the sender ends the session
-        self.inner.authenticated.lock().remove(peer);
+        let old = sessions.remove(peer); // dropping the handle ends the session
+        self.forget_peer(peer);
+        drop(sessions);
+        drop(old);
+    }
+
+    /// Stop syncing: cancel every session and forget the signer and
+    /// transport. Frames and connections reported afterwards are ignored
+    /// until the next `start_sync` (which may use a new transport).
+    pub fn stop_sync(&self) {
+        let mut sync = self.inner.sync.lock();
+        *sync = None;
+        let mut sessions = self.inner.sessions.lock();
+        let old: Vec<_> = sessions.drain().collect();
+        for (peer, _) in &old {
+            self.forget_peer(peer);
+        }
+        drop(sessions);
+        drop(sync);
+        drop(old);
     }
 
     pub fn authenticated_peers(&self) -> Vec<PeerId> {
@@ -221,9 +327,28 @@ impl MeshNode {
         peers
     }
 
+    /// Connected peers that proved inbox membership, sorted by `PeerId`.
+    pub fn verified_peers(&self) -> Vec<VerifiedPeer> {
+        let mut peers: Vec<_> = self.inner.verified.lock().values().cloned().collect();
+        peers.sort_by(|a, b| a.peer.cmp(&b.peer));
+        peers
+    }
+
+    /// Clear `peer`'s authentication and presence, emitting `PeerLost` if it
+    /// was verified. Callers hold `sessions`.
+    fn forget_peer(&self, peer: &str) {
+        self.inner.authenticated.lock().remove(peer);
+        if self.inner.verified.lock().remove(peer).is_some() {
+            self.emit(vec![NodeEvent::PeerLost {
+                peer: peer.to_string(),
+            }]);
+        }
+    }
+
     /// A session task may outlive its registry entry (its receiver still drains
     /// buffered frames after `on_peer_lost`), so only the peer's current session
-    /// may change its state. Lock order: `sessions`, then `authenticated`.
+    /// may change its state. Lock order: `sessions`, then `authenticated`,
+    /// then `verified`.
     pub(crate) fn session_authenticated(&self, peer: &str, session_id: u64) {
         let sessions = self.inner.sessions.lock();
         if sessions.get(peer).is_some_and(|h| h.id == session_id) {
@@ -231,11 +356,44 @@ impl MeshNode {
         }
     }
 
+    pub(crate) fn session_verified(
+        &self,
+        peer: &str,
+        session_id: u64,
+        inbox_id: String,
+        installation: Vec<u8>,
+    ) {
+        let sessions = self.inner.sessions.lock();
+        if sessions.get(peer).is_some_and(|h| h.id == session_id) {
+            let verified = VerifiedPeer {
+                peer: peer.to_string(),
+                inbox_id,
+                installation,
+            };
+            self.inner
+                .verified
+                .lock()
+                .insert(peer.to_string(), verified.clone());
+            let VerifiedPeer {
+                peer,
+                inbox_id,
+                installation,
+            } = verified;
+            self.emit(vec![NodeEvent::PeerVerified {
+                peer,
+                inbox_id,
+                installation,
+            }]);
+        }
+    }
+
     pub(crate) fn session_ended(&self, peer: &str, session_id: u64) {
         let mut sessions = self.inner.sessions.lock();
         if sessions.get(peer).is_some_and(|h| h.id == session_id) {
-            sessions.remove(peer);
-            self.inner.authenticated.lock().remove(peer);
+            let old = sessions.remove(peer);
+            self.forget_peer(peer);
+            drop(sessions);
+            drop(old);
         }
     }
 }

@@ -1,4 +1,4 @@
-use diesel::connection::SimpleConnection;
+use diesel::connection::{SimpleConnection, TransactionManager};
 use diesel::prelude::*;
 use diesel::sql_query;
 use diesel::sql_types::{BigInt, Binary, Bool, Integer, Text};
@@ -121,8 +121,10 @@ struct OutboundRow {
     input: Vec<u8>,
 }
 
-const GROUP_COLUMNS: &str =
-    "group_id, id, created_ns, data, sender_hmac, should_push, is_commit";
+const GROUP_COLUMNS: &str = "group_id, id, created_ns, data, sender_hmac, should_push, is_commit";
+
+/// (envelope_hash, input) pairs for outbound welcomes awaiting delivery.
+type OutboundWelcomePairs = Vec<(Vec<u8>, Vec<u8>)>;
 
 pub struct MeshStore {
     conn: SqliteConnection,
@@ -143,6 +145,41 @@ impl MeshStore {
 
     pub fn open_in_memory() -> Result<Self, MeshError> {
         Self::open(None, None)
+    }
+
+    /// Run `f` atomically: every statement commits together, or none does
+    /// when `f` fails or panics (the panic then continues). Nests (inner
+    /// calls become savepoints).
+    pub fn transaction<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, MeshError>,
+    ) -> Result<T, MeshError> {
+        type Tm = <SqliteConnection as Connection>::TransactionManager;
+        Tm::begin_transaction(&mut self.conn)?;
+        // The store sits behind a non-poisoning mutex, so a panic must not
+        // leave this transaction open for the next caller.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
+        match outcome {
+            Ok(Ok(value)) => {
+                Tm::commit_transaction(&mut self.conn)?;
+                Ok(value)
+            }
+            Ok(Err(e)) => {
+                self.rollback();
+                Err(e)
+            }
+            Err(panic) => {
+                self.rollback();
+                std::panic::resume_unwind(panic)
+            }
+        }
+    }
+
+    fn rollback(&mut self) {
+        type Tm = <SqliteConnection as Connection>::TransactionManager;
+        if let Err(rollback) = Tm::rollback_transaction(&mut self.conn) {
+            tracing::error!(error = %rollback, "mesh store rollback failed");
+        }
     }
 
     // ---- meta ----
@@ -182,7 +219,11 @@ impl MeshStore {
 
     // ---- identity ----
 
-    pub fn identity_rows(&mut self, inbox_id: &str, after: i64) -> Result<Vec<IdentityRow>, MeshError> {
+    pub fn identity_rows(
+        &mut self,
+        inbox_id: &str,
+        after: i64,
+    ) -> Result<Vec<IdentityRow>, MeshError> {
         Ok(sql_query(
             "SELECT sequence_id, server_timestamp_ns, update_bytes FROM identity_updates \
              WHERE inbox_id = ? AND sequence_id > ? ORDER BY sequence_id ASC",
@@ -208,24 +249,31 @@ impl MeshStore {
         server_timestamp_ns: i64,
         update_bytes: &[u8],
     ) -> Result<(), MeshError> {
-        let expected = self.identity_len(inbox_id)? + 1;
-        if sequence_id != expected {
-            return Err(MeshError::IdentityConflict {
-                inbox_id: inbox_id.to_string(),
-                expected,
-                got: sequence_id,
-            });
-        }
-        sql_query("INSERT INTO identity_updates (inbox_id, sequence_id, server_timestamp_ns, update_bytes) VALUES (?, ?, ?, ?)")
-            .bind::<Text, _>(inbox_id)
-            .bind::<BigInt, _>(sequence_id)
-            .bind::<BigInt, _>(server_timestamp_ns)
-            .bind::<Binary, _>(update_bytes)
-            .execute(&mut self.conn)?;
-        Ok(())
+        self.transaction(|s| {
+            let expected = s.identity_len(inbox_id)? + 1;
+            if sequence_id != expected {
+                return Err(MeshError::IdentityConflict {
+                    inbox_id: inbox_id.to_string(),
+                    expected,
+                    got: sequence_id,
+                });
+            }
+            sql_query("INSERT INTO identity_updates (inbox_id, sequence_id, server_timestamp_ns, update_bytes) VALUES (?, ?, ?, ?)")
+                .bind::<Text, _>(inbox_id)
+                .bind::<BigInt, _>(sequence_id)
+                .bind::<BigInt, _>(server_timestamp_ns)
+                .bind::<Binary, _>(update_bytes)
+                .execute(&mut s.conn)?;
+            Ok(())
+        })
     }
 
-    pub fn set_identifier(&mut self, identifier: &str, kind: i32, inbox_id: &str) -> Result<(), MeshError> {
+    pub fn set_identifier(
+        &mut self,
+        identifier: &str,
+        kind: i32,
+        inbox_id: &str,
+    ) -> Result<(), MeshError> {
         sql_query("INSERT INTO inbox_identifiers (identifier, identifier_kind, inbox_id) VALUES (?, ?, ?) \
                    ON CONFLICT(identifier, identifier_kind) DO UPDATE SET inbox_id = excluded.inbox_id")
             .bind::<Text, _>(identifier)
@@ -235,7 +283,11 @@ impl MeshStore {
         Ok(())
     }
 
-    pub fn inbox_for_identifier(&mut self, identifier: &str, kind: i32) -> Result<Option<String>, MeshError> {
+    pub fn inbox_for_identifier(
+        &mut self,
+        identifier: &str,
+        kind: i32,
+    ) -> Result<Option<String>, MeshError> {
         let rows: Vec<TextRow> = sql_query(
             "SELECT inbox_id AS v FROM inbox_identifiers WHERE identifier = ? AND identifier_kind = ?",
         )
@@ -247,12 +299,18 @@ impl MeshStore {
 
     // ---- key packages ----
 
-    pub fn put_key_package(&mut self, installation: &[u8], key_package: &[u8]) -> Result<(), MeshError> {
-        sql_query("INSERT INTO key_packages (installation_key, key_package) VALUES (?, ?) \
-                   ON CONFLICT(installation_key) DO UPDATE SET key_package = excluded.key_package")
-            .bind::<Binary, _>(installation)
-            .bind::<Binary, _>(key_package)
-            .execute(&mut self.conn)?;
+    pub fn put_key_package(
+        &mut self,
+        installation: &[u8],
+        key_package: &[u8],
+    ) -> Result<(), MeshError> {
+        sql_query(
+            "INSERT INTO key_packages (installation_key, key_package) VALUES (?, ?) \
+                   ON CONFLICT(installation_key) DO UPDATE SET key_package = excluded.key_package",
+        )
+        .bind::<Binary, _>(installation)
+        .bind::<Binary, _>(key_package)
+        .execute(&mut self.conn)?;
         Ok(())
     }
 
@@ -282,25 +340,32 @@ impl MeshStore {
     }
 
     pub fn sequencer(&mut self, group_id: &[u8]) -> Result<Option<Vec<u8>>, MeshError> {
-        let rows: Vec<OptBlobRow> = sql_query("SELECT sequencer AS v FROM groups WHERE group_id = ?")
-            .bind::<Binary, _>(group_id)
-            .load(&mut self.conn)?;
+        let rows: Vec<OptBlobRow> =
+            sql_query("SELECT sequencer AS v FROM groups WHERE group_id = ?")
+                .bind::<Binary, _>(group_id)
+                .load(&mut self.conn)?;
         Ok(rows.into_iter().next().and_then(|r| r.v))
     }
 
     /// Trust-on-first-use: sets the sequencer only if none is set yet.
-    pub fn pin_sequencer(&mut self, group_id: &[u8], installation: &[u8]) -> Result<Vec<u8>, MeshError> {
-        self.ensure_group(group_id)?;
-        sql_query("UPDATE groups SET sequencer = ? WHERE group_id = ? AND sequencer IS NULL")
-            .bind::<Binary, _>(installation)
-            .bind::<Binary, _>(group_id)
-            .execute(&mut self.conn)?;
-        Ok(self.sequencer(group_id)?.expect("sequencer was just pinned"))
+    pub fn pin_sequencer(
+        &mut self,
+        group_id: &[u8],
+        installation: &[u8],
+    ) -> Result<Vec<u8>, MeshError> {
+        self.transaction(|s| {
+            s.ensure_group(group_id)?;
+            sql_query("UPDATE groups SET sequencer = ? WHERE group_id = ? AND sequencer IS NULL")
+                .bind::<Binary, _>(installation)
+                .bind::<Binary, _>(group_id)
+                .execute(&mut s.conn)?;
+            Ok(s.sequencer(group_id)?.expect("sequencer was just pinned"))
+        })
     }
 
     pub fn known_groups(&mut self) -> Result<Vec<Vec<u8>>, MeshError> {
-        let rows: Vec<BlobRow> = sql_query("SELECT group_id AS v FROM groups ORDER BY group_id")
-            .load(&mut self.conn)?;
+        let rows: Vec<BlobRow> =
+            sql_query("SELECT group_id AS v FROM groups ORDER BY group_id").load(&mut self.conn)?;
         Ok(rows.into_iter().map(|r| r.v).collect())
     }
 
@@ -314,7 +379,11 @@ impl MeshStore {
         Ok(rows[0].v)
     }
 
-    fn sequenced_by_hash(&mut self, group_id: &[u8], hash: &[u8]) -> Result<Option<StoredGroupMessage>, MeshError> {
+    fn sequenced_by_hash(
+        &mut self,
+        group_id: &[u8],
+        hash: &[u8],
+    ) -> Result<Option<StoredGroupMessage>, MeshError> {
         let rows: Vec<StoredGroupMessage> = sql_query(format!(
             "SELECT {GROUP_COLUMNS} FROM group_messages WHERE group_id = ? AND data_hash = ?"
         ))
@@ -348,39 +417,72 @@ impl MeshStore {
 
     /// Sequence a message here (this node is the group's sequencer).
     /// Returns the stored row and whether it was newly inserted.
-    pub fn append_sequenced(&mut self, msg: &NewGroupMessage, now_ns: i64) -> Result<(StoredGroupMessage, bool), MeshError> {
-        if let Some(existing) = self.sequenced_by_hash(&msg.group_id, &sha256(&msg.data))? {
-            return Ok((existing, false));
-        }
-        let row = StoredGroupMessage {
-            group_id: msg.group_id.clone(),
-            id: self.max_group_id(&msg.group_id)? + 1,
-            created_ns: now_ns,
-            data: msg.data.clone(),
-            sender_hmac: msg.sender_hmac.clone(),
-            should_push: msg.should_push,
-            is_commit: msg.is_commit,
-        };
-        self.insert_group_row(&row)?;
-        Ok((row, true))
+    pub fn append_sequenced(
+        &mut self,
+        msg: &NewGroupMessage,
+        now_ns: i64,
+    ) -> Result<(StoredGroupMessage, bool), MeshError> {
+        self.transaction(|s| {
+            if let Some(existing) = s.sequenced_by_hash(&msg.group_id, &sha256(&msg.data))? {
+                return Ok((existing, false));
+            }
+            let row = StoredGroupMessage {
+                group_id: msg.group_id.clone(),
+                id: s.max_group_id(&msg.group_id)? + 1,
+                created_ns: now_ns,
+                data: msg.data.clone(),
+                sender_hmac: msg.sender_hmac.clone(),
+                should_push: msg.should_push,
+                is_commit: msg.is_commit,
+            };
+            s.insert_group_row(&row)?;
+            Ok((row, true))
+        })
     }
 
     /// Store a message another node sequenced. Ids must arrive contiguously.
-    pub fn insert_sequenced(&mut self, row: &StoredGroupMessage) -> Result<InsertOutcome, MeshError> {
-        let have = self.max_group_id(&row.group_id)?;
-        if row.id <= have {
-            return Ok(InsertOutcome::Duplicate);
-        }
-        if row.id != have + 1 {
-            return Ok(InsertOutcome::Gap { have });
-        }
-        self.insert_group_row(row)?;
-        Ok(InsertOutcome::Inserted)
+    pub fn insert_sequenced(
+        &mut self,
+        row: &StoredGroupMessage,
+    ) -> Result<InsertOutcome, MeshError> {
+        self.transaction(|s| {
+            let have = s.max_group_id(&row.group_id)?;
+            if row.id <= have {
+                return Ok(InsertOutcome::Duplicate);
+            }
+            if row.id != have + 1 {
+                return Ok(InsertOutcome::Gap { have });
+            }
+            s.insert_group_row(row)?;
+            Ok(InsertOutcome::Inserted)
+        })
+    }
+
+    /// [`insert_sequenced`](Self::insert_sequenced), and in the same
+    /// transaction drop our pending copy of the message if it is now
+    /// sequenced (inserted or already held).
+    pub fn insert_sequenced_settling_pending(
+        &mut self,
+        row: &StoredGroupMessage,
+    ) -> Result<InsertOutcome, MeshError> {
+        self.transaction(|s| {
+            let outcome = s.insert_sequenced(row)?;
+            if matches!(outcome, InsertOutcome::Inserted | InsertOutcome::Duplicate) {
+                s.remove_pending(&row.group_id, &sha256(&row.data))?;
+            }
+            Ok(outcome)
+        })
     }
 
     /// v3 paging: ascending returns `id > cursor`; descending returns
     /// `id < cursor`, or the newest messages when `cursor == 0`.
-    pub fn query_group(&mut self, group_id: &[u8], cursor: i64, limit: i64, descending: bool) -> Result<Vec<StoredGroupMessage>, MeshError> {
+    pub fn query_group(
+        &mut self,
+        group_id: &[u8],
+        cursor: i64,
+        limit: i64,
+        descending: bool,
+    ) -> Result<Vec<StoredGroupMessage>, MeshError> {
         let rows = match (descending, cursor) {
             (false, _) => sql_query(format!(
                 "SELECT {GROUP_COLUMNS} FROM group_messages WHERE group_id = ? AND id > ? ORDER BY id ASC LIMIT ?"
@@ -454,7 +556,23 @@ impl MeshStore {
     // ---- welcomes ----
 
     /// Store a welcome addressed to `installation`. The receiving node assigns ids.
-    pub fn append_welcome(&mut self, installation: &[u8], envelope_hash: &[u8], input: &[u8], now_ns: i64) -> Result<Option<StoredWelcome>, MeshError> {
+    pub fn append_welcome(
+        &mut self,
+        installation: &[u8],
+        envelope_hash: &[u8],
+        input: &[u8],
+        now_ns: i64,
+    ) -> Result<Option<StoredWelcome>, MeshError> {
+        self.transaction(|s| s.append_welcome_inner(installation, envelope_hash, input, now_ns))
+    }
+
+    fn append_welcome_inner(
+        &mut self,
+        installation: &[u8],
+        envelope_hash: &[u8],
+        input: &[u8],
+        now_ns: i64,
+    ) -> Result<Option<StoredWelcome>, MeshError> {
         let dup: Vec<I64Row> = sql_query(
             "SELECT COUNT(*) AS v FROM welcomes WHERE installation_key = ? AND envelope_hash = ?",
         )
@@ -484,7 +602,12 @@ impl MeshStore {
         Ok(Some(row))
     }
 
-    pub fn query_welcomes(&mut self, installation: &[u8], cursor: i64, limit: i64) -> Result<Vec<StoredWelcome>, MeshError> {
+    pub fn query_welcomes(
+        &mut self,
+        installation: &[u8],
+        cursor: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredWelcome>, MeshError> {
         Ok(sql_query(
             "SELECT installation_key, id, created_ns, input FROM welcomes \
              WHERE installation_key = ? AND id > ? ORDER BY id ASC LIMIT ?",
@@ -495,7 +618,12 @@ impl MeshStore {
         .load(&mut self.conn)?)
     }
 
-    pub fn add_outbound_welcome(&mut self, envelope_hash: &[u8], installation: &[u8], input: &[u8]) -> Result<(), MeshError> {
+    pub fn add_outbound_welcome(
+        &mut self,
+        envelope_hash: &[u8],
+        installation: &[u8],
+        input: &[u8],
+    ) -> Result<(), MeshError> {
         sql_query("INSERT OR IGNORE INTO outbound_welcomes (envelope_hash, installation_key, input) VALUES (?, ?, ?)")
             .bind::<Binary, _>(envelope_hash)
             .bind::<Binary, _>(installation)
@@ -504,19 +632,34 @@ impl MeshStore {
         Ok(())
     }
 
-    pub fn outbound_welcomes_for(&mut self, installation: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, MeshError> {
+    pub fn outbound_welcomes_for(
+        &mut self,
+        installation: &[u8],
+    ) -> Result<OutboundWelcomePairs, MeshError> {
         let rows: Vec<OutboundRow> = sql_query(
             "SELECT envelope_hash, input FROM outbound_welcomes WHERE installation_key = ? ORDER BY rowid ASC",
         )
         .bind::<Binary, _>(installation)
         .load(&mut self.conn)?;
-        Ok(rows.into_iter().map(|r| (r.envelope_hash, r.input)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.envelope_hash, r.input))
+            .collect())
     }
 
-    pub fn remove_outbound_welcome(&mut self, envelope_hash: &[u8]) -> Result<(), MeshError> {
-        sql_query("DELETE FROM outbound_welcomes WHERE envelope_hash = ?")
-            .bind::<Binary, _>(envelope_hash)
-            .execute(&mut self.conn)?;
-        Ok(())
+    /// Remove the outbound welcome `envelope_hash` if it is queued for
+    /// `installation`. Returns whether one was removed.
+    pub fn remove_outbound_welcome_for(
+        &mut self,
+        installation: &[u8],
+        envelope_hash: &[u8],
+    ) -> Result<bool, MeshError> {
+        let n = sql_query(
+            "DELETE FROM outbound_welcomes WHERE envelope_hash = ? AND installation_key = ?",
+        )
+        .bind::<Binary, _>(envelope_hash)
+        .bind::<Binary, _>(installation)
+        .execute(&mut self.conn)?;
+        Ok(n > 0)
     }
 }

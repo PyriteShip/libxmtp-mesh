@@ -49,7 +49,10 @@ impl MeshNode {
                         key_package_tls_serialized: kp,
                     })
                     .ok_or_else(|| {
-                        MeshError::NotFound(format!("key package for {}", hex::encode(installation)))
+                        MeshError::NotFound(format!(
+                            "key package for {}",
+                            hex::encode(installation)
+                        ))
                     })
             })
             .collect::<Result<Vec<_>, MeshError>>()?;
