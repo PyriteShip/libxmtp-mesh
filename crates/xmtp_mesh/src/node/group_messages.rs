@@ -10,7 +10,7 @@ use xmtp_proto::mls_v1::{
 use super::{MeshNode, NodeEvent};
 use crate::MeshError;
 use crate::mls_parse::parse_group_message;
-use crate::store::{NewGroupMessage, StoredGroupMessage};
+use crate::store::{NewGroupMessage, StoredGroupMessage, sha256};
 
 impl StoredGroupMessage {
     pub fn to_proto(&self) -> GroupMessage {
@@ -68,7 +68,7 @@ impl MeshNode {
                     if inserted {
                         events.push(NodeEvent::GroupSequenced(row));
                     }
-                } else {
+                } else if !store.is_sequenced(&gid, &sha256(&msg.data))? {
                     store.add_pending(&msg, Self::now_ns())?;
                     events.push(NodeEvent::PendingAdded(gid));
                 }
@@ -139,6 +139,20 @@ impl MeshNode {
     #[doc(hidden)]
     pub fn group_sequencer_for_test(&self, group_id: &[u8]) -> Result<Option<Vec<u8>>, MeshError> {
         self.inner.store.lock().sequencer(group_id)
+    }
+
+    #[doc(hidden)]
+    pub fn first_sequenced_data_for_test(&self, group_id: &[u8]) -> Result<Vec<u8>, MeshError> {
+        let mut rows = self.inner.store.lock().query_group(group_id, 0, 1, false)?;
+        if rows.is_empty() {
+            return Err(MeshError::NotFound("no sequenced message".into()));
+        }
+        Ok(rows.remove(0).data)
+    }
+
+    #[doc(hidden)]
+    pub fn pending_count_for_test(&self, group_id: &[u8]) -> Result<usize, MeshError> {
+        Ok(self.inner.store.lock().pending_for(group_id)?.len())
     }
 
     #[doc(hidden)]

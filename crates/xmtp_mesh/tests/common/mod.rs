@@ -79,3 +79,41 @@ pub fn app_payloads(group: &MeshGroup) -> Vec<Vec<u8>> {
     messages.sort_by_key(|m| m.sent_at_ns);
     messages.into_iter().map(|m| m.decrypted_message_bytes).collect()
 }
+
+use xmtp_mesh::{HelloSigner, LoopbackHub, MeshError};
+
+pub struct ClientSigner(pub MeshClient);
+
+impl HelloSigner for ClientSigner {
+    fn installation_key(&self) -> Vec<u8> {
+        self.0.installation_public_key().to_vec()
+    }
+    fn sign(&self, text: &str) -> Result<Vec<u8>, MeshError> {
+        self.0
+            .context
+            .sign_with_public_context(text)
+            .map_err(|e| MeshError::AuthFailed(e.to_string()))
+    }
+}
+
+pub struct TestPeer {
+    pub name: String,
+    pub node: MeshNode,
+    pub client: MeshClient,
+}
+
+impl TestPeer {
+    pub fn installation(&self) -> Vec<u8> {
+        self.client.installation_public_key().to_vec()
+    }
+}
+
+/// A registered client on its own node, attached to `hub` under `name`, syncing.
+pub async fn peer(hub: &LoopbackHub, name: &str) -> TestPeer {
+    let node = MeshNode::in_memory().unwrap();
+    hub.register(name, &node);
+    let client = build_client(&node).await;
+    node.start_sync(Arc::new(ClientSigner(client.clone())), hub.transport_for(name))
+        .unwrap();
+    TestPeer { name: name.to_string(), node, client }
+}

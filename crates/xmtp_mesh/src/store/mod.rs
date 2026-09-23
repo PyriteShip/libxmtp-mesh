@@ -324,6 +324,11 @@ impl MeshStore {
         Ok(rows.into_iter().next())
     }
 
+    /// Whether a message with this data hash is already sequenced in the group.
+    pub fn is_sequenced(&mut self, group_id: &[u8], hash: &[u8]) -> Result<bool, MeshError> {
+        Ok(self.sequenced_by_hash(group_id, hash)?.is_some())
+    }
+
     fn insert_group_row(&mut self, row: &StoredGroupMessage) -> Result<(), MeshError> {
         sql_query(
             "INSERT INTO group_messages (group_id, id, created_ns, data, sender_hmac, should_push, is_commit, data_hash) \

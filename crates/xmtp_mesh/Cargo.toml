@@ -25,7 +25,7 @@ prost = { workspace = true, features = ["derive", "std"] }
 rand = { workspace = true }
 sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tonic = { workspace = true }
 tracing.workspace = true
 xmtp-workspace-hack = { version = "0.1", path = "../xmtp-workspace-hack" }
@@ -44,3 +44,7 @@ xmtp_cryptography.workspace = true
 xmtp_db = { workspace = true }
 xmtp_id = { workspace = true, features = ["test-utils"] }
 xmtp_mls = { workspace = true, features = ["test-utils"] }
+
+[[test]]
+name = "capture_commit"
+path = "tests/fixtures/capture_commit.rs"

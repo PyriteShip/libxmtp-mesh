@@ -12,6 +12,10 @@ pub enum MeshError {
     InvalidKeyPackage(String),
     #[error("identity update rejected: {0}")]
     IdentityRejected(String),
+    /// An update could not be appended at the sequence id it was offered for:
+    /// `expected` is the id the store needs next (its length + 1), `got` is the
+    /// id the caller claimed (or, after repeated concurrent appends, the id its
+    /// stale snapshot implied).
     #[error("identity log conflict for {inbox_id}: expected {expected}, got {got}")]
     IdentityConflict { inbox_id: String, expected: i64, got: i64 },
     #[error("not found: {0}")]
