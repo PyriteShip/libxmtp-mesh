@@ -3,11 +3,15 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy::signers::local::PrivateKeySigner;
 use xmtp_api_d14n::{ClientBundle, MessageBackendBuilder};
 use xmtp_cryptography::utils::generate_local_wallet;
 use xmtp_db::group_message::{GroupMessageKind, MsgQueryArgs};
 use xmtp_db::{EncryptedMessageStore, NativeDb};
 use xmtp_id::InboxOwner;
+use xmtp_id::associations::test_utils::add_wallet_signature;
+use xmtp_id::associations::unverified::UnverifiedIdentityUpdate;
+use xmtp_id::associations::{self, AssociationState};
 use xmtp_mesh::{EoaOnlyVerifier, MeshNode};
 use xmtp_mls::builder::DeviceSyncMode;
 use xmtp_mls::cursor_store::SqliteCursorStore;
@@ -21,7 +25,13 @@ pub type MeshClient = Client<MlsContext>;
 pub type MeshGroup = MlsGroup<MlsContext>;
 
 pub async fn build_client(node: &MeshNode) -> MeshClient {
-    let wallet = generate_local_wallet();
+    build_client_for(node, &generate_local_wallet()).await
+}
+
+/// A client for `wallet`'s inbox (nonce 1) on `node`, registered with the
+/// wallet's signature: a new inbox on a node that does not know it, or a new
+/// installation of an inbox the node already holds (the reset case).
+pub async fn build_client_for(node: &MeshNode, wallet: &PrivateKeySigner) -> MeshClient {
     let ident = wallet.get_identifier().unwrap();
     let nonce = 1;
     let inbox_id = ident.inbox_id(nonce).unwrap();
@@ -50,8 +60,22 @@ pub async fn build_client(node: &MeshNode) -> MeshClient {
         .build()
         .await
         .unwrap();
-    register_client(&client, &wallet).await;
+    register_client(&client, wallet).await;
     client
+}
+
+/// The verified association state built from `node`'s own stored identity
+/// log for `inbox_id` (empty log -> `get_state` on no updates, which is an
+/// error the caller is not expected to hit in these tests). Mirrors
+/// `MeshNode::verified_state`, which is `pub(crate)` and not visible from
+/// this integration-test crate.
+pub async fn association_state(node: &MeshNode, inbox_id: &str) -> AssociationState {
+    let mut verified = Vec::new();
+    for row in node.identity_log(inbox_id).unwrap() {
+        let unverified = UnverifiedIdentityUpdate::try_from(row.update.unwrap()).unwrap();
+        verified.push(unverified.to_verified(EoaOnlyVerifier).await.unwrap());
+    }
+    associations::get_state(&verified).unwrap()
 }
 
 /// Poll `check` every 50 ms for up to 20 s.
@@ -118,11 +142,65 @@ impl TestPeer {
     }
 }
 
+/// Revoke every other live installation of `peer`'s inbox, signed by the
+/// recovery wallet. Mirrors `revoke_all_other_installations_signature_request`
+/// (`bindings/mobile/src/mls.rs:952-976`), the libxmtp call the app's
+/// instance `client.revokeAllOtherInstallations(signer)` runs underneath
+/// (Task 2b, `dm-after-reset-analysis.md` Option 1). Idempotent the same
+/// way that FFI is: once `peer`'s own installation is the only one left,
+/// this reads the inbox state, finds nothing to revoke, and returns without
+/// building or submitting a signature request — it does not resubmit the
+/// prior revoke, which the association state's replay protection
+/// (`RevokeAssociation::replay_check`) would reject as a reused signature.
+pub async fn revoke_all_other_installations(peer: &TestPeer, wallet: &PrivateKeySigner) {
+    let own = peer.installation();
+    let others: Vec<Vec<u8>> = peer
+        .client
+        .inbox_state(true)
+        .await
+        .unwrap()
+        .installation_ids()
+        .into_iter()
+        .filter(|id| *id != own)
+        .collect();
+    if others.is_empty() {
+        return;
+    }
+
+    let mut request = peer
+        .client
+        .identity_updates()
+        .revoke_installations(others)
+        .await
+        .unwrap();
+    add_wallet_signature(&mut request, wallet).await;
+    peer.client
+        .identity_updates()
+        .apply_signature_request(request)
+        .await
+        .unwrap();
+}
+
 /// A registered client on its own node, attached to `hub` under `name`, syncing.
 pub async fn peer(hub: &LoopbackHub, name: &str) -> TestPeer {
-    let node = MeshNode::in_memory().unwrap();
+    peer_on(
+        hub,
+        name,
+        MeshNode::in_memory().unwrap(),
+        &generate_local_wallet(),
+    )
+    .await
+}
+
+/// Like [`peer`], but on `node` and for `wallet` (a reset keeps the wallet).
+pub async fn peer_on(
+    hub: &LoopbackHub,
+    name: &str,
+    node: MeshNode,
+    wallet: &PrivateKeySigner,
+) -> TestPeer {
     hub.register(name, &node);
-    let client = build_client(&node).await;
+    let client = build_client_for(&node, wallet).await;
     start_sync(&node, &client, hub.transport_for(name));
     TestPeer {
         name: name.to_string(),

@@ -25,12 +25,20 @@ impl MeshNode {
         if self.inner.suppress_identity_log.load(Ordering::Relaxed) {
             return Ok(None);
         }
-        let mut store = self.inner.store.lock();
-        let Some(inbox_id) = store.local_inbox()? else {
+        let Some(inbox_id) = self.inner.store.lock().local_inbox()? else {
             return Ok(None);
         };
-        let updates = store
-            .identity_rows(&inbox_id, 0)?
+        let updates = self.identity_log(&inbox_id)?;
+        Ok(Some(IdentityLog { inbox_id, updates }))
+    }
+
+    /// This node's whole stored identity log for `inbox_id`, oldest first
+    /// (empty when the inbox is unknown).
+    pub fn identity_log(&self, inbox_id: &str) -> Result<Vec<IdentityUpdateLog>, MeshError> {
+        self.inner
+            .store
+            .lock()
+            .identity_rows(inbox_id, 0)?
             .into_iter()
             .map(|r| {
                 Ok(IdentityUpdateLog {
@@ -39,8 +47,54 @@ impl MeshNode {
                     update: Some(IdentityUpdateProto::decode(r.update_bytes.as_slice())?),
                 })
             })
-            .collect::<Result<Vec<_>, MeshError>>()?;
-        Ok(Some(IdentityLog { inbox_id, updates }))
+            .collect::<Result<Vec<_>, MeshError>>()
+    }
+
+    /// Copy another node's log of `inbox_id` into this one: the carry on a
+    /// node rotation, so that a reset's new installation extends the log
+    /// its peers already hold instead of re-creating the inbox (root-cause
+    /// note 2026-09-24). Each update is verified and appended as a peer's
+    /// would be, so the identifier mappings follow and libxmtp's
+    /// `get_inbox_ids` finds the inbox. Only an unbound node may import:
+    /// this never sets the local installation or inbox (the next
+    /// installation's own key package and publish do). Not capped: the log
+    /// comes from this device's own previous node.
+    ///
+    /// Returns how many updates this node now holds for `inbox_id`. An
+    /// error if ingestion reports the source log forked at a sequence id we
+    /// already held (P11), or if, after ingestion, this node holds fewer
+    /// updates than the source's highest sequence id — a silent stop at a
+    /// gap would leave a truncated log that forks again at N+1 (P11).
+    pub async fn import_identity_log(
+        &self,
+        inbox_id: &str,
+        updates: Vec<IdentityUpdateLog>,
+    ) -> Result<i64, MeshError> {
+        if self.local_installation()?.is_some() || self.local_inbox()?.is_some() {
+            return Err(MeshError::InvalidRequest(
+                "identity log import into a node already bound to an installation".into(),
+            ));
+        }
+        let highest = updates
+            .iter()
+            .map(|u| u.sequence_id as i64)
+            .max()
+            .unwrap_or(0);
+        if let Some(fork_seq) = self
+            .ingest_identity_log_capped(inbox_id, updates, i64::MAX)
+            .await?
+        {
+            return Err(MeshError::InvalidRequest(format!(
+                "identity log import for {inbox_id} forked at sequence {fork_seq}"
+            )));
+        }
+        let held = self.inner.store.lock().identity_len(inbox_id)?;
+        if held < highest {
+            return Err(MeshError::InvalidRequest(format!(
+                "identity log import for {inbox_id} stopped at a gap: holding {held}, source had {highest}"
+            )));
+        }
+        Ok(held)
     }
 
     pub(crate) fn own_key_package(&self) -> Result<Option<KeyPackage>, MeshError> {
@@ -56,15 +110,18 @@ impl MeshNode {
             }))
     }
 
-    /// Append a peer-supplied log contiguously (Rule B): updates we already
-    /// hold (sequence id <= our length) are skipped without comparing them to
-    /// ours, ingestion stops at the first gap, and nothing past
-    /// [`MAX_PEER_IDENTITY_LOG`] updates is accepted.
+    /// Append a peer-supplied log contiguously (Rule B): ingestion stops at
+    /// the first gap, and nothing past [`MAX_PEER_IDENTITY_LOG`] updates is
+    /// accepted. Updates we already hold (sequence id <= our length) are
+    /// skipped. If one differs from ours at the same sequence id, the peer
+    /// holds a forked log (for example a second `CreateInbox` for this inbox,
+    /// minted on an empty node): it is logged, the rest of that log is not
+    /// ingested, and that sequence id is returned. `Ok(None)`: no fork seen.
     pub(crate) async fn ingest_identity_log(
         &self,
         inbox_id: &str,
         updates: Vec<IdentityUpdateLog>,
-    ) -> Result<(), MeshError> {
+    ) -> Result<Option<i64>, MeshError> {
         self.ingest_identity_log_capped(inbox_id, updates, MAX_PEER_IDENTITY_LOG)
             .await
     }
@@ -74,13 +131,22 @@ impl MeshNode {
         inbox_id: &str,
         mut updates: Vec<IdentityUpdateLog>,
         cap: i64,
-    ) -> Result<(), MeshError> {
+    ) -> Result<Option<i64>, MeshError> {
         updates.retain(|u| (u.sequence_id as i64) <= cap);
         updates.sort_by_key(|u| u.sequence_id);
         for u in updates {
             let have = self.inner.store.lock().identity_len(inbox_id)?;
             let seq = u.sequence_id as i64;
             if seq <= have {
+                if self.differs_from_held(inbox_id, seq, &u)? {
+                    tracing::warn!(
+                        inbox_id,
+                        seq,
+                        "peer identity log differs from ours at a held sequence id \
+                         (forked log); not ingesting the rest of it"
+                    );
+                    return Ok(Some(seq));
+                }
                 continue;
             }
             if seq != have + 1 {
@@ -102,7 +168,24 @@ impl MeshNode {
             )
             .await?;
         }
-        Ok(())
+        Ok(None)
+    }
+
+    /// True when we hold `seq` for `inbox_id` and `u` carries a different
+    /// update there. Timestamps are not compared: only the update itself.
+    fn differs_from_held(
+        &self,
+        inbox_id: &str,
+        seq: i64,
+        u: &IdentityUpdateLog,
+    ) -> Result<bool, MeshError> {
+        let Some(update) = &u.update else {
+            return Ok(false);
+        };
+        let held = self.inner.store.lock().identity_rows(inbox_id, seq - 1)?;
+        Ok(held.first().is_some_and(|row| {
+            row.sequence_id == seq && row.update_bytes != update.encode_to_vec()
+        }))
     }
 
     pub(crate) async fn installations_of(&self, inbox_id: &str) -> Result<Vec<Vec<u8>>, MeshError> {
@@ -430,8 +513,33 @@ mod tests {
 
     use super::*;
 
-    /// A real three-update log for one inbox: create it, then add two wallets.
-    async fn three_update_log() -> (String, Vec<IdentityUpdateLog>) {
+    use alloy::signers::local::PrivateKeySigner;
+
+    /// `owner` adds a fresh wallet to `inbox_id`: a real update, numbered `seq`.
+    async fn added_wallet(
+        owner: &PrivateKeySigner,
+        inbox_id: &str,
+        seq: u64,
+        ts: u64,
+    ) -> IdentityUpdateLog {
+        let added = generate_local_wallet();
+        let mut add = SignatureRequestBuilder::new(inbox_id)
+            .add_association(added.member_identifier(), owner.member_identifier())
+            .build();
+        add_wallet_signature(&mut add, owner).await;
+        add_wallet_signature(&mut add, &added).await;
+        IdentityUpdateLog {
+            sequence_id: seq,
+            server_timestamp_ns: ts,
+            update: Some(IdentityUpdateProto::from(
+                add.build_identity_update().unwrap(),
+            )),
+        }
+    }
+
+    /// A real three-update log for one inbox (create it, then add two
+    /// wallets), with its owner. Timestamps are 1_000 + sequence id.
+    async fn owned_three_update_log() -> (PrivateKeySigner, String, Vec<IdentityUpdateLog>) {
         let owner = generate_local_wallet();
         let inbox_id = owner.get_inbox_id(0);
 
@@ -439,27 +547,24 @@ mod tests {
             .create_inbox(owner.identifier(), 0)
             .build();
         add_wallet_signature(&mut create, &owner).await;
-        let mut updates = vec![create.build_identity_update().unwrap()];
+        let first = IdentityUpdateLog {
+            sequence_id: 1,
+            server_timestamp_ns: 1_001,
+            update: Some(IdentityUpdateProto::from(
+                create.build_identity_update().unwrap(),
+            )),
+        };
+        let log = vec![
+            first,
+            added_wallet(&owner, &inbox_id, 2, 1_002).await,
+            added_wallet(&owner, &inbox_id, 3, 1_003).await,
+        ];
+        (owner, inbox_id, log)
+    }
 
-        for _ in 0..2 {
-            let added = generate_local_wallet();
-            let mut add = SignatureRequestBuilder::new(&inbox_id)
-                .add_association(added.member_identifier(), owner.member_identifier())
-                .build();
-            add_wallet_signature(&mut add, &owner).await;
-            add_wallet_signature(&mut add, &added).await;
-            updates.push(add.build_identity_update().unwrap());
-        }
-
-        let log = updates
-            .into_iter()
-            .zip(1u64..)
-            .map(|(u, seq)| IdentityUpdateLog {
-                sequence_id: seq,
-                server_timestamp_ns: 1_000 + seq,
-                update: Some(IdentityUpdateProto::from(u)),
-            })
-            .collect();
+    /// [`owned_three_update_log`] without the owner.
+    async fn three_update_log() -> (String, Vec<IdentityUpdateLog>) {
+        let (_, inbox_id, log) = owned_three_update_log().await;
         (inbox_id, log)
     }
 
@@ -542,5 +647,140 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, MeshError::IdentityRejected(_)), "{err:?}");
         assert!(timestamps(&node, "some-other-inbox").is_empty());
+    }
+
+    /// Review Focus 5: a peer whose log differs from ours at a held sequence
+    /// id (a second CreateInbox minted on an empty node, root-cause note
+    /// 2026-09-24) is reported, and nothing after the fork is appended on
+    /// top of our history.
+    #[tokio::test]
+    async fn a_forked_log_is_reported_and_the_rest_of_it_is_not_ingested() {
+        let node = MeshNode::in_memory().unwrap();
+        let (owner, inbox_id, log) = owned_three_update_log().await;
+        assert_eq!(
+            node.ingest_identity_log(&inbox_id, log[..2].to_vec())
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Same seq 1, another update at seq 2, and a seq 3 that would apply
+        // on top of our state if ingestion went on.
+        let fork = vec![
+            log[0].clone(),
+            added_wallet(&owner, &inbox_id, 2, 2_002).await,
+            added_wallet(&owner, &inbox_id, 3, 2_003).await,
+        ];
+        assert_eq!(
+            node.ingest_identity_log(&inbox_id, fork).await.unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            timestamps(&node, &inbox_id),
+            vec![1_001, 1_002],
+            "nothing of the fork is appended"
+        );
+
+        // Our own updates sent again, even with other timestamps, are not a fork.
+        let mut resent = log[1].clone();
+        resent.server_timestamp_ns = 9_999;
+        assert_eq!(
+            node.ingest_identity_log(&inbox_id, vec![log[0].clone(), resent])
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    /// The reset carry (root-cause note, minimal fix 1): a fresh node gets
+    /// the inbox's log and identifier mappings, so libxmtp's get_inbox_ids
+    /// finds the inbox, but it stays unbound (Review Focus 3).
+    #[tokio::test]
+    async fn import_copies_the_log_and_identifiers_and_leaves_the_node_unbound() {
+        use xmtp_proto::types::ApiIdentifier;
+        let (owner, inbox_id, log) = owned_three_update_log().await;
+        let old = MeshNode::in_memory().unwrap();
+        old.ingest_identity_log(&inbox_id, log).await.unwrap();
+
+        let fresh = MeshNode::in_memory().unwrap();
+        let held = fresh
+            .import_identity_log(&inbox_id, old.identity_log(&inbox_id).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(held, 3);
+        assert_eq!(timestamps(&fresh, &inbox_id), vec![1_001, 1_002, 1_003]);
+        let api: ApiIdentifier = (&owner.identifier()).into();
+        assert_eq!(
+            fresh
+                .inner
+                .store
+                .lock()
+                .inbox_for_identifier(&api.identifier, api.identifier_kind as i32)
+                .unwrap(),
+            Some(inbox_id.clone())
+        );
+        assert_eq!(fresh.local_installation().unwrap(), None);
+        assert_eq!(fresh.local_inbox().unwrap(), None);
+    }
+
+    /// Review Focus 3: a node already serving an installation never takes
+    /// an imported log ("a mesh node serves exactly one local installation").
+    #[tokio::test]
+    async fn import_into_a_bound_node_is_refused() {
+        let (inbox_id, log) = three_update_log().await;
+        let bound = MeshNode::in_memory().unwrap();
+        bound
+            .inner
+            .store
+            .lock()
+            .set_local_installation(b"installation-key-of-a-live-clien")
+            .unwrap();
+        let err = bound.import_identity_log(&inbox_id, log).await.unwrap_err();
+        assert!(matches!(err, MeshError::InvalidRequest(_)), "{err:?}");
+        assert!(timestamps(&bound, &inbox_id).is_empty());
+    }
+
+    #[test]
+    fn the_log_of_an_unknown_inbox_is_empty() {
+        let node = MeshNode::in_memory().unwrap();
+        assert!(node.identity_log("unknown").unwrap().is_empty());
+    }
+
+    /// P11: a source log that forked at a sequence id the target already
+    /// held (from an earlier, partial import) is an error, not a silent
+    /// partial import.
+    #[tokio::test]
+    async fn import_of_a_forked_log_is_an_error() {
+        let (owner, inbox_id, log) = owned_three_update_log().await;
+        let target = MeshNode::in_memory().unwrap();
+        target
+            .import_identity_log(&inbox_id, log[..2].to_vec())
+            .await
+            .unwrap();
+        let fork = vec![
+            log[0].clone(),
+            added_wallet(&owner, &inbox_id, 2, 2_002).await,
+        ];
+        let err = target
+            .import_identity_log(&inbox_id, fork)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MeshError::InvalidRequest(_)), "{err:?}");
+    }
+
+    /// P11: a source log with a gap (here, sequence 2 missing) must not
+    /// silently stop short of the source's highest sequence id — that would
+    /// leave a truncated log that forks again at the next append.
+    #[tokio::test]
+    async fn import_that_stops_at_a_gap_is_an_error() {
+        let (inbox_id, log) = three_update_log().await;
+        let target = MeshNode::in_memory().unwrap();
+        let gapped = vec![log[0].clone(), log[2].clone()];
+        let err = target
+            .import_identity_log(&inbox_id, gapped)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MeshError::InvalidRequest(_)), "{err:?}");
     }
 }

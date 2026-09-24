@@ -437,7 +437,7 @@ impl Session {
             }
             self.mark_verified().await?;
         }
-        ingested
+        ingested.map(|_| ())
     }
 
     /// Runs once the peer's membership is proven: deliver the welcomes queued
