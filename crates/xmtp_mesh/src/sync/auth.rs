@@ -39,7 +39,7 @@ pub(crate) fn hello_text(
     verifier_installation: &[u8],
 ) -> String {
     format!(
-        "pyrechat-mesh-hello-v1:{}:{}:{}",
+        "xmtp-mesh-hello-v1:{}:{}:{}",
         hex::encode(challenge),
         hex::encode(signer_installation),
         hex::encode(verifier_installation)

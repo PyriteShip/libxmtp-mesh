@@ -3,7 +3,7 @@ name = "xmtp_mesh"
 edition = "2024"
 license.workspace = true
 version.workspace = true
-description = "Serverless XMTP v3 node emulation, synced peer-to-peer (pyrechat)"
+description = "Serverless XMTP v3 node emulation, synced peer-to-peer (xmtp-mesh)"
 
 [lints]
 workspace = true

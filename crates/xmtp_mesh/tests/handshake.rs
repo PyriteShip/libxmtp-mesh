@@ -166,7 +166,7 @@ impl Recorder {
 /// The wire format of the signed hello text, pinned independently of the crate.
 fn hello_text(challenge: &[u8], signer: &[u8], verifier: &[u8]) -> String {
     format!(
-        "pyrechat-mesh-hello-v1:{}:{}:{}",
+        "xmtp-mesh-hello-v1:{}:{}:{}",
         hex::encode(challenge),
         hex::encode(signer),
         hex::encode(verifier)
