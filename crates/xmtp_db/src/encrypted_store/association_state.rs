@@ -124,6 +124,8 @@ impl<C: ConnectionExt> QueryAssociationStateCache for DbConnection<C> {
             return Ok(vec![]);
         }
 
+        let requested_pairs: std::collections::HashSet<(String, i64)> =
+            identifiers.iter().cloned().collect();
         let (inbox_ids, sequence_ids): (Vec<String>, Vec<i64>) = identifiers.into_iter().unzip();
 
         let query = dsl::association_state
@@ -139,6 +141,17 @@ impl<C: ConnectionExt> QueryAssociationStateCache for DbConnection<C> {
 
         association_states
             .into_iter()
+            // The SQL filter above is `inbox_id IN (..) AND sequence_id IN (..)`, a
+            // prefilter that narrows the scan but also matches the cross product of
+            // the two sets (e.g. requesting (a, 2) and (b, 1) also matches (a, 1)).
+            // Keep only the rows whose exact (inbox_id, sequence_id) pair was
+            // requested.
+            .filter(|stored_association_state| {
+                requested_pairs.contains(&(
+                    stored_association_state.inbox_id.clone(),
+                    stored_association_state.sequence_id,
+                ))
+            })
             .map(|stored_association_state| {
                 Ok(AssociationStateProto::decode(
                     stored_association_state.state.as_slice(),
@@ -222,6 +235,70 @@ pub(crate) mod tests {
                 .map(Into::into)
                 .collect::<Vec<MockState>>();
             assert_eq!(no_results.len(), 0);
+        })
+    }
+
+    /// Regression test for the mesh's cross-product bug: `batch_read_from_cache`
+    /// filtered `inbox_id IN (..) AND sequence_id IN (..)`, so two inboxes
+    /// with overlapping sequence numbers returned extra rows the caller never
+    /// asked for. On the mesh every inbox's identity log is numbered
+    /// independently starting at 1, so this collision is the norm, not the
+    /// exception it is on the XMTP network's global cursors.
+    #[xmtp_common::test]
+    fn test_batch_read_returns_only_requested_pairs() {
+        with_connection(|conn| {
+            let inbox_a = "inbox_a".to_string();
+            let inbox_b = "inbox_b".to_string();
+
+            // Stamp each cached state's recovery_identifier with a unique marker
+            // so we can tell (inbox_a, 1) apart from (inbox_a, 2) in the results;
+            // inbox_id alone is not enough since both rows share it.
+            let state_a1 = AssociationStateProto {
+                inbox_id: inbox_a.clone(),
+                recovery_identifier: "a1".into(),
+                ..Default::default()
+            };
+            conn.write_to_cache(inbox_a.clone(), 1, state_a1).unwrap();
+
+            let state_a2 = AssociationStateProto {
+                inbox_id: inbox_a.clone(),
+                recovery_identifier: "a2".into(),
+                ..Default::default()
+            };
+            conn.write_to_cache(inbox_a.clone(), 2, state_a2).unwrap();
+
+            let state_b1 = AssociationStateProto {
+                inbox_id: inbox_b.clone(),
+                recovery_identifier: "b1".into(),
+                ..Default::default()
+            };
+            conn.write_to_cache(inbox_b.clone(), 1, state_b1).unwrap();
+
+            // Ask for (inbox_a, 2) and (inbox_b, 1). A naive
+            // `inbox IN (a,b) AND seq IN (2,1)` filter also matches (inbox_a, 1),
+            // since 1 is in the sequence set even though it was never paired
+            // with inbox_a in the request.
+            let results = conn
+                .batch_read_from_cache(vec![(inbox_a.clone(), 2), (inbox_b.clone(), 1)])
+                .unwrap();
+
+            assert_eq!(
+                results.len(),
+                2,
+                "expected exactly the two requested pairs, got: {:?}",
+                results
+            );
+
+            let recovery_identifiers: std::collections::HashSet<String> = results
+                .into_iter()
+                .map(|state| state.recovery_identifier)
+                .collect();
+            assert!(recovery_identifiers.contains("a2"));
+            assert!(recovery_identifiers.contains("b1"));
+            assert!(
+                !recovery_identifiers.contains("a1"),
+                "(inbox_a, 1) was not requested and must not be returned"
+            );
         })
     }
 }
