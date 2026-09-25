@@ -16,7 +16,7 @@ use xmtp_proto::xmtp::identity::associations::IdentityUpdate as IdentityUpdatePr
 use super::{MeshNode, NodeEvent};
 use crate::{EoaOnlyVerifier, MeshError};
 
-async fn verify(proto: &IdentityUpdateProto) -> Result<IdentityUpdate, MeshError> {
+pub(crate) async fn verify(proto: &IdentityUpdateProto) -> Result<IdentityUpdate, MeshError> {
     let unverified = UnverifiedIdentityUpdate::try_from(proto.clone())
         .map_err(|e| MeshError::IdentityRejected(e.to_string()))?;
     unverified
@@ -131,9 +131,11 @@ impl MeshNode {
                 store.set_local_inbox(&inbox_id)?;
             }
             drop(store);
+            let mut events = vec![NodeEvent::IdentityLogChanged(inbox_id.clone())];
             if local {
-                self.emit(vec![NodeEvent::LocalIdentityChanged]);
+                events.push(NodeEvent::LocalIdentityChanged);
             }
+            self.emit(events);
             return Ok(next_seq);
         }
     }

@@ -1,3 +1,4 @@
+mod convergence;
 mod group_messages;
 mod identity;
 mod key_packages;
@@ -6,12 +7,16 @@ mod streams;
 mod sync_api;
 #[cfg(test)]
 mod sync_api_tests;
+#[cfg(test)]
+pub(crate) mod test_logs;
 mod welcomes;
+
+pub use convergence::{Resolution, ResyncOutcome};
 
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -49,6 +54,11 @@ pub(crate) struct NodeInner {
     pub(crate) suppress_identity_log: AtomicBool,
     /// Test only: sessions drop live GroupSequenced pushes (simulates a lagged stream).
     pub(crate) suppress_group_push: AtomicBool,
+    /// When each inbox's identity log was last replaced (flap guard, §4.3).
+    pub(crate) replaced_at: Mutex<HashMap<String, std::time::Instant>>,
+    pub(crate) replace_flap_window: Mutex<Duration>,
+    /// Replaces so far (tests assert convergence settles).
+    pub(crate) replacements: AtomicU64,
 }
 
 /// Default time an authenticated peer has to prove inbox membership.
@@ -112,6 +122,23 @@ pub enum NodeEvent {
     GroupKnown(Vec<u8>),
     WelcomeStored(StoredWelcome),
     WelcomeOutbound(Vec<u8>),
+    /// An update was appended to this inbox's identity log (local or a peer's).
+    IdentityLogChanged(String),
+    /// This inbox's identity log was replaced by one with an earlier origin
+    /// (restore convergence §4.3). The local client must drop its copy.
+    ///
+    /// M3 (review 2026-09-24): a replace emits **only** this event, not
+    /// `IdentityLogChanged` and not `LocalIdentityChanged` even for our own
+    /// inbox. A listener that follows appends (e.g. the §4.7 handover, or
+    /// re-sending our own log to peers) must also handle this variant, or
+    /// it will miss a replace.
+    IdentityLogReplaced(String),
+    /// The local client reloaded a replaced log (or, for our own inbox, the
+    /// node refused a full winner): what the app should do next (§4.4).
+    IdentityResynced {
+        inbox_id: String,
+        outcome: ResyncOutcome,
+    },
 }
 
 impl MeshNode {
@@ -129,6 +156,9 @@ impl MeshNode {
                 handshake_timeout: Mutex::new(HANDSHAKE_TIMEOUT),
                 suppress_identity_log: AtomicBool::new(false),
                 suppress_group_push: AtomicBool::new(false),
+                replaced_at: Mutex::new(HashMap::new()),
+                replace_flap_window: Mutex::new(convergence::REPLACE_FLAP_WINDOW),
+                replacements: AtomicU64::new(0),
             }),
         }
     }

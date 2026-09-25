@@ -40,7 +40,12 @@ impl UnverifiedIdentityUpdate {
         }
     }
 
-    fn signature_text(&self) -> String {
+    /// The text this update's signatures cover (mesh.8 Task 1 review C1,
+    /// 2026-09-24): exposed so a caller can rank or compare two updates on
+    /// signed content only, without trusting unsigned bytes (e.g. the
+    /// sub-second digits of `client_timestamp_ns`, which `signature_text`
+    /// renders at second precision).
+    pub fn signature_text(&self) -> String {
         let unsigned_actions = self
             .actions
             .iter()

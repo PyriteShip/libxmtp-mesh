@@ -268,6 +268,38 @@ impl MeshStore {
         })
     }
 
+    /// Replace `inbox_id`'s whole identity log with `rows` (sequence ids
+    /// 1..=N, checked by the caller) and its identifier mappings with
+    /// `identifiers`, in one transaction (restore convergence §4.3). Touches
+    /// no other table.
+    pub fn replace_identity(
+        &mut self,
+        inbox_id: &str,
+        rows: &[IdentityRow],
+        identifiers: &[(String, i32)],
+    ) -> Result<(), MeshError> {
+        self.transaction(|s| {
+            sql_query("DELETE FROM identity_updates WHERE inbox_id = ?")
+                .bind::<Text, _>(inbox_id)
+                .execute(&mut s.conn)?;
+            sql_query("DELETE FROM inbox_identifiers WHERE inbox_id = ?")
+                .bind::<Text, _>(inbox_id)
+                .execute(&mut s.conn)?;
+            for row in rows {
+                s.append_identity(
+                    inbox_id,
+                    row.sequence_id,
+                    row.server_timestamp_ns,
+                    &row.update_bytes,
+                )?;
+            }
+            for (identifier, kind) in identifiers {
+                s.set_identifier(identifier, *kind, inbox_id)?;
+            }
+            Ok(())
+        })
+    }
+
     pub fn set_identifier(
         &mut self,
         identifier: &str,
