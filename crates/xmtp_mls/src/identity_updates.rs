@@ -7,10 +7,11 @@ use crate::{
     subscriptions::SyncWorkerEvent,
 };
 use futures::{StreamExt, future::try_join_all, stream::FuturesUnordered};
+use prost::Message;
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 use xmtp_common::{Event, Retry, RetryableError, retry_async, retryable};
-use xmtp_configuration::Originators;
+use xmtp_configuration::{MAX_INSTALLATIONS_PER_INBOX, Originators};
 use xmtp_cryptography::CredentialSign;
 use xmtp_db::StorageError;
 use xmtp_db::XmtpDb;
@@ -37,6 +38,7 @@ use xmtp_proto::{
 
 use xmtp_api::{ApiClientWrapper, GetIdentityUpdatesV2Filter};
 use xmtp_id::InboxUpdate;
+use xmtp_proto::xmtp::identity::associations::AssociationState as AssociationStateProto;
 
 #[derive(Debug, Error)]
 pub enum IdentityUpdateError {
@@ -103,6 +105,13 @@ pub async fn get_association_state_with_verifier(
         return Ok(association_state.try_into().map_err(StorageError::from)?);
     }
 
+    // xmtp-mesh restore convergence (re-review 2026-09-24 I1, race 2):
+    // remember exactly which row this state is computed from, so the
+    // conditional write below can refuse to cache it if a concurrent
+    // `resync_identity_log` purged and replaced this inbox's log while
+    // `verify_updates`/`get_state` ran.
+    let last_update_payload = updates.last().unwrap().payload.clone();
+
     let unverified_updates = updates
         .into_iter()
         // deserialize identity update payload
@@ -112,10 +121,23 @@ pub async fn get_association_state_with_verifier(
 
     let association_state = get_state(updates)?;
 
-    conn.write_to_cache(
-        inbox_id.to_owned(),
+    // One atomic call: it re-reads the row at `last_sequence_id` and writes
+    // the cache entry only if that row still has `last_update_payload`, in
+    // one write transaction. A two-call check-then-write left a window a
+    // concurrent `replace_identity_log` could commit inside -- the check
+    // would pass against a pre-replace row, and the write would then land
+    // in the cache slot the replace's own delete had just cleared, the
+    // common case in §4.1 (a replacement log ending at the same sequence id
+    // as the one it replaced). Because writes serialize, a concurrent
+    // replace now either commits entirely before this call (the payload
+    // differs and the write is skipped) or entirely after it (the
+    // replace's own purge then removes whatever this call just cached).
+    let state_bytes: AssociationStateProto = association_state.clone().into();
+    conn.write_to_cache_if_current(
+        inbox_id,
         last_sequence_id,
-        association_state.clone().into(),
+        &last_update_payload,
+        state_bytes.encode_to_vec(),
     )?;
 
     Ok(association_state)
@@ -234,6 +256,84 @@ where
         .await
     }
 
+    /// xmtp-mesh restore convergence (§4.3): the mesh node replaced
+    /// `inbox_id`'s identity log with one that starts differently. Drops this
+    /// client's copy of that log and every association state cached from it
+    /// (one transaction), then loads the node's log again, so the client
+    /// never holds a hybrid (the fork's first update followed by the
+    /// winner's later ones). Returns the reloaded state.
+    pub async fn resync_identity_log(
+        &self,
+        inbox_id: InboxIdRef<'a>,
+    ) -> Result<AssociationState, ClientError> {
+        // xmtp-mesh restore convergence (§4.3, review 2026-09-24 I1): fetch
+        // the full winning log from the node BEFORE touching the database,
+        // then purge this inbox's rows and insert the fetched ones in one
+        // transaction (`replace_identity_log`). A separate purge-then-reload
+        // left a window where a concurrent `load_identity_updates` or
+        // `get_association_state` for this inbox could observe it purged but
+        // not yet reloaded (a permanent gap), or race the reload itself (a
+        // hybrid log); fetching first and writing once removes that window.
+        let rows = fetch_full_identity_log(self.context.api(), inbox_id).await?;
+        let conn = self.context.db();
+        conn.replace_identity_log(inbox_id, &rows)?;
+        self.get_association_state(&conn, inbox_id, None).await
+    }
+
+    /// xmtp-mesh restore convergence (§4.4): `AddAssociation(this
+    /// installation)` onto the inbox's current log, pre-signed with the
+    /// installation key. The caller adds the recovery wallet's signature and
+    /// applies it ([`Self::apply_signature_request`]), as for a revoke.
+    /// `Ok(None)` when the log already lists this installation.
+    /// [`IdentityError::TooManyInstallations`] when the log is full.
+    ///
+    /// Not idempotent before the built request is applied (review M2): two
+    /// calls before either is applied each build a fresh
+    /// `AddAssociation(this installation)` request, and applying both then
+    /// either fails or duplicates the association. Callers must call, apply,
+    /// then call again -- this task's only caller (the mesh identity task,
+    /// §4.4) does exactly that, serialized per inbox.
+    pub async fn rebase_installation_signature_request(
+        &self,
+    ) -> Result<Option<SignatureRequest>, ClientError> {
+        let inbox_id = self.context.inbox_id();
+        let conn = self.context.db();
+        load_identity_updates(self.context.api(), &conn, &[inbox_id]).await?;
+        let state = self.get_association_state(&conn, inbox_id, None).await?;
+        let identity = self.context.identity();
+        let installation_key = identity.installation_keys.verifying_key();
+        let installation_id = installation_key.as_bytes().to_vec();
+        let installations = state.installation_ids();
+        if installations.contains(&installation_id) {
+            return Ok(None);
+        }
+        if installations.len() >= MAX_INSTALLATIONS_PER_INBOX {
+            return Err(IdentityError::TooManyInstallations {
+                inbox_id: inbox_id.to_string(),
+                count: installations.len(),
+                max: MAX_INSTALLATIONS_PER_INBOX,
+            }
+            .into());
+        }
+        let mut request = SignatureRequestBuilder::new(inbox_id)
+            .add_association(
+                MemberIdentifier::installation(installation_id),
+                state.recovery_identifier().clone().into(),
+            )
+            .build();
+        let signature = identity.sign_identity_update(request.signature_text())?;
+        request
+            .add_signature(
+                UnverifiedSignature::InstallationKey(UnverifiedInstallationKeySignature::new(
+                    signature,
+                    installation_key,
+                )),
+                &self.context.scw_verifier(),
+            )
+            .await?;
+        Ok(Some(request))
+    }
+
     /// Calculate the changes between the `starting_sequence_id` and `ending_sequence_id` for the
     /// provided `inbox_id`
     pub(crate) async fn get_association_state_diff(
@@ -267,6 +367,13 @@ where
             conn.get_identity_updates(inbox_id, starting_sequence_id, ending_sequence_id)?;
 
         let last_sequence_id = incremental_updates.last().map(|update| update.sequence_id);
+        // xmtp-mesh restore convergence (review 2026-09-24 I1, race 2): as in
+        // `get_association_state_with_verifier`, remember the last row's
+        // payload so the cache write below can detect a concurrent
+        // `resync_identity_log` for this inbox.
+        let last_update_payload = incremental_updates
+            .last()
+            .map(|update| update.payload.clone());
         if ending_sequence_id.is_some()
             && last_sequence_id.is_some()
             && last_sequence_id != ending_sequence_id
@@ -293,11 +400,18 @@ where
         }
 
         tracing::debug!("Final state at {:?}: {:?}", last_sequence_id, final_state);
-        if let Some(last_sequence_id) = last_sequence_id {
-            conn.write_to_cache(
-                inbox_id.to_string(),
+        if let (Some(last_sequence_id), Some(last_update_payload)) =
+            (last_sequence_id, last_update_payload)
+        {
+            // As in `get_association_state_with_verifier`: one atomic call,
+            // not a separate check then write (re-review 2026-09-24 I1, race
+            // 2).
+            let state_bytes: AssociationStateProto = final_state.clone().into();
+            conn.write_to_cache_if_current(
+                inbox_id,
                 last_sequence_id,
-                final_state.clone().into(),
+                &last_update_payload,
+                state_bytes.encode_to_vec(),
             )?;
         }
 
@@ -597,6 +711,29 @@ pub async fn load_identity_updates<ApiClient: XmtpApi>(
     tracing::debug!("Fetching identity updates for: {:?}", inbox_ids);
 
     let existing_sequence_ids = conn.get_latest_sequence_id(inbox_ids)?;
+    // xmtp-mesh restore convergence (re-review 2026-09-24 I1, inverse
+    // hybrid): snapshot each inbox's cursor-row payload alongside its
+    // sequence id, before the network fetch below. The conditional insert
+    // at the bottom of this function re-checks this snapshot against
+    // whatever is stored by the time the fetch returns, so a concurrent
+    // `resync_identity_log` that replaces an inbox's log while this fetch
+    // is in flight can't have its rows appended on top of the winner --
+    // without this, a stale fetch's fork rows would otherwise land after
+    // the winner's own sequences and produce a permanent hybrid log that
+    // still verifies (the same wallet signs both forks) and passes
+    // `replace_identity_log`'s own contiguity check (the result is still
+    // contiguous, just wrong).
+    let mut cursor_payloads: HashMap<String, Vec<u8>> = HashMap::new();
+    for (inbox_id, cursor) in &existing_sequence_ids {
+        if let Some(row) = conn
+            .get_identity_updates(inbox_id.as_str(), Some(cursor - 1), Some(*cursor))?
+            .into_iter()
+            .next()
+        {
+            cursor_payloads.insert(inbox_id.clone(), row.payload);
+        }
+    }
+
     let filters: Vec<GetIdentityUpdatesV2Filter> = inbox_ids
         .iter()
         .map(|inbox_id| GetIdentityUpdatesV2Filter {
@@ -609,21 +746,69 @@ pub async fn load_identity_updates<ApiClient: XmtpApi>(
         .get_identity_updates_v2(filters)
         .await?
         .collect::<HashMap<_, Vec<InboxUpdate>>>();
-    let to_store = updates
-        .iter()
-        .flat_map(move |(inbox_id, updates)| {
-            updates.iter().map(move |update| StoredIdentityUpdate {
+
+    let mut accepted = HashMap::with_capacity(updates.len());
+    for (inbox_id, inbox_updates) in updates {
+        if inbox_updates.is_empty() {
+            accepted.insert(inbox_id, inbox_updates);
+            continue;
+        }
+        let to_store: Vec<StoredIdentityUpdate> = inbox_updates
+            .iter()
+            .map(|update| StoredIdentityUpdate {
                 inbox_id: inbox_id.clone(),
                 sequence_id: update.sequence_id as i64,
                 server_timestamp_ns: update.server_timestamp_ns as i64,
                 payload: update.update.clone().into(),
                 originator_id: Originators::INBOX_LOG as i32,
             })
-        })
-        .collect::<Vec<StoredIdentityUpdate>>();
+            .collect();
+        let cursor = existing_sequence_ids.get(&inbox_id).copied();
+        let cursor_payload = cursor_payloads.get(&inbox_id).map(Vec::as_slice);
+        let inserted =
+            conn.insert_identity_updates_if_current(&inbox_id, cursor, cursor_payload, &to_store)?;
+        if inserted {
+            accepted.insert(inbox_id, inbox_updates);
+        }
+        // else: a concurrent resync_identity_log replaced this inbox's log
+        // while this fetch was in flight. Discard these stale fork rows
+        // instead of appending them on top of the winner; the caller sees
+        // this inbox as not updated this round, and the next
+        // load_identity_updates call starts fresh from the (now correct)
+        // stored cursor.
+    }
 
-    conn.insert_or_ignore_identity_updates(&to_store)?;
-    Ok(updates)
+    Ok(accepted)
+}
+
+/// Fetches `inbox_id`'s **full** identity log from the node: every stored
+/// update from sequence 1, not just those above what this client already
+/// holds. Does not touch the database. xmtp-mesh restore convergence (§4.3,
+/// review 2026-09-24 I1): `resync_identity_log` calls this before purging
+/// anything, so the fetch (which can fail, e.g. the node is unreachable)
+/// never leaves the client with a purged, not-yet-reloaded inbox.
+async fn fetch_full_identity_log<ApiClient: XmtpApi>(
+    api_client: &ApiClientWrapper<ApiClient>,
+    inbox_id: &str,
+) -> Result<Vec<StoredIdentityUpdate>, ClientError> {
+    let filters = vec![GetIdentityUpdatesV2Filter {
+        inbox_id: inbox_id.to_string(),
+        sequence_id: None,
+    }];
+    let mut updates: HashMap<String, Vec<InboxUpdate>> =
+        api_client.get_identity_updates_v2(filters).await?.collect();
+    Ok(updates
+        .remove(inbox_id)
+        .unwrap_or_default()
+        .iter()
+        .map(|update| StoredIdentityUpdate {
+            inbox_id: inbox_id.to_string(),
+            sequence_id: update.sequence_id as i64,
+            server_timestamp_ns: update.server_timestamp_ns as i64,
+            payload: update.update.clone().into(),
+            originator_id: Originators::INBOX_LOG as i32,
+        })
+        .collect())
 }
 
 /// Convert a list of unverified updates to verified updates using the given smart contract verifier
@@ -776,6 +961,17 @@ pub(crate) mod tests {
         conn.insert_or_ignore_identity_updates(&[identity_update])
             .expect("insert should succeed");
     }
+
+    // xmtp-mesh restore convergence (re-review 2026-09-24 I1, race 2): the
+    // atomic check-and-write guard used to live here as
+    // `cache_write_is_still_current` plus a separate `write_to_cache` call,
+    // which the re-review found a concurrent `replace_identity_log` could
+    // still commit between. It is now `xmtp_db::QueryIdentityUpdates::
+    // write_to_cache_if_current`, one write transaction, tested at the
+    // xmtp_db level (`identity_update.rs`'s
+    // `write_to_cache_if_current_refuses_a_write_that_lost_a_race_to_a_replace`),
+    // since the guarantee it provides is entirely a property of that one
+    // DB call, not of anything client-specific here.
 
     #[rstest::rstest]
     #[xmtp_common::test]

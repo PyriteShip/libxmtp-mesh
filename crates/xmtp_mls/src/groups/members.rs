@@ -31,6 +31,18 @@ impl<Context> MlsGroup<Context>
 where
     Context: XmtpSharedContext,
 {
+    /// The signature keys (installation ids) of the group's current leaves,
+    /// sorted. xmtp-mesh uses them to pick a DM's next sequencer when the
+    /// pinned one is revoked (restore convergence §4.7).
+    pub fn leaf_installation_ids(&self) -> Result<Vec<Vec<u8>>, GroupError> {
+        let storage = self.context.mls_storage();
+        self.load_mls_group_with_lock(storage, |mls_group| {
+            let mut leaves: Vec<Vec<u8>> = mls_group.members().map(|m| m.signature_key).collect();
+            leaves.sort();
+            Ok(leaves)
+        })
+    }
+
     /// Load the member list for the group from the DB, merging together multiple installations into a single entry
     pub async fn members(&self) -> Result<Vec<GroupMember>, GroupError> {
         let db = self.context.db();

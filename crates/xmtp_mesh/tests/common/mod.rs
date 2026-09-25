@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alloy::signers::local::PrivateKeySigner;
+use prost::Message;
 use xmtp_api_d14n::{ClientBundle, MessageBackendBuilder};
 use xmtp_cryptography::utils::generate_local_wallet;
 use xmtp_db::group_message::{GroupMessageKind, MsgQueryArgs};
@@ -20,6 +21,7 @@ use xmtp_mls::identity::IdentityStrategy;
 use xmtp_mls::utils::test::register_client;
 use xmtp_mls::{Client, MlsContext};
 use xmtp_proto::api::ToBoxedClient;
+use xmtp_proto::xmtp::identity::associations::IdentityUpdate as IdentityUpdateProto;
 
 pub type MeshClient = Client<MlsContext>;
 pub type MeshGroup = MlsGroup<MlsContext>;
@@ -76,6 +78,49 @@ pub async fn association_state(node: &MeshNode, inbox_id: &str) -> AssociationSt
         verified.push(unverified.to_verified(EoaOnlyVerifier).await.unwrap());
     }
     associations::get_state(&verified).unwrap()
+}
+
+/// Re-base `peer`'s installation onto its inbox's current log (restore
+/// convergence §4.4), signed by `wallet` as the app's phrase-derived signer
+/// would. False when the log already lists the installation.
+pub async fn rebase(peer: &TestPeer, wallet: &PrivateKeySigner) -> bool {
+    let Some(mut request) = peer
+        .client
+        .identity_updates()
+        .rebase_installation_signature_request()
+        .await
+        .unwrap()
+    else {
+        return false;
+    };
+    add_wallet_signature(&mut request, wallet).await;
+    peer.client
+        .identity_updates()
+        .apply_signature_request(request)
+        .await
+        .unwrap();
+    true
+}
+
+/// The identity updates `peer`'s libxmtp client holds for `inbox_id`, oldest first.
+pub fn client_log(peer: &TestPeer, inbox_id: &str) -> Vec<IdentityUpdateProto> {
+    use xmtp_db::prelude::QueryIdentityUpdates;
+    peer.client
+        .db()
+        .get_identity_updates(inbox_id, None, None)
+        .unwrap()
+        .into_iter()
+        .map(|u| IdentityUpdateProto::decode(u.payload.as_slice()).unwrap())
+        .collect()
+}
+
+/// `node`'s log of `inbox_id`, oldest first.
+pub fn node_log(node: &MeshNode, inbox_id: &str) -> Vec<IdentityUpdateProto> {
+    node.identity_log(inbox_id)
+        .unwrap()
+        .into_iter()
+        .map(|u| u.update.unwrap())
+        .collect()
 }
 
 /// Poll `check` every 50 ms for up to 20 s.

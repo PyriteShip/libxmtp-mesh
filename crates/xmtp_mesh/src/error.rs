@@ -45,6 +45,9 @@ pub enum MeshError {
     /// The local client could not report a group's members.
     #[error("group membership: {0}")]
     Membership(String),
+    /// The local libxmtp client failed a call the node made for it.
+    #[error("local client: {0}")]
+    LocalClient(String),
 }
 
 impl MeshError {

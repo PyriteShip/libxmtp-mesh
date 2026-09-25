@@ -676,6 +676,28 @@ mock! {
             &'a self,
             inbox_ids: &'a [&'a str],
         ) -> Result<std::collections::HashMap<String, i64>, crate::ConnectionError>;
+
+        fn replace_identity_log(
+            &self,
+            inbox_id: &str,
+            rows: &[crate::identity_update::StoredIdentityUpdate],
+        ) -> Result<(), crate::ConnectionError>;
+
+        fn write_to_cache_if_current(
+            &self,
+            inbox_id: &str,
+            sequence_id: i64,
+            expected_payload: &[u8],
+            state: Vec<u8>,
+        ) -> Result<bool, crate::ConnectionError>;
+
+        fn insert_identity_updates_if_current<'a>(
+            &'a self,
+            inbox_id: &'a str,
+            cursor: Option<i64>,
+            cursor_payload: Option<&'a [u8]>,
+            rows: &'a [crate::identity_update::StoredIdentityUpdate],
+        ) -> Result<bool, crate::ConnectionError>;
     }
 
     impl QueryLocalCommitLog for DbQuery {
