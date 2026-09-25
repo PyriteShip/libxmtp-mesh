@@ -11,7 +11,9 @@ mod sync_api_tests;
 pub(crate) mod test_logs;
 mod welcomes;
 
+pub(crate) use convergence::MAX_RELAYED_IDENTITY_LOGS;
 pub use convergence::{Resolution, ResyncOutcome};
+pub(crate) use sync_api::MAX_PEER_IDENTITY_LOG;
 
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -59,6 +61,16 @@ pub(crate) struct NodeInner {
     pub(crate) replace_flap_window: Mutex<Duration>,
     /// Replaces so far (tests assert convergence settles).
     pub(crate) replacements: AtomicU64,
+    /// The identity task (convergence.rs), alive between start_sync and stop_sync.
+    pub(crate) identity_task: Mutex<Option<tokio::task::AbortHandle>>,
+    /// Test only: behave like a node from before restore convergence.
+    pub(crate) legacy_identity: AtomicBool,
+    /// Serializes `start_sync`/`stop_sync` (review M5, 2026-09-24): they
+    /// update `identity_task` and `sync` under separate locks, so a
+    /// concurrent start and stop could otherwise interleave and leave
+    /// `sync` set with no identity task, or an identity task running with
+    /// no `sync`. Held for each method's whole critical section.
+    pub(crate) sync_lifecycle: Mutex<()>,
 }
 
 /// Default time an authenticated peer has to prove inbox membership.
@@ -159,6 +171,9 @@ impl MeshNode {
                 replaced_at: Mutex::new(HashMap::new()),
                 replace_flap_window: Mutex::new(convergence::REPLACE_FLAP_WINDOW),
                 replacements: AtomicU64::new(0),
+                identity_task: Mutex::new(None),
+                legacy_identity: AtomicBool::new(false),
+                sync_lifecycle: Mutex::new(()),
             }),
         }
     }
@@ -286,6 +301,14 @@ impl MeshNode {
                 "signer is not this node's installation".into(),
             ));
         }
+        // M5 (review 2026-09-24): held for the whole critical section, so a
+        // concurrent `stop_sync` can't interleave between the identity task
+        // swap and the `sync` config write.
+        let _lifecycle = self.inner.sync_lifecycle.lock();
+        let task = self.spawn_identity_task(&runtime, membership.clone());
+        if let Some(old) = self.inner.identity_task.lock().replace(task) {
+            old.abort();
+        }
         *self.inner.sync.lock() = Some(SyncConfig {
             signer,
             transport,
@@ -339,6 +362,11 @@ impl MeshNode {
     /// transport. Frames and connections reported afterwards are ignored
     /// until the next `start_sync` (which may use a new transport).
     pub fn stop_sync(&self) {
+        // M5 (review 2026-09-24): see `start_sync`.
+        let _lifecycle = self.inner.sync_lifecycle.lock();
+        if let Some(task) = self.inner.identity_task.lock().take() {
+            task.abort();
+        }
         let mut sync = self.inner.sync.lock();
         *sync = None;
         let mut sessions = self.inner.sessions.lock();
@@ -413,6 +441,19 @@ impl MeshNode {
                 peer,
                 inbox_id,
                 installation,
+            }]);
+        }
+    }
+
+    /// The session's peer lost its verification (its installation left its
+    /// inbox's log): drop it from presence. Only the current session may.
+    pub(crate) fn session_unverified(&self, peer: &str, session_id: u64) {
+        let sessions = self.inner.sessions.lock();
+        if sessions.get(peer).is_some_and(|h| h.id == session_id)
+            && self.inner.verified.lock().remove(peer).is_some()
+        {
+            self.emit(vec![NodeEvent::PeerLost {
+                peer: peer.to_string(),
             }]);
         }
     }

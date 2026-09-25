@@ -89,7 +89,7 @@ pub struct Frame {
     pub ttl: u32,
     #[prost(uint32, tag = "3")]
     pub hops: u32,
-    #[prost(oneof = "frame::Body", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18")]
+    #[prost(oneof = "frame::Body", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19")]
     pub body: Option<frame::Body>,
 }
 
@@ -114,6 +114,11 @@ pub mod frame {
         Sequenced(super::Sequenced),
         #[prost(message, tag = "18")]
         Pending(super::Pending),
+        /// Restore convergence (§4.2): our log of `inbox_id` beats the one
+        /// the peer sent or holds (earlier sequence-1 origin). Old nodes
+        /// decode this as an empty frame and ignore it.
+        #[prost(message, tag = "19")]
+        IdentityConflict(super::IdentityLog),
     }
 }
 
@@ -261,5 +266,58 @@ mod tests {
     fn oversized_input_is_rejected() {
         let err = decode(&vec![0u8; MAX_FRAME_LEN + 1]).unwrap_err();
         assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    /// Backward compatibility (§4.2): a mesh.7 node's Frame has no tag 19, so
+    /// it decodes an IdentityConflict as an empty frame, a non-fatal error
+    /// that the session logs and ignores.
+    #[test]
+    fn an_old_node_reads_identity_conflict_as_an_empty_frame() {
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct OldFrame {
+            #[prost(uint32, tag = "1")]
+            version: u32,
+            #[prost(uint32, tag = "2")]
+            ttl: u32,
+            #[prost(uint32, tag = "3")]
+            hops: u32,
+            #[prost(oneof = "old::Body", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18")]
+            body: Option<old::Body>,
+        }
+        mod old {
+            #[derive(Clone, PartialEq, prost::Oneof)]
+            pub enum Body {
+                #[prost(message, tag = "10")]
+                Hello(crate::sync::frames::Hello),
+                #[prost(message, tag = "11")]
+                Auth(crate::sync::frames::Auth),
+                #[prost(message, tag = "12")]
+                IdentityLog(crate::sync::frames::IdentityLog),
+                #[prost(message, tag = "13")]
+                KeyPackage(crate::sync::frames::KeyPackage),
+                #[prost(message, tag = "14")]
+                Welcome(crate::sync::frames::Welcome),
+                #[prost(message, tag = "15")]
+                WelcomeAck(crate::sync::frames::WelcomeAck),
+                #[prost(message, tag = "16")]
+                Interest(crate::sync::frames::Interest),
+                #[prost(message, tag = "17")]
+                Sequenced(crate::sync::frames::Sequenced),
+                #[prost(message, tag = "18")]
+                Pending(crate::sync::frames::Pending),
+            }
+        }
+        let bytes = encode(frame::Body::IdentityConflict(IdentityLog {
+            inbox_id: "inbox".into(),
+            updates: vec![],
+        }));
+        let old = OldFrame::decode(bytes.as_slice()).unwrap();
+        assert_eq!(old.version, FRAME_VERSION);
+        assert!(old.body.is_none(), "the old node sees no body");
+        assert!(!MeshError::InvalidRequest("empty frame".into()).is_fatal());
+        assert!(matches!(
+            decode(&bytes).unwrap(),
+            frame::Body::IdentityConflict(IdentityLog { inbox_id, .. }) if inbox_id == "inbox"
+        ));
     }
 }

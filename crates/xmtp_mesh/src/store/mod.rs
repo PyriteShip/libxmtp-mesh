@@ -329,6 +329,14 @@ impl MeshStore {
         Ok(rows.into_iter().next().map(|r| r.v))
     }
 
+    /// Every inbox this store holds an identity log for, sorted.
+    pub fn identity_inboxes(&mut self) -> Result<Vec<String>, MeshError> {
+        let rows: Vec<TextRow> =
+            sql_query("SELECT DISTINCT inbox_id AS v FROM identity_updates ORDER BY inbox_id")
+                .load(&mut self.conn)?;
+        Ok(rows.into_iter().map(|r| r.v).collect())
+    }
+
     // ---- key packages ----
 
     pub fn put_key_package(

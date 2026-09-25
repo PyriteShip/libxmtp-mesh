@@ -16,11 +16,14 @@
 //! [`UnverifiedIdentityUpdate::signature_text`](xmtp_id::associations::unverified::UnverifiedIdentityUpdate::signature_text),
 //! never on raw bytes or nanoseconds.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use futures::future::try_join_all;
 use prost::Message;
+use tokio::sync::broadcast;
 use xmtp_configuration::MAX_INSTALLATIONS_PER_INBOX;
 use xmtp_id::associations;
 use xmtp_id::associations::unverified::UnverifiedIdentityUpdate;
@@ -33,11 +36,31 @@ use super::sync_api::MAX_PEER_IDENTITY_LOG;
 use super::{MeshNode, NodeEvent};
 use crate::MeshError;
 use crate::store::{IdentityRow, sha256};
+use crate::sync::GroupMembership;
 
 /// At most one replace per inbox in this window (flap guard, §4.3). Kept in
 /// memory only (`NodeInner::replaced_at`): it resets on node restart and is
 /// never pruned. The spec's "per 60 s" allows this (M2, review 2026-09-24).
 pub(crate) const REPLACE_FLAP_WINDOW: Duration = Duration::from_secs(60);
+
+/// Most held logs a session relays to one verified peer (§4.2).
+pub(crate) const MAX_RELAYED_IDENTITY_LOGS: usize = 32;
+
+/// How often the identity task retries a client resync that failed with a
+/// `LocalClient` error (Task 2 review carry). Matches
+/// `sync::session::MEMBERSHIP_RETRY_INTERVAL`'s cadence.
+pub(crate) const IDENTITY_TASK_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Completes at `deadline`, or never when there is none (mirrors
+/// `sync::session::until`). M1 (review 2026-09-24): a fixed
+/// `tokio::time::Instant`, not a duration re-measured from "now" -- see
+/// [`MeshNode::spawn_identity_task`].
+async fn identity_task_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
 
 /// The exact text `proto`'s signatures cover
 /// ([`UnverifiedIdentityUpdate::signature_text`]). This is the only content
@@ -75,14 +98,71 @@ pub(crate) fn origin_rank(proto: &IdentityUpdateProto) -> Result<OriginRank, Mes
 }
 
 /// What a peer's copy of an inbox's identity log meant for ours.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum Resolution {
     /// Same sequence-1 update, or we held none: ingested as before (Rule B).
     SameOrigin,
     /// Theirs has the earlier origin: ours was replaced by it.
     Replaced,
-    /// Ours has the earlier origin: nothing changed; the peer should get ours.
-    OursWins,
+    /// Ours has the earlier origin: nothing changed. Carries the peer's
+    /// fully verified candidate state (review 2026-09-24 C1/R5): a
+    /// `Resolution` is never produced from unverified content, and a
+    /// caller must never reply with our log based on rank alone -- the
+    /// session uses this state to prove a restoring owner's own claimed-
+    /// inbox candidate actually lists its authenticated installation
+    /// before ever sending our log back.
+    OursWins(Box<associations::AssociationState>),
+}
+
+/// Verifies `updates` in isolation (no store access): caps at
+/// [`MAX_PEER_IDENTITY_LOG`], sorts and checks a contiguous 1..=N with
+/// every update's `inbox_id` matching, verifies every signature, and
+/// computes the resulting `AssociationState`. Shared by
+/// `MeshNode::{replace_identity_log, resolve_identity_log,
+/// claimed_log_proves_installation}` (review 2026-09-24 C1/R5): a
+/// candidate log is never ranked, replied to or replaced before it
+/// verifies.
+async fn verify_candidate_log(
+    inbox_id: &str,
+    mut updates: Vec<IdentityUpdateLog>,
+) -> Result<
+    (
+        Vec<IdentityUpdateLog>,
+        Vec<IdentityUpdateProto>,
+        associations::AssociationState,
+    ),
+    MeshError,
+> {
+    if updates.is_empty() || updates.len() as i64 > MAX_PEER_IDENTITY_LOG {
+        return Err(MeshError::IdentityRejected(format!(
+            "replacement log for {inbox_id} has {} updates (1..={MAX_PEER_IDENTITY_LOG} allowed)",
+            updates.len()
+        )));
+    }
+    updates.sort_by_key(|u| u.sequence_id);
+    let mut protos = Vec::with_capacity(updates.len());
+    for (i, u) in updates.iter().enumerate() {
+        if u.sequence_id != i as u64 + 1 {
+            return Err(MeshError::IdentityRejected(format!(
+                "replacement log for {inbox_id} has a gap before sequence {}",
+                i + 1
+            )));
+        }
+        let proto = u
+            .update
+            .clone()
+            .ok_or_else(|| MeshError::InvalidRequest("empty identity update".into()))?;
+        if proto.inbox_id != inbox_id {
+            return Err(MeshError::IdentityRejected(
+                "update inbox id mismatch".into(),
+            ));
+        }
+        protos.push(proto);
+    }
+    let verified = try_join_all(protos.iter().map(verify)).await?;
+    let state = associations::get_state(&verified)
+        .map_err(|e| MeshError::IdentityRejected(e.to_string()))?;
+    Ok((updates, protos, state))
 }
 
 /// What the local client did after the node replaced an inbox's log.
@@ -100,11 +180,16 @@ pub enum ResyncOutcome {
 impl MeshNode {
     /// §4.2: reconcile a peer's copy of `inbox_id`'s log with ours.
     ///
-    /// M5 (review 2026-09-24): `#[allow(dead_code)]` because this task's own
-    /// tests are its only caller; `sync/session.rs`'s `on_identity_log`
-    /// (§4.2) calls it in production starting with the task that wires that
-    /// session up (mesh.8 Task 4).
-    #[allow(dead_code)]
+    /// Review 2026-09-24 C1/R5: a candidate whose sequence-1 update starts
+    /// a different origin from ours is never ranked, replaced or reported
+    /// as a winner before it fully verifies (every signature, contiguous
+    /// 1..=N, every update's `inbox_id`) -- an unverified log can never
+    /// produce [`Resolution::OursWins`], which is what a session may reply
+    /// with. M4: a candidate that would rank earlier by the cheap,
+    /// unverified comparison alone is refused outright, skipping that
+    /// verification, when the inbox is still inside its flap window: a
+    /// genuinely verified winner would be refused by the same guard in
+    /// [`Self::replace_identity_log_verified`] anyway.
     pub(crate) async fn resolve_identity_log(
         &self,
         inbox_id: &str,
@@ -117,28 +202,72 @@ impl MeshNode {
             .identity_rows(inbox_id, 0)?
             .into_iter()
             .next();
-        let theirs = updates
+        let Some(ours) = ours else {
+            self.ingest_identity_log(inbox_id, updates).await?;
+            return Ok(Resolution::SameOrigin);
+        };
+        let ours_proto = IdentityUpdateProto::decode(ours.update_bytes.as_slice())?;
+        let theirs_first = updates
             .iter()
             .find(|u| u.sequence_id == 1)
             .and_then(|u| u.update.clone());
-        match (ours, theirs) {
-            (Some(ours), Some(theirs)) => {
-                let ours_proto = IdentityUpdateProto::decode(ours.update_bytes.as_slice())?;
-                if same_origin(&ours_proto, &theirs)? {
-                    self.ingest_identity_log(inbox_id, updates).await?;
-                    Ok(Resolution::SameOrigin)
-                } else if origin_rank(&theirs)? < origin_rank(&ours_proto)? {
-                    self.replace_identity_log(inbox_id, updates).await?;
-                    Ok(Resolution::Replaced)
-                } else {
-                    Ok(Resolution::OursWins)
-                }
-            }
-            _ => {
-                self.ingest_identity_log(inbox_id, updates).await?;
-                Ok(Resolution::SameOrigin)
-            }
+        let Some(theirs_first) = theirs_first else {
+            self.ingest_identity_log(inbox_id, updates).await?;
+            return Ok(Resolution::SameOrigin);
+        };
+        if same_origin(&ours_proto, &theirs_first)? {
+            self.ingest_identity_log(inbox_id, updates).await?;
+            return Ok(Resolution::SameOrigin);
         }
+        if origin_rank(&theirs_first)? < origin_rank(&ours_proto)? && self.flap_blocked(inbox_id) {
+            return Err(self.flap_blocked_error(inbox_id));
+        }
+        let (updates, protos, state) = verify_candidate_log(inbox_id, updates).await?;
+        if origin_rank(&protos[0])? < origin_rank(&ours_proto)? {
+            self.replace_identity_log_verified(updates, protos, state)
+                .await?;
+            Ok(Resolution::Replaced)
+        } else {
+            Ok(Resolution::OursWins(Box::new(state)))
+        }
+    }
+
+    /// Whether `updates` (the peer's own claim for `inbox_id`, e.g. on the
+    /// `IdentityConflict` claimed-inbox path, review C1/R5) fully verifies
+    /// and its resulting state lists `installation` -- the restoring
+    /// owner's bootstrap proof: a genuine installation on a genuine fork.
+    /// Touches no store state; a verification failure is `Ok(false)`, not
+    /// an error, so the caller can stay silent either way.
+    pub(crate) async fn claimed_log_proves_installation(
+        &self,
+        inbox_id: &str,
+        updates: &[IdentityUpdateLog],
+        installation: &[u8],
+    ) -> Result<bool, MeshError> {
+        match verify_candidate_log(inbox_id, updates.to_vec()).await {
+            Ok((_, _, state)) => Ok(state.installation_ids().contains(&installation.to_vec())),
+            Err(_) => Ok(false),
+        }
+    }
+
+    /// The flap guard (§4.3), checked from just `inbox_id` alone: cheap,
+    /// and content-independent, so it can run before the expensive
+    /// per-update signature verification (M4, review 2026-09-24).
+    fn flap_blocked(&self, inbox_id: &str) -> bool {
+        let window = *self.inner.replace_flap_window.lock();
+        self.inner
+            .replaced_at
+            .lock()
+            .get(inbox_id)
+            .is_some_and(|at| at.elapsed() < window)
+    }
+
+    fn flap_blocked_error(&self, inbox_id: &str) -> MeshError {
+        let window = *self.inner.replace_flap_window.lock();
+        MeshError::IdentityRejected(format!(
+            "identity log of {inbox_id} was replaced less than {}s ago",
+            window.as_secs()
+        ))
     }
 
     /// Replace this node's log of `inbox_id` with `updates` (restore
@@ -151,15 +280,10 @@ impl MeshNode {
     ///   signature text: [`same_origin`] is D7's later-divergence case),
     /// - and this inbox was not replaced in the last [`REPLACE_FLAP_WINDOW`].
     ///
-    /// Only once the candidate has actually won those checks (I1, review
-    /// 2026-09-24) does it also have to clear the owner's-own-inbox cap
-    /// guard: for our own inbox, a winner that is full
-    /// ([`MAX_INSTALLATIONS_PER_INBOX`]) and omits this installation is
-    /// refused, and `IdentityResynced { TooManyInstallations }` is reported:
-    /// keeping our log keeps the phone usable with contacts on it (§4.4). A
-    /// losing, same-origin or flap-blocked full log never raises that
-    /// banner, since (`F11`) it clears only after a successful re-base,
-    /// which a losing log will never trigger.
+    /// M4 (review 2026-09-24): the flap guard needs only `inbox_id`, so it
+    /// is checked before the expensive per-update verification -- a
+    /// forged or repeated candidate for a just-replaced inbox is refused
+    /// without paying for signatures that could never matter.
     ///
     /// Swaps the log and its identifier mappings in one transaction and
     /// emits `IdentityLogReplaced` after it commits. Never touches groups,
@@ -169,37 +293,41 @@ impl MeshNode {
     pub async fn replace_identity_log(
         &self,
         inbox_id: &str,
-        mut updates: Vec<IdentityUpdateLog>,
+        updates: Vec<IdentityUpdateLog>,
     ) -> Result<(), MeshError> {
-        if updates.is_empty() || updates.len() as i64 > MAX_PEER_IDENTITY_LOG {
-            return Err(MeshError::IdentityRejected(format!(
-                "replacement log for {inbox_id} has {} updates (1..={MAX_PEER_IDENTITY_LOG} allowed)",
-                updates.len()
-            )));
+        if self.flap_blocked(inbox_id) {
+            return Err(self.flap_blocked_error(inbox_id));
         }
-        updates.sort_by_key(|u| u.sequence_id);
-        let mut protos = Vec::with_capacity(updates.len());
-        for (i, u) in updates.iter().enumerate() {
-            if u.sequence_id != i as u64 + 1 {
-                return Err(MeshError::IdentityRejected(format!(
-                    "replacement log for {inbox_id} has a gap before sequence {}",
-                    i + 1
-                )));
-            }
-            let proto = u
-                .update
-                .clone()
-                .ok_or_else(|| MeshError::InvalidRequest("empty identity update".into()))?;
-            if proto.inbox_id != inbox_id {
-                return Err(MeshError::IdentityRejected(
-                    "update inbox id mismatch".into(),
-                ));
-            }
-            protos.push(proto);
-        }
-        let verified = try_join_all(protos.iter().map(verify)).await?;
-        let state = associations::get_state(&verified)
-            .map_err(|e| MeshError::IdentityRejected(e.to_string()))?;
+        let (updates, protos, state) = verify_candidate_log(inbox_id, updates).await?;
+        self.replace_identity_log_verified(updates, protos, state)
+            .await
+    }
+
+    /// The rest of [`Self::replace_identity_log`], given an already fully
+    /// verified candidate (its protos and resulting `AssociationState`):
+    /// wins under §4.1 against the stored log (a stored log must exist,
+    /// and the two must have different signature text: [`same_origin`] is
+    /// D7's later-divergence case), and this inbox was not replaced in the
+    /// last [`REPLACE_FLAP_WINDOW`] (re-checked here under the store lock,
+    /// even though callers already made the cheap check above -- this is
+    /// the authoritative check against a concurrent replace).
+    ///
+    /// Only once the candidate has actually won those checks (I1, review
+    /// 2026-09-24) does it also have to clear the owner's-own-inbox cap
+    /// guard: for our own inbox, a winner that is full
+    /// ([`MAX_INSTALLATIONS_PER_INBOX`]) and omits this installation is
+    /// refused, and `IdentityResynced { TooManyInstallations }` is reported:
+    /// keeping our log keeps the phone usable with contacts on it (§4.4). A
+    /// losing, same-origin or flap-blocked full log never raises that
+    /// banner, since (`F11`) it clears only after a successful re-base,
+    /// which a losing log will never trigger.
+    async fn replace_identity_log_verified(
+        &self,
+        updates: Vec<IdentityUpdateLog>,
+        protos: Vec<IdentityUpdateProto>,
+        state: associations::AssociationState,
+    ) -> Result<(), MeshError> {
+        let inbox_id = protos[0].inbox_id.as_str();
         let rows: Vec<IdentityRow> = updates
             .iter()
             .zip(&protos)
@@ -289,6 +417,181 @@ impl MeshNode {
         );
         self.emit(vec![NodeEvent::IdentityLogReplaced(inbox_id.to_string())]);
         Ok(())
+    }
+
+    /// Whether this node holds any identity log for `inbox_id`.
+    pub(crate) fn holds_identity_log(&self, inbox_id: &str) -> Result<bool, MeshError> {
+        Ok(self.inner.store.lock().identity_len(inbox_id)? > 0)
+    }
+
+    /// Every inbox whose log this node holds, except those in `skip`. The
+    /// session narrows this to inboxes that share a group with the peer
+    /// (§4.2) and caps it at [`MAX_RELAYED_IDENTITY_LOGS`].
+    pub(crate) fn relayable_inboxes(&self, skip: &[&str]) -> Result<Vec<String>, MeshError> {
+        Ok(self
+            .inner
+            .store
+            .lock()
+            .identity_inboxes()?
+            .into_iter()
+            .filter(|inbox| !skip.contains(&inbox.as_str()))
+            .collect())
+    }
+
+    /// The groups this node knows (every group the local client used).
+    pub(crate) fn known_group_ids(&self) -> Result<Vec<Vec<u8>>, MeshError> {
+        self.inner.store.lock().known_groups()
+    }
+
+    /// Inboxes replaced within the flap window, which a lagged identity task
+    /// must resync again in case it missed their IdentityLogReplaced.
+    pub(crate) fn recently_replaced(&self) -> Vec<String> {
+        let window = *self.inner.replace_flap_window.lock();
+        self.inner
+            .replaced_at
+            .lock()
+            .iter()
+            .filter(|(_, at)| at.elapsed() < window.max(REPLACE_FLAP_WINDOW))
+            .map(|(inbox, _)| inbox.clone())
+            .collect()
+    }
+
+    pub(crate) fn legacy_identity(&self) -> bool {
+        self.inner.legacy_identity.load(Ordering::Relaxed)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn set_legacy_identity_for_test(&self) {
+        self.inner.legacy_identity.store(true, Ordering::Relaxed);
+    }
+
+    /// Runs between start_sync and stop_sync: after this node replaced an
+    /// inbox's log, the local client drops its copy and reloads (§4.3), and
+    /// the outcome is reported as IdentityResynced; the owner's re-base
+    /// (§4.4) starts from it. Holds the client (through `membership`), so
+    /// stop_sync aborts it.
+    ///
+    /// Task 2 review carry: if the client adapter fails with a `LocalClient`
+    /// error (its database was busy or briefly unreachable, not a rejection
+    /// of the log itself), the inbox is queued and retried every
+    /// [`IDENTITY_TASK_RETRY_INTERVAL`] until it succeeds, so a transient
+    /// failure never leaves the local client stuck on a purged or forked
+    /// copy of the inbox's log -- including our own.
+    ///
+    /// M1 (review 2026-09-24): the retry deadline is a fixed
+    /// `tokio::time::Instant`, not a duration re-measured from "now" on
+    /// every loop iteration. The old code rebuilt a relative sleep every
+    /// time `select!` ran, so any event -- including this task's own
+    /// `IdentityResynced` -- restarted the wait, and steady event traffic
+    /// starved the retry forever. A fixed deadline fires on schedule
+    /// regardless of how many times the surrounding future is
+    /// reconstructed. A sustained `LocalClient` outage is logged once,
+    /// then every 10th attempt, not on every retry.
+    pub(crate) fn spawn_identity_task(
+        &self,
+        runtime: &tokio::runtime::Handle,
+        membership: Arc<dyn GroupMembership>,
+    ) -> tokio::task::AbortHandle {
+        let node = self.clone();
+        let mut events = self.subscribe_events();
+        runtime
+            .spawn(async move {
+                let mut pending: HashMap<String, u32> = HashMap::new();
+                let mut retry_at: Option<tokio::time::Instant> = None;
+                loop {
+                    tokio::select! {
+                        biased;
+                        event = events.recv() => match event {
+                            Ok(NodeEvent::IdentityLogReplaced(inbox_id)) => {
+                                node.retry_resync(membership.as_ref(), inbox_id, &mut pending).await;
+                            }
+                            Ok(_) => {}
+                            Err(broadcast::error::RecvError::Lagged(_)) => {
+                                for inbox_id in node.recently_replaced() {
+                                    node.retry_resync(membership.as_ref(), inbox_id, &mut pending).await;
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        },
+                        _ = identity_task_until(retry_at) => {
+                            retry_at = None;
+                            for inbox_id in pending.keys().cloned().collect::<Vec<_>>() {
+                                node.retry_resync(membership.as_ref(), inbox_id, &mut pending).await;
+                            }
+                        }
+                    }
+                    // M1: only arm a *new* deadline when none is already
+                    // pending -- an unrelated event must never push a
+                    // scheduled retry further into the future, or steady
+                    // traffic starves it exactly as before this fix.
+                    if retry_at.is_none() && !pending.is_empty() {
+                        retry_at = Some(tokio::time::Instant::now() + IDENTITY_TASK_RETRY_INTERVAL);
+                    }
+                }
+            })
+            .abort_handle()
+    }
+
+    /// Calls [`Self::resync_client`] for `inbox_id`; on success (or a
+    /// non-retryable error) removes it from `pending`, on a retryable
+    /// `LocalClient` error bumps its attempt count so the next retry's log
+    /// line (if any) reflects it.
+    async fn retry_resync(
+        &self,
+        membership: &dyn GroupMembership,
+        inbox_id: String,
+        pending: &mut HashMap<String, u32>,
+    ) {
+        let attempt = pending.get(&inbox_id).copied().unwrap_or(0) + 1;
+        if self
+            .resync_client(membership, inbox_id.clone(), attempt)
+            .await
+        {
+            pending.remove(&inbox_id);
+        } else {
+            pending.insert(inbox_id, attempt);
+        }
+    }
+
+    /// True when nothing more needs doing for `inbox_id` (it resynced, or
+    /// the error is not the transient `LocalClient` kind); false when it
+    /// should be retried (see [`Self::spawn_identity_task`]). `attempt` is
+    /// 1 for the first try; a `LocalClient` failure is logged only on
+    /// attempt 1 and every 10th attempt after that (M1: cap log spam under
+    /// a sustained outage).
+    async fn resync_client(
+        &self,
+        membership: &dyn GroupMembership,
+        inbox_id: String,
+        attempt: u32,
+    ) -> bool {
+        match membership.identity_log_replaced(&inbox_id).await {
+            Ok(outcome) => {
+                tracing::info!(
+                    inbox_id,
+                    ?outcome,
+                    "local client reloaded a replaced identity log"
+                );
+                self.emit(vec![NodeEvent::IdentityResynced { inbox_id, outcome }]);
+                true
+            }
+            Err(e @ MeshError::LocalClient(_)) => {
+                if attempt == 1 || attempt % 10 == 0 {
+                    tracing::warn!(
+                        inbox_id,
+                        attempt,
+                        error = %e,
+                        "local client could not reload a replaced identity log; will retry"
+                    );
+                }
+                false
+            }
+            Err(e) => {
+                tracing::warn!(inbox_id, error = %e, "local client could not reload a replaced identity log");
+                true
+            }
+        }
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -385,12 +688,12 @@ mod tests {
 
         let mut rx = node.subscribe_events();
         let winner = vec![older.clone(), added_wallet(&owner, &inbox, 2, 1_002).await];
-        assert_eq!(
+        assert!(matches!(
             node.resolve_identity_log(&inbox, winner.clone())
                 .await
                 .unwrap(),
             Resolution::Replaced
-        );
+        ));
         let held: Vec<Vec<u8>> = node
             .identity_log(&inbox)
             .unwrap()
@@ -425,11 +728,15 @@ mod tests {
         node.ingest_identity_log(&inbox, vec![older.clone()])
             .await
             .unwrap();
-        assert_eq!(
-            node.resolve_identity_log(&inbox, vec![newer])
-                .await
-                .unwrap(),
-            Resolution::OursWins
+        let resolution = node
+            .resolve_identity_log(&inbox, vec![newer])
+            .await
+            .unwrap();
+        // review C1/R5: OursWins is only ever produced from a fully
+        // verified candidate.
+        assert!(
+            matches!(resolution, Resolution::OursWins(_)),
+            "expected OursWins, got {resolution:?}"
         );
         assert_eq!(first_bytes(&node, &inbox), bytes(&older));
         assert_eq!(node.replacements_for_test(), 0);
@@ -446,10 +753,10 @@ mod tests {
             .await
             .unwrap();
         let longer = vec![first, added_wallet(&owner, &inbox, 2, 1_002).await];
-        assert_eq!(
+        assert!(matches!(
             node.resolve_identity_log(&inbox, longer).await.unwrap(),
             Resolution::SameOrigin
-        );
+        ));
         assert_eq!(node.identity_log(&inbox).unwrap().len(), 2);
     }
 
@@ -834,6 +1141,119 @@ mod tests {
             drain(&mut rx)
                 .iter()
                 .any(|e| matches!(e, NodeEvent::IdentityLogChanged(i) if *i == inbox))
+        );
+    }
+
+    /// A [`GroupMembership`] whose `identity_log_replaced` fails with
+    /// `LocalClient` the first `fail_times` calls, then succeeds.
+    struct FlakyLocalClient {
+        remaining_failures: std::sync::atomic::AtomicUsize,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl GroupMembership for FlakyLocalClient {
+        async fn member_inboxes(&self, _group_id: &[u8]) -> Result<Option<Vec<String>>, MeshError> {
+            Ok(None)
+        }
+
+        async fn identity_log_replaced(&self, _inbox_id: &str) -> Result<ResyncOutcome, MeshError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let prev = self.remaining_failures.load(Ordering::Relaxed);
+            if prev > 0 {
+                self.remaining_failures.fetch_sub(1, Ordering::Relaxed);
+                return Err(MeshError::LocalClient("db busy".into()));
+            }
+            Ok(ResyncOutcome::Reloaded)
+        }
+    }
+
+    /// Task 2 review carry: a `LocalClient` error from the client adapter is
+    /// retried later, so the own inbox is not left empty/unresynced forever.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_local_client_error_is_retried_until_it_succeeds() {
+        let node = MeshNode::in_memory().unwrap();
+        let membership = Arc::new(FlakyLocalClient {
+            remaining_failures: std::sync::atomic::AtomicUsize::new(2),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut rx = node.subscribe_events();
+        let handle =
+            node.spawn_identity_task(&tokio::runtime::Handle::current(), membership.clone());
+
+        node.emit(vec![NodeEvent::IdentityLogReplaced("inbox".into())]);
+
+        let resynced = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let NodeEvent::IdentityResynced { inbox_id, outcome } = rx.recv().await.unwrap()
+                {
+                    return (inbox_id, outcome);
+                }
+            }
+        })
+        .await
+        .expect("the inbox is eventually resynced, not left empty forever");
+
+        assert_eq!(resynced, ("inbox".to_string(), ResyncOutcome::Reloaded));
+        assert!(
+            membership.calls.load(Ordering::Relaxed) >= 3,
+            "expected at least 1 failing call and 1 retry that succeeds, got {}",
+            membership.calls.load(Ordering::Relaxed)
+        );
+        handle.abort();
+    }
+
+    /// Review 2026-09-24 C1/R5: `claimed_log_proves_installation` (the
+    /// restoring-owner bootstrap proof on the `IdentityConflict`
+    /// claimed-inbox path) is `Ok(false)` for a candidate that does not
+    /// verify -- a forged claim, however later-ranked, proves nothing and
+    /// so a session must never reply to it. The positive case (a genuine
+    /// fork that verifies and lists its own installation) is exercised
+    /// end-to-end by `tests/convergence.rs`'s
+    /// `an_early_clock_on_the_restored_phone_makes_the_original_re_base`
+    /// and `a_restored_owner_and_its_contacts_converge_on_the_older_log`,
+    /// both of which depend on exactly this proof succeeding for a real
+    /// fork.
+    #[tokio::test]
+    async fn claimed_log_proves_installation_rejects_an_unverifiable_candidate() {
+        let owner = generate_local_wallet();
+        let inbox = owner.get_inbox_id(0);
+        let node = MeshNode::in_memory().unwrap();
+        let forged = vec![IdentityUpdateLog {
+            sequence_id: 1,
+            server_timestamp_ns: 1,
+            update: Some(IdentityUpdateProto {
+                actions: vec![],
+                client_timestamp_ns: 1,
+                inbox_id: inbox.clone(),
+            }),
+        }];
+        assert!(
+            !node
+                .claimed_log_proves_installation(&inbox, &forged, b"any-installation-32-bytes!!")
+                .await
+                .unwrap()
+        );
+    }
+
+    /// The positive mirror: a genuinely verified candidate that does list
+    /// the asked-about installation proves it.
+    #[tokio::test]
+    async fn claimed_log_proves_installation_accepts_a_genuine_candidate() {
+        let owner = generate_local_wallet();
+        let inbox = owner.get_inbox_id(0);
+        let create = origin(&owner).await;
+        let key = XmtpInstallationCredential::new();
+        let add = added_installation(&owner, &inbox, 2, &key).await;
+        let node = MeshNode::in_memory().unwrap();
+        assert!(
+            node.claimed_log_proves_installation(
+                &inbox,
+                &[create, add],
+                &key.public_slice().to_vec()
+            )
+            .await
+            .unwrap()
         );
     }
 }

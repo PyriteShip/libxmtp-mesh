@@ -15,7 +15,9 @@ use super::frames::{
 use super::membership::GroupMembership;
 use super::transport::{MeshTransport, PeerId};
 use crate::MeshError;
-use crate::node::{MeshNode, NodeEvent};
+use crate::node::{
+    MAX_PEER_IDENTITY_LOG, MAX_RELAYED_IDENTITY_LOGS, MeshNode, NodeEvent, Resolution,
+};
 
 pub(crate) struct SessionHandle {
     /// Distinguishes this session from earlier/later ones for the same peer.
@@ -158,6 +160,11 @@ pub(crate) struct Session {
     deferred: HashMap<Vec<u8>, Deferred>,
     /// When the deferred groups are next re-checked.
     retry_at: Option<Instant>,
+    /// Inboxes an `IdentityConflict` reply was already sent for this
+    /// session (review I1, 2026-09-24): at most one per inbox per session,
+    /// so a peer can't flood the link. Cleared for an inbox once our log
+    /// of it actually changes.
+    conflict_sent: HashSet<String>,
 }
 
 pub(crate) fn spawn(
@@ -192,6 +199,7 @@ pub(crate) fn spawn(
         peer_interest: HashSet::new(),
         deferred: HashMap::new(),
         retry_at: None,
+        conflict_sent: HashSet::new(),
     };
     runtime.spawn(session.run(rx, events, wake));
     handle
@@ -418,12 +426,65 @@ impl Session {
         self.on_verified().await
     }
 
-    /// Only the log of the inbox the peer claimed in its Hello is accepted
-    /// (peers exchange each other's logs, spec §5); others are ignored.
-    /// Ingest it, then require the peer's installation to be a member. The
-    /// membership check runs even when ingestion failed part-way: a peer that
-    /// cannot prove membership with what we hold is dropped.
+    /// The peer's identity log for `log.inbox_id`. The log of the inbox the
+    /// peer claimed in its Hello proves (or disproves) its membership. Any
+    /// other inbox's log is a relay (§4.2), which only ever reconciles a log
+    /// we already hold. When the two copies start differently, the one with
+    /// the earlier origin wins on every node (§4.1): ours is replaced, or the
+    /// peer is sent ours in an IdentityConflict and stays unverified until
+    /// the verification deadline (an owner re-bases meanwhile, §4.4) instead
+    /// of being dropped. PeerNotMember stays fatal when the logs agree and
+    /// the peer is still not a member.
     async fn on_identity_log(&mut self, log: IdentityLog) -> Result<(), MeshError> {
+        if self.node.legacy_identity() {
+            return self.on_identity_log_legacy(log).await;
+        }
+        if self.peer_inbox.as_deref() != Some(log.inbox_id.as_str()) {
+            return self.on_relayed_identity_log(log).await;
+        }
+        let inbox_id = log.inbox_id.clone();
+        let resolved = self.node.resolve_identity_log(&inbox_id, log.updates).await;
+        if let Ok(Resolution::OursWins(candidate_state)) = &resolved {
+            // R5(b) (review 2026-09-24 C1): the peer's own submitted, fully
+            // verified log for its claimed inbox must actually list the
+            // installation it just authenticated as, before it gets our
+            // log back -- the restoring-owner bootstrap proof. A stranger
+            // whose later-ranked (but genuinely signed) claim doesn't list
+            // its own installation gets nothing. Either way, a losing
+            // claimed-inbox submission never proceeds to the membership
+            // check below: our own (unchanged, winning) log is what the
+            // peer needs to catch up to first, exactly as before this
+            // task's C1/R5 fix (the original code returned unconditionally
+            // here too).
+            if candidate_state
+                .installation_ids()
+                .contains(&self.peer_installation())
+            {
+                self.send_identity_conflict(&inbox_id)?;
+                return Ok(());
+            }
+            // N1 (review 2026-09-24, re-review 1): a failed proof must
+            // disconnect exactly like the "we hold nothing for this inbox"
+            // case below (fatal `PeerNotMember`), not linger connected
+            // until the verification deadline -- otherwise how long a
+            // stranger stays connected (immediately dropped vs. 10 s)
+            // itself reveals whether we hold the inbox, reopening C1
+            // through disconnect timing alone even though no frame is
+            // ever sent.
+            return Err(MeshError::PeerNotMember);
+        }
+        if !self.verified {
+            if !self.is_member(&inbox_id).await? {
+                return Err(MeshError::PeerNotMember);
+            }
+            self.mark_verified().await?;
+        }
+        resolved.map(|_| ())
+    }
+
+    /// Before restore convergence (and in tests that emulate such a node):
+    /// only the claimed inbox's log counts; ingest, then require membership.
+    async fn on_identity_log_legacy(&mut self, log: IdentityLog) -> Result<(), MeshError> {
         if self.peer_inbox.as_deref() != Some(log.inbox_id.as_str()) {
             return Ok(());
         }
@@ -440,18 +501,219 @@ impl Session {
         ingested.map(|_| ())
     }
 
+    /// A verified peer relayed its copy of another inbox's log (§4.2): it
+    /// reconciles a log we hold (extends it, replaces it, or gets ours
+    /// back). Authorized only under [`Self::may_consider`] (review
+    /// 2026-09-24 C1/R5), checked *before* `holds_identity_log` so an
+    /// unauthorized inbox looks the same (silence) whether or not we hold
+    /// it. A log we do not hold is ignored, as before.
+    async fn on_relayed_identity_log(&mut self, log: IdentityLog) -> Result<(), MeshError> {
+        if !self.may_consider(&log.inbox_id).await?
+            || !self.node.holds_identity_log(&log.inbox_id)?
+        {
+            return Ok(());
+        }
+        let resolution = self
+            .node
+            .resolve_identity_log(&log.inbox_id, log.updates)
+            .await?;
+        if matches!(resolution, Resolution::OursWins(_)) {
+            self.send_identity_conflict(&log.inbox_id)?;
+        }
+        Ok(())
+    }
+
+    /// The peer says its copy of `log.inbox_id`'s log beats ours (§4.2).
+    /// Checked, never trusted: we replace only if it verifies and wins
+    /// (§4.3), and a same-origin log is ingested like any other. If ours
+    /// wins, the peer gets ours; the winner rule is the same on both sides,
+    /// so this never ping-pongs.
+    ///
+    /// Authorized the same way as a relay ([`Self::may_consider`]), or, on
+    /// the claimed-inbox path (`inbox_id` is the peer's own claimed
+    /// inbox), the same proof [`Self::on_identity_log`] uses: the peer's
+    /// own submitted candidate fully verifies and lists the installation
+    /// it authenticated as (review 2026-09-24 C1/R5). Checked before
+    /// `holds_identity_log`.
+    async fn on_identity_conflict(&mut self, log: IdentityLog) -> Result<(), MeshError> {
+        if self.node.legacy_identity() {
+            return Ok(());
+        }
+        let IdentityLog { inbox_id, updates } = log;
+        let authorized = if self.may_consider(&inbox_id).await? {
+            true
+        } else if self.peer_inbox.as_deref() == Some(inbox_id.as_str()) {
+            self.node
+                .claimed_log_proves_installation(&inbox_id, &updates, &self.peer_installation())
+                .await?
+        } else {
+            false
+        };
+        if !authorized || !self.node.holds_identity_log(&inbox_id)? {
+            return Ok(());
+        }
+        let resolution = self.node.resolve_identity_log(&inbox_id, updates).await?;
+        if matches!(resolution, Resolution::OursWins(_)) {
+            self.send_identity_conflict(&inbox_id)?;
+        }
+        Ok(())
+    }
+
+    /// Whether the peer may have their claim about `inbox_id` looked at,
+    /// and, if we hold a winning log for it, get it back (owner decision,
+    /// §4.2; review 2026-09-24 C1/R5). True when either:
+    /// - `inbox_id` is our own local inbox: never sensitive (we already
+    ///   send our own log to every authenticated peer, verified or not, in
+    ///   `send_own_identity`), and this is how a restored owner's contacts
+    ///   help it converge before it can prove membership of anything.
+    /// - the peer is verified and shares a group with `inbox_id`, the same
+    ///   scope [`Self::relay_identity_logs`] uses to send it in the first
+    ///   place.
+    /// Checked before `holds_identity_log`, so an unauthorized inbox looks
+    /// the same (silence) whether or not we hold it.
+    async fn may_consider(&self, inbox_id: &str) -> Result<bool, MeshError> {
+        if self.node.local_inbox()?.as_deref() == Some(inbox_id) {
+            return Ok(true);
+        }
+        if !self.verified {
+            return Ok(false);
+        }
+        let peer_inbox = self.peer_inbox.clone().unwrap_or_default();
+        Ok(self
+            .inboxes_sharing_a_group_with(&peer_inbox)
+            .await?
+            .contains(inbox_id))
+    }
+
+    /// Review 2026-09-24 I1: at most one reply per inbox per session, so a
+    /// peer that keeps sending a losing (or forged, if authorized) log
+    /// can't flood the link with a fresh full log every time. Cleared for
+    /// an inbox by [`Self::on_event`] once our log of it actually changes.
+    fn send_identity_conflict(&mut self, inbox_id: &str) -> Result<(), MeshError> {
+        if !self.conflict_sent.insert(inbox_id.to_string()) {
+            return Ok(());
+        }
+        let mut updates = self.node.identity_log(inbox_id)?;
+        updates.truncate(MAX_PEER_IDENTITY_LOG as usize);
+        tracing::info!(
+            peer = %self.peer,
+            inbox_id,
+            "identity conflict: our log of this inbox has the earlier origin; sending it"
+        );
+        self.send(Body::IdentityConflict(IdentityLog {
+            inbox_id: inbox_id.to_string(),
+            updates,
+        }));
+        Ok(())
+    }
+
+    /// §4.2 relay: the logs we hold of inboxes that share a group with the
+    /// peer, so that a peer holding a losing copy of one converges from us
+    /// even when the owner is not here. Owner decision (2026-09-24): a log
+    /// of inbox X goes to the peer only if the peer's verified inbox and X
+    /// are both members of some group this node knows, per the local
+    /// client. Never to strangers: a nearby phone must not learn which
+    /// inboxes this phone has met. At most [`MAX_RELAYED_IDENTITY_LOGS`].
+    async fn relay_identity_logs(&self) -> Result<(), MeshError> {
+        if self.node.legacy_identity() {
+            return Ok(());
+        }
+        let Some(peer_inbox) = self.peer_inbox.clone().filter(|i| !i.is_empty()) else {
+            return Ok(());
+        };
+        let own_inbox = self.node.local_inbox()?.unwrap_or_default();
+        let shared = self.inboxes_sharing_a_group_with(&peer_inbox).await?;
+        let relayable: Vec<String> = self
+            .node
+            .relayable_inboxes(&[peer_inbox.as_str(), own_inbox.as_str()])?
+            .into_iter()
+            .filter(|inbox| shared.contains(inbox))
+            .take(MAX_RELAYED_IDENTITY_LOGS)
+            .collect();
+        for inbox_id in relayable {
+            let mut updates = self.node.identity_log(&inbox_id)?;
+            updates.truncate(MAX_PEER_IDENTITY_LOG as usize);
+            self.send(Body::IdentityLog(IdentityLog { inbox_id, updates }));
+        }
+        Ok(())
+    }
+
+    /// Every inbox that is a member, together with `peer_inbox`, of some
+    /// group this node knows (the local client's member lists). A group the
+    /// client cannot report is skipped: when in doubt, relay nothing. Runs
+    /// no store lock across the lookups.
+    async fn inboxes_sharing_a_group_with(
+        &self,
+        peer_inbox: &str,
+    ) -> Result<HashSet<String>, MeshError> {
+        let mut shared = HashSet::new();
+        for group_id in self.node.known_group_ids()? {
+            match self.membership.member_inboxes(&group_id).await {
+                Ok(Some(members)) if members.iter().any(|m| m == peer_inbox) => {
+                    shared.extend(members);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(peer = %self.peer, error = %e, "group membership unavailable; not relaying for it");
+                }
+            }
+        }
+        Ok(shared)
+    }
+
+    /// Our log of the verified peer's own inbox changed (a replace, or an
+    /// update relayed by someone else, such as a revocation). If the peer's
+    /// installation is no longer a member, it loses its verification: it
+    /// is sent our log (§4.2) and gets the verification deadline to prove
+    /// membership again (an owner re-bases, §4.4). Until then none of its
+    /// group traffic is accepted (§4.7 "no split brain").
+    ///
+    /// M2 (review 2026-09-24): a security gate fails closed. If
+    /// `is_member` itself errors (we can't tell), demote anyway rather
+    /// than leave the peer verified on an unknown answer.
+    async fn recheck_membership(&mut self) -> Result<(), MeshError> {
+        let inbox_id = self.peer_inbox.clone().unwrap_or_default();
+        match self.is_member(&inbox_id).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    peer = %self.peer,
+                    inbox_id,
+                    error = %e,
+                    "membership check failed; demoting the peer to be safe"
+                );
+            }
+        }
+        tracing::info!(
+            peer = %self.peer,
+            inbox_id,
+            "peer installation left its inbox's log; unverified until it proves membership again"
+        );
+        self.verified = false;
+        self.verify_deadline = Some(Instant::now() + self.node.peer_verify_timeout());
+        self.peer_interest.clear();
+        self.deferred.clear();
+        self.retry_at = None;
+        self.node.session_unverified(&self.peer, self.id);
+        self.send_identity_conflict(&inbox_id)
+    }
+
     /// Runs once the peer's membership is proven: deliver the welcomes queued
-    /// for it and announce every group it may hear about.
-    /// Both steps always run; an error from either is returned for logging.
+    /// for it, announce every group it may hear about, and relay the
+    /// identity logs of inboxes that share a group with it (§4.2). Every step always runs; the first error
+    /// is returned for logging.
     async fn on_verified(&mut self) -> Result<(), MeshError> {
         let welcomes = self.send_welcomes();
         let announced = self.announce_all().await;
-        welcomes.and(announced)
+        let relayed = self.relay_identity_logs().await;
+        welcomes.and(announced).and(relayed)
     }
 
     async fn on_authenticated_frame(&mut self, body: Body) -> Result<(), MeshError> {
         match body {
             Body::IdentityLog(log) => self.on_identity_log(log).await,
+            Body::IdentityConflict(log) => self.on_identity_conflict(log).await,
             // Only the peer's own key package: relaying others' would let any
             // peer replace a stored package with an older genuine one.
             Body::KeyPackage(kp)
@@ -824,9 +1086,34 @@ impl Session {
         if self.state != State::Authenticated {
             return Ok(());
         }
+        if let NodeEvent::IdentityLogChanged(inbox_id) | NodeEvent::IdentityLogReplaced(inbox_id) =
+            &event
+        {
+            // Review I1: our log of this inbox actually changed, so a
+            // fresh conflict reply is allowed again instead of throttled
+            // for the rest of the session.
+            self.conflict_sent.remove(inbox_id);
+        }
         match event {
             NodeEvent::LocalIdentityChanged | NodeEvent::LocalKeyPackageChanged => {
                 self.send_own_identity()
+            }
+            NodeEvent::IdentityLogChanged(inbox_id) | NodeEvent::IdentityLogReplaced(inbox_id)
+                if !self.node.legacy_identity()
+                    && self.peer_inbox.as_deref() == Some(inbox_id.as_str()) =>
+            {
+                if self.verified {
+                    self.recheck_membership().await
+                } else if self.is_member(&inbox_id).await? {
+                    // M3 (review 2026-09-24): a demoted (or never-verified)
+                    // peer whose re-base reaches us through a third party
+                    // re-verifies as soon as our log of its claimed inbox
+                    // shows it, instead of waiting for its own IdentityLog
+                    // frame or the deadline.
+                    self.mark_verified().await
+                } else {
+                    Ok(())
+                }
             }
             event if self.verified => self.on_verified_event(event).await,
             _ => Ok(()),

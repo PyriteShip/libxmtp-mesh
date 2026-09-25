@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use alloy::signers::local::PrivateKeySigner;
 use prost::Message;
+use tokio::sync::broadcast;
 use xmtp_api_d14n::{ClientBundle, MessageBackendBuilder};
 use xmtp_cryptography::utils::generate_local_wallet;
 use xmtp_db::group::GroupQueryArgs;
@@ -14,7 +15,7 @@ use xmtp_id::InboxOwner;
 use xmtp_id::associations::test_utils::add_wallet_signature;
 use xmtp_id::associations::unverified::UnverifiedIdentityUpdate;
 use xmtp_id::associations::{self, AssociationState};
-use xmtp_mesh::{EoaOnlyVerifier, MeshNode};
+use xmtp_mesh::{EoaOnlyVerifier, MeshNode, NodeEvent, ResyncOutcome};
 use xmtp_mls::builder::DeviceSyncMode;
 use xmtp_mls::cursor_store::SqliteCursorStore;
 use xmtp_mls::groups::MlsGroup;
@@ -102,6 +103,29 @@ pub async fn rebase(peer: &TestPeer, wallet: &PrivateKeySigner) -> bool {
         .await
         .unwrap();
     true
+}
+
+/// The next IdentityResynced for `inbox_id` on `events` (20 s at most).
+pub async fn next_resync(
+    events: &mut broadcast::Receiver<NodeEvent>,
+    inbox_id: &str,
+) -> ResyncOutcome {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            match events.recv().await {
+                Ok(NodeEvent::IdentityResynced {
+                    inbox_id: i,
+                    outcome,
+                }) if i == inbox_id => {
+                    return outcome;
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(e) => panic!("event stream closed: {e}"),
+            }
+        }
+    })
+    .await
+    .expect("no identity resync within 20 s")
 }
 
 /// The identity updates `peer`'s libxmtp client holds for `inbox_id`, oldest first.
