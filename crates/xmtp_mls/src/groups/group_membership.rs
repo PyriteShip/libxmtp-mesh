@@ -141,6 +141,58 @@ impl MembershipDiffWithKeyPackages {
             failed_installations,
         }
     }
+
+    /// xmtp-mesh restore convergence §4.6, committer half: reconcile the
+    /// association-state diff with the ratchet tree (`leaves`: the current
+    /// leaves' signature keys). After an identity log was replaced, the diff
+    /// can list, as added, an installation that is already a leaf (re-adding
+    /// it is an openmls DuplicateSignatureKey error), and, as removed, one
+    /// that never was a leaf. Drops both. The add-side drop is load-bearing:
+    /// without it the commit itself would fail. The removal-side drop is
+    /// redundant with `get_removed_leaf_nodes` (which already intersects
+    /// removals with the tree's current members) — the refusal for removing
+    /// a non-leaf is cured by the *validator* half
+    /// (`expected_diff_matches_commit`), not by this filter; it is kept here
+    /// for parity and as a safety net. The commit still carries the new
+    /// inbox → sequence_id extension. `new_installations` and
+    /// `new_key_packages` are parallel lists (built in one loop in
+    /// `get_keypackages_for_installation_ids`).
+    pub fn reconcile_with_leaves(&mut self, leaves: &HashSet<Vec<u8>>) {
+        debug_assert_eq!(
+            self.new_installations.len(),
+            self.new_key_packages.len(),
+            "new_installations and new_key_packages must stay parallel lists"
+        );
+        let (installations, key_packages): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.new_installations)
+                .into_iter()
+                .zip(std::mem::take(&mut self.new_key_packages))
+                .filter(|(installation, _)| !leaves.contains(&installation.installation_key))
+                .unzip();
+        self.new_installations = installations;
+        self.new_key_packages = key_packages;
+        self.removed_installations.retain(|id| leaves.contains(id));
+    }
+}
+
+/// Test-only: when enabled, `apply_update_group_membership_intent` skips
+/// stripping current leaves from a newly published commit's
+/// `failed_installations`, simulating a pre-fix or hostile committer's
+/// extension. Lets a test construct "this inbox's already-published state
+/// wrongly excuses a leaf's removal" without needing an actual unpatched or
+/// malicious peer to have produced it.
+#[cfg(any(test, feature = "test-utils"))]
+static SIMULATE_UNRECONCILED_FAILED_LEAF: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(any(test, feature = "test-utils"))]
+pub fn set_test_mode_simulate_unreconciled_failed_leaf(enable: bool) {
+    SIMULATE_UNRECONCILED_FAILED_LEAF.store(enable, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) fn is_test_mode_simulate_unreconciled_failed_leaf() -> bool {
+    SIMULATE_UNRECONCILED_FAILED_LEAF.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 #[cfg(test)]
@@ -148,7 +200,27 @@ pub(crate) mod tests {
     #[cfg(target_arch = "wasm32")]
     wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-    use super::GroupMembership;
+    use super::{GroupMembership, MembershipDiffWithKeyPackages};
+    use std::collections::HashSet;
+
+    /// `reconcile_with_leaves`'s removal-side filter, in isolation (the
+    /// add-side filter needs a real openmls `KeyPackage` to construct,
+    /// which is exercised end to end instead by the
+    /// `after_a_replace_the_contact_can_commit_first` loopback test).
+    #[xmtp_common::test]
+    fn reconcile_with_leaves_prunes_removals_to_current_leaves() {
+        let mut diff = MembershipDiffWithKeyPackages::new(
+            Vec::new(),
+            Vec::new(),
+            HashSet::from([b"leaf".to_vec(), b"ghost".to_vec()]),
+            Vec::new(),
+        );
+        diff.reconcile_with_leaves(&HashSet::from([b"leaf".to_vec()]));
+        assert_eq!(
+            diff.removed_installations,
+            HashSet::from([b"leaf".to_vec()])
+        );
+    }
 
     #[xmtp_common::test]
     fn test_equality_works() {

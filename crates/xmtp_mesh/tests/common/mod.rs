@@ -7,6 +7,7 @@ use alloy::signers::local::PrivateKeySigner;
 use prost::Message;
 use xmtp_api_d14n::{ClientBundle, MessageBackendBuilder};
 use xmtp_cryptography::utils::generate_local_wallet;
+use xmtp_db::group::GroupQueryArgs;
 use xmtp_db::group_message::{GroupMessageKind, MsgQueryArgs};
 use xmtp_db::{EncryptedMessageStore, NativeDb};
 use xmtp_id::InboxOwner;
@@ -17,6 +18,7 @@ use xmtp_mesh::{EoaOnlyVerifier, MeshNode};
 use xmtp_mls::builder::DeviceSyncMode;
 use xmtp_mls::cursor_store::SqliteCursorStore;
 use xmtp_mls::groups::MlsGroup;
+use xmtp_mls::groups::send_message_opts::SendMessageOpts;
 use xmtp_mls::identity::IdentityStrategy;
 use xmtp_mls::utils::test::register_client;
 use xmtp_mls::{Client, MlsContext};
@@ -226,6 +228,29 @@ pub async fn revoke_all_other_installations(peer: &TestPeer, wallet: &PrivateKey
         .unwrap();
 }
 
+/// Revoke `installation` from `peer`'s inbox, signed by the recovery
+/// wallet. Unlike `revoke_all_other_installations`, this can target any
+/// installation, including `peer`'s own live one: a wallet holder can sign
+/// a revoke for any installation of their inbox, live or not (spec R2).
+pub async fn revoke_installation(
+    peer: &TestPeer,
+    wallet: &PrivateKeySigner,
+    installation: Vec<u8>,
+) {
+    let mut request = peer
+        .client
+        .identity_updates()
+        .revoke_installations(vec![installation])
+        .await
+        .unwrap();
+    add_wallet_signature(&mut request, wallet).await;
+    peer.client
+        .identity_updates()
+        .apply_signature_request(request)
+        .await
+        .unwrap();
+}
+
 /// A registered client on its own node, attached to `hub` under `name`, syncing.
 pub async fn peer(hub: &LoopbackHub, name: &str) -> TestPeer {
     peer_on(
@@ -384,4 +409,106 @@ pub async fn welcome_count(p: &TestPeer) -> usize {
         .unwrap()
         .messages
         .len()
+}
+
+/// Until `node` holds `who`'s key package.
+pub async fn has_key_package(node: &MeshNode, who: &TestPeer) {
+    eventually("a key package", || async {
+        node.has_key_package(&who.installation()).unwrap()
+    })
+    .await;
+}
+
+/// Until `group` shows the application message `text`.
+pub async fn see(group: &MeshGroup, text: &str) {
+    eventually(&format!("sees {text:?}"), || async {
+        group.sync().await.ok();
+        app_payloads(group).contains(&text.as_bytes().to_vec())
+    })
+    .await;
+}
+
+/// `from` sends `text`; `to` shows it.
+pub async fn send_and_see(from: &MeshGroup, to: &MeshGroup, text: &str) {
+    from.send_message(text.as_bytes(), SendMessageOpts::default())
+        .await
+        .unwrap();
+    see(to, text).await;
+}
+
+/// `x` starts a DM with `y` (x's node is its Rule-A sequencer) and they
+/// exchange "<tag>-1" and "<tag>-2". Returns (x's group, y's group).
+pub async fn dm_both_ways(x: &TestPeer, y: &TestPeer, tag: &str) -> (MeshGroup, MeshGroup) {
+    let before = y
+        .client
+        .find_groups(GroupQueryArgs::default())
+        .unwrap()
+        .len();
+    let xd = x
+        .client
+        .find_or_create_dm(y.client.inbox_id(), None)
+        .await
+        .unwrap();
+    xd.send_message(format!("{tag}-1").as_bytes(), SendMessageOpts::default())
+        .await
+        .unwrap();
+    eventually("the welcome", || async {
+        y.client.sync_welcomes().await.ok();
+        y.client
+            .find_groups(GroupQueryArgs::default())
+            .unwrap()
+            .len()
+            > before
+    })
+    .await;
+    let yd = y
+        .client
+        .find_groups(GroupQueryArgs::default())
+        .unwrap()
+        .into_iter()
+        .find(|g| g.group_id == xd.group_id)
+        .unwrap();
+    see(&yd, &format!("{tag}-1")).await;
+    send_and_see(&yd, &xd, &format!("{tag}-2")).await;
+    (xd, yd)
+}
+
+/// RAII guard for `set_test_mode_upload_malformed_keypackage`: the flag is
+/// process-wide, so a test that panics between enabling and disabling it
+/// would otherwise leak it into later tests in the same binary. Enables the
+/// flag for `installations` on construction and always disables it on drop.
+pub struct MalformedKeyPackages;
+
+impl MalformedKeyPackages {
+    pub fn new(installations: Vec<Vec<u8>>) -> Self {
+        xmtp_mls::utils::test_mocks_helpers::set_test_mode_upload_malformed_keypackage(
+            true,
+            Some(installations),
+        );
+        Self
+    }
+}
+
+impl Drop for MalformedKeyPackages {
+    fn drop(&mut self) {
+        xmtp_mls::utils::test_mocks_helpers::set_test_mode_upload_malformed_keypackage(false, None);
+    }
+}
+
+/// RAII guard for
+/// `xmtp_mls::groups::group_membership::set_test_mode_simulate_unreconciled_failed_leaf`,
+/// for the same reason as [`MalformedKeyPackages`].
+pub struct SimulateUnreconciledFailedLeaf;
+
+impl SimulateUnreconciledFailedLeaf {
+    pub fn new() -> Self {
+        xmtp_mls::groups::group_membership::set_test_mode_simulate_unreconciled_failed_leaf(true);
+        Self
+    }
+}
+
+impl Drop for SimulateUnreconciledFailedLeaf {
+    fn drop(&mut self) {
+        xmtp_mls::groups::group_membership::set_test_mode_simulate_unreconciled_failed_leaf(false);
+    }
 }

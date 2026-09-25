@@ -20,17 +20,56 @@ pub(crate) async fn apply_update_group_membership_intent(
     signer: impl Signer,
 ) -> Result<Option<PublishIntentData>, GroupError> {
     let extensions: Extensions = openmls_group.extensions().clone();
-    let old_group_membership = extract_group_membership(&extensions)?;
-    let new_group_membership = intent_data.apply_to_group_membership(&old_group_membership);
+    let mut old_group_membership = extract_group_membership(&extensions)?;
+    // xmtp-mesh restore convergence §4.6: never re-add a leaf, never remove a
+    // non-leaf, and never let a `failed_installations` entry excuse the
+    // removal of an installation that is currently a leaf. A replaced
+    // identity log can make a diff, computed against a now-stale sequence,
+    // see an already-a-leaf installation as "added"; if its key-package
+    // fetch then fails for any reason, that installation must not stay
+    // excused from a later, genuine revoke. Strip current leaves from the
+    // OLD membership's failed list before it feeds either the diff or the
+    // committer's failed∩removed pruning below (`old_group_membership`'s
+    // list may already carry a leaf: from an earlier commit before this fix
+    // existed, or planted by another member — the validator does not check
+    // what a commit adds to the failed list). Otherwise the committer would
+    // drop a genuinely revoked leaf's removal using the unfiltered old
+    // list, while the extension it publishes no longer excuses it, and
+    // patched receivers reject the commit as missing a required removal.
+    let leaves: HashSet<Vec<u8>> = openmls_group.members().map(|m| m.signature_key).collect();
+    old_group_membership
+        .failed_installations
+        .retain(|id| !leaves.contains(id));
+    let mut new_group_membership = intent_data.apply_to_group_membership(&old_group_membership);
+    // A test can disable this specific filter to simulate a pre-fix or
+    // hostile committer's published extension (see
+    // `group_membership::set_test_mode_simulate_unreconciled_failed_leaf`);
+    // this is always active in a production build.
+    #[cfg(any(test, feature = "test-utils"))]
+    let skip_new_failed_leaf_filter =
+        crate::groups::group_membership::is_test_mode_simulate_unreconciled_failed_leaf();
+    #[cfg(not(any(test, feature = "test-utils")))]
+    let skip_new_failed_leaf_filter = false;
+    if !skip_new_failed_leaf_filter {
+        new_group_membership
+            .failed_installations
+            .retain(|id| !leaves.contains(id));
+    }
     let membership_diff = old_group_membership.diff(&new_group_membership);
 
-    let changes_with_kps = calculate_membership_changes_with_keypackages(
+    let mut changes_with_kps = calculate_membership_changes_with_keypackages(
         context,
         openmls_group.group_id().as_slice(),
         &new_group_membership,
         &old_group_membership,
     )
     .await?;
+    // xmtp-mesh restore convergence §4.6: never re-add a leaf, never remove a
+    // non-leaf. The removal filter is redundant with `get_removed_leaf_nodes`
+    // below (which already intersects with the tree's current members), but
+    // is kept for parity between the add and removal halves and as a safety
+    // net if that call's filtering ever changes.
+    changes_with_kps.reconcile_with_leaves(&leaves);
     let leaf_nodes_to_remove: Vec<LeafNodeIndex> =
         get_removed_leaf_nodes(openmls_group, &changes_with_kps.removed_installations);
 

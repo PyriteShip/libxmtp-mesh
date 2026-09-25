@@ -75,8 +75,13 @@ pub enum CommitValidationError {
     UnexpectedInstallationAdded(Vec<Vec<u8>>),
     #[error("Sequence ID can only increase")]
     SequenceIdDecreased,
-    #[error("Unexpected installations removed: {0:?}")]
-    UnexpectedInstallationsRemoved(Vec<Vec<u8>>),
+    #[error(
+        "Unexpected installations removed: {unexpected:?} (missing required removals: {missing:?})"
+    )]
+    UnexpectedInstallationsRemoved {
+        unexpected: Vec<Vec<u8>>,
+        missing: Vec<Vec<u8>>,
+    },
     #[error(transparent)]
     GroupMetadata(#[from] GroupMetadataError),
     #[error(transparent)]
@@ -754,7 +759,7 @@ pub(super) fn extract_readded_installations(
 /// Compare the list of installations added and removed in the commit to the expected diff based on the changes
 /// to the inbox state.
 /// Satisfies Rule 3 and Rule 7
-fn expected_diff_matches_commit(
+pub(super) fn expected_diff_matches_commit(
     expected_diff: &InstallationDiff,
     added_installations: HashSet<Vec<u8>>,
     removed_installations: HashSet<Vec<u8>>,
@@ -778,10 +783,24 @@ fn expected_diff_matches_commit(
         ));
     }
 
+    // xmtp-mesh restore convergence §4.6, validator half: an installation
+    // that is not a current leaf (a replaced identity log lists it, the
+    // ratchet tree never had it) cannot be removed, so it is not expected
+    // to be. Adds already tolerate "already a leaf" (above). A
+    // failed-installations entry excuses an expected removal only when that
+    // id is not a current leaf: a commit's own claimed failed list (its own
+    // or one planted by another member — this function never validates what
+    // a commit adds to it) must never excuse the removal of an installation
+    // that is genuinely still a leaf. Combined with the leaf-only filter
+    // below, a current leaf's removal is always required regardless of what
+    // any commit claims is failed.
     let filtered_expected: HashSet<_> = expected_diff
         .removed_installations
         .iter()
-        .filter(|id| !failed_installation_ids.contains(*id))
+        .filter(|id| {
+            !failed_installation_ids.contains(*id) || existing_installation_ids.contains(*id)
+        })
+        .filter(|id| existing_installation_ids.contains(*id))
         .cloned()
         .collect();
 
@@ -790,10 +809,19 @@ fn expected_diff_matches_commit(
             .difference(&expected_diff.removed_installations)
             .cloned()
             .collect();
+        // Report required removals the commit is missing, alongside ones it
+        // made that weren't expected: a "leaf still required" failure
+        // (unexpected empty, missing non-empty) is then self-explanatory
+        // instead of printing an empty vec.
+        let missing: Vec<_> = filtered_expected
+            .difference(&removed_installations)
+            .cloned()
+            .collect();
 
-        return Err(CommitValidationError::UnexpectedInstallationsRemoved(
+        return Err(CommitValidationError::UnexpectedInstallationsRemoved {
             unexpected,
-        ));
+            missing,
+        });
     }
 
     Ok(())
