@@ -25,6 +25,16 @@ pub trait GroupMembership: Send + Sync {
     async fn identity_log_replaced(&self, _inbox_id: &str) -> Result<ResyncOutcome, MeshError> {
         Ok(ResyncOutcome::Reloaded)
     }
+
+    /// The installation ids (leaf signature keys) of the group's current
+    /// leaves per the local client, or `Ok(None)` when it does not know the
+    /// group. The §4.7 sequencer handover picks from them.
+    async fn leaf_installations(
+        &self,
+        _group_id: &[u8],
+    ) -> Result<Option<Vec<Vec<u8>>>, MeshError> {
+        Ok(None)
+    }
 }
 
 /// The production [`GroupMembership`]: reads the member list of a group from
@@ -84,5 +94,17 @@ where
         } else {
             ResyncOutcome::RebaseNeeded
         })
+    }
+
+    async fn leaf_installations(&self, group_id: &[u8]) -> Result<Option<Vec<Vec<u8>>>, MeshError> {
+        let group = match self.0.group(&group_id.to_vec()) {
+            Ok(group) => group,
+            Err(ClientError::MlsStore(MlsStoreError::NotFound(_))) => return Ok(None),
+            Err(e) => return Err(MeshError::Membership(e.to_string())),
+        };
+        group
+            .leaf_installation_ids()
+            .map(Some)
+            .map_err(|e| MeshError::Membership(e.to_string()))
     }
 }

@@ -158,13 +158,26 @@ where
     eventually_for(what, 20, check).await
 }
 
-/// Poll `check` every 50 ms for up to `secs` seconds.
+/// Ruling X1 (progress.md): scales every [`eventually_for`] (and so
+/// [`eventually`]) timeout by this many times. Set by the env var
+/// `MESH_TEST_TIMEOUT_SCALE` (an integer), default 1 -- unset or unparsable
+/// keeps today's behaviour identical. Meant for a slower CI runner (the
+/// upstream-drift workflow), not local iteration.
+fn test_timeout_scale() -> u64 {
+    std::env::var("MESH_TEST_TIMEOUT_SCALE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// Poll `check` every 50 ms for up to `secs` seconds (see [`test_timeout_scale`]).
 pub async fn eventually_for<F, Fut>(what: &str, secs: u64, mut check: F)
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = bool>,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs * test_timeout_scale());
     loop {
         if check().await {
             return;

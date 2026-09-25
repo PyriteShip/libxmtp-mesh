@@ -403,6 +403,54 @@ impl MeshStore {
         })
     }
 
+    /// Sets the group's sequencer unconditionally: the §4.7 handover from a
+    /// revoked sequencer. Trust-on-first-use pinning stays `pin_sequencer`.
+    pub fn repin_sequencer(
+        &mut self,
+        group_id: &[u8],
+        installation: &[u8],
+    ) -> Result<(), MeshError> {
+        self.transaction(|s| {
+            s.ensure_group(group_id)?;
+            sql_query("UPDATE groups SET sequencer = ? WHERE group_id = ?")
+                .bind::<Binary, _>(installation)
+                .bind::<Binary, _>(group_id)
+                .execute(&mut s.conn)?;
+            Ok(())
+        })
+    }
+
+    /// §4.7 handover (review round 1, M6): repin the sequencer and, in the
+    /// SAME transaction, sequence our own pending messages for the group
+    /// when we are the new sequencer. Doing both under one lock closes the
+    /// window where a local publish landing between a separate repin and a
+    /// separate drain could jump ahead of older pending messages with a
+    /// lower id. Returns the newly sequenced rows (the caller emits events
+    /// after the lock is released).
+    pub fn repin_sequencer_and_drain_pending(
+        &mut self,
+        group_id: &[u8],
+        installation: &[u8],
+        now_ns: i64,
+    ) -> Result<Vec<StoredGroupMessage>, MeshError> {
+        self.transaction(|s| {
+            s.ensure_group(group_id)?;
+            sql_query("UPDATE groups SET sequencer = ? WHERE group_id = ?")
+                .bind::<Binary, _>(installation)
+                .bind::<Binary, _>(group_id)
+                .execute(&mut s.conn)?;
+            let mut rows = Vec::new();
+            for message in s.pending_for(group_id)? {
+                let (row, inserted) = s.append_sequenced(&message, now_ns)?;
+                s.remove_pending(group_id, &sha256(&message.data))?;
+                if inserted {
+                    rows.push(row);
+                }
+            }
+            Ok(rows)
+        })
+    }
+
     pub fn known_groups(&mut self) -> Result<Vec<Vec<u8>>, MeshError> {
         let rows: Vec<BlobRow> =
             sql_query("SELECT group_id AS v FROM groups ORDER BY group_id").load(&mut self.conn)?;

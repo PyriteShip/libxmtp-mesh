@@ -488,6 +488,11 @@ impl MeshNode {
     /// regardless of how many times the surrounding future is
     /// reconstructed. A sustained `LocalClient` outage is logged once,
     /// then every 10th attempt, not on every retry.
+    ///
+    /// Also runs the §4.7 sequencer handover after every identity-log
+    /// change (a replace, a plain append such as a revoke, or a lagged
+    /// resync), so a group whose pinned sequencer was just revoked is
+    /// re-pinned to the lowest live leaf without waiting on anything else.
     pub(crate) fn spawn_identity_task(
         &self,
         runtime: &tokio::runtime::Handle,
@@ -505,12 +510,17 @@ impl MeshNode {
                         event = events.recv() => match event {
                             Ok(NodeEvent::IdentityLogReplaced(inbox_id)) => {
                                 node.retry_resync(membership.as_ref(), inbox_id, &mut pending).await;
+                                node.hand_over(membership.as_ref()).await;
+                            }
+                            Ok(NodeEvent::IdentityLogChanged(_)) => {
+                                node.hand_over(membership.as_ref()).await;
                             }
                             Ok(_) => {}
                             Err(broadcast::error::RecvError::Lagged(_)) => {
                                 for inbox_id in node.recently_replaced() {
                                     node.retry_resync(membership.as_ref(), inbox_id, &mut pending).await;
                                 }
+                                node.hand_over(membership.as_ref()).await;
                             }
                             Err(broadcast::error::RecvError::Closed) => break,
                         },

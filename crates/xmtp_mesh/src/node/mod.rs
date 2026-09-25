@@ -1,5 +1,6 @@
 mod convergence;
 mod group_messages;
+mod handover;
 mod identity;
 mod key_packages;
 pub(crate) mod paths;
@@ -65,6 +66,13 @@ pub(crate) struct NodeInner {
     pub(crate) identity_task: Mutex<Option<tokio::task::AbortHandle>>,
     /// Test only: behave like a node from before restore convergence.
     pub(crate) legacy_identity: AtomicBool,
+    /// Test only (review I2, task-5-review.md fix round 1): suppress the
+    /// §4.7 handover's automatic trigger (the identity task and
+    /// `start_sync`), so a test can prove a gate other than the handover's
+    /// own sequencer repin is what refuses a revoked installation's frames.
+    /// `hand_over_sequencers` itself is never suppressed -- only its
+    /// automatic callers are.
+    pub(crate) suppress_handover: AtomicBool,
     /// Serializes `start_sync`/`stop_sync` (review M5, 2026-09-24): they
     /// update `identity_task` and `sync` under separate locks, so a
     /// concurrent start and stop could otherwise interleave and leave
@@ -173,6 +181,7 @@ impl MeshNode {
                 replacements: AtomicU64::new(0),
                 identity_task: Mutex::new(None),
                 legacy_identity: AtomicBool::new(false),
+                suppress_handover: AtomicBool::new(false),
                 sync_lifecycle: Mutex::new(()),
             }),
         }
@@ -308,6 +317,15 @@ impl MeshNode {
         let task = self.spawn_identity_task(&runtime, membership.clone());
         if let Some(old) = self.inner.identity_task.lock().replace(task) {
             old.abort();
+        }
+        // Ruling F9 (progress.md): also run the §4.7 handover once here, so
+        // a restart retries it even if this node's own revocation of a dead
+        // sequencer was ingested while sync was stopped (no identity-log
+        // event fires for the identity task to react to after the fact).
+        {
+            let node = self.clone();
+            let membership = membership.clone();
+            runtime.spawn(async move { node.hand_over(membership.as_ref()).await });
         }
         *self.inner.sync.lock() = Some(SyncConfig {
             signer,

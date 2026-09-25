@@ -141,25 +141,22 @@ async fn revoking_the_original_that_never_joined_keeps_the_dm_alive() {
 /// persisted `failed_installations` — otherwise a later, genuine revoke of
 /// that leaf could be silently skipped, defeating §4.7's revoke guarantee.
 ///
-/// BLOCKED pending mesh.8 Task 5 (spec §4.7, sequencer handover): `a2`
-/// started this DM, so it is the pinned sequencer (Rule A). Task 4's session
-/// now re-checks a verified peer's membership whenever its own inbox's log
-/// changes (`sync/session.rs::recheck_membership`), including a plain
-/// append it sends us directly -- not only a replace or a relay. The
+/// Ruling R4 (progress.md): was blocked pending mesh.8 Task 5 (spec §4.7,
+/// sequencer handover). `a2` started this DM, so it was the pinned
+/// sequencer (Rule A). Task 4's session re-checks a verified peer's
+/// membership whenever its own inbox's log changes
+/// (`sync/session.rs::recheck_membership`), including a plain append it
+/// sends us directly -- not only a replace or a relay. The
 /// `revoke_installation` call below removes `a2`'s own installation from
 /// I's log while `a2`'s node stays connected, so as soon as `c` ingests
 /// that revoke from `a2` itself, `c` demotes its session with `a2` (Review
 /// Focus 5: a revoked-but-alive installation "cannot stay verified, and
-/// its Sequenced frames change nothing") and can no longer reach `a2` to
-/// sequence the following `update_installations()` commit, which then
-/// fails with `SyncFailedToWait`. Before Task 4 this test passed only
-/// because a revoked-but-alive sequencer stayed fully trusted -- exactly
-/// the gap Review Focus 5 exists to close (Task 5's own test is named
-/// `a_revoked_installation_that_is_still_alive_cannot_sequence`). Task 5's
-/// DM sequencer handover (`node/handover.rs`, groups with <=2 leaves) is
-/// what lets `c` take over sequencing once `a2` is revoked but still
-/// connected; re-enable this test once that lands.
-#[ignore]
+/// its Sequenced frames change nothing"). Task 5's DM sequencer handover
+/// (`node/handover.rs`, groups with at most two leaves) now takes over:
+/// once `c` ingests a2's revoke, its identity task hands the DM's
+/// sequencer to `c` itself (the only remaining live leaf), so the final
+/// `update_installations()` below sequences locally instead of needing to
+/// reach the now-demoted `a2`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leaf_with_a_failed_key_package_fetch_can_still_be_revoked() {
     let r = restored_dm().await;
@@ -211,13 +208,11 @@ async fn a_leaf_with_a_failed_key_package_fetch_can_still_be_revoked() {
 /// accounted for, because that entry is not, and never was, a legitimate
 /// excuse for the removal of an installation that is still a leaf.
 ///
-/// BLOCKED pending mesh.8 Task 5, same reason as
-/// `a_leaf_with_a_failed_key_package_fetch_can_still_be_revoked` above: `a2`
-/// is the DM's sequencer, and Task 4's `recheck_membership` demotes `c`'s
-/// session with `a2` the moment `a2`'s own self-revoke reaches `c`, so the
-/// final `update_installations()` below can no longer reach `a2` to
-/// sequence. Re-enable once Task 5's DM sequencer handover lands.
-#[ignore]
+/// Ruling R4 (progress.md): was blocked pending mesh.8 Task 5, same reason
+/// as `a_leaf_with_a_failed_key_package_fetch_can_still_be_revoked` above --
+/// Task 5's DM sequencer handover now hands `c` the sequencer role once
+/// `a2`'s self-revoke demotes it, so the final `update_installations()`
+/// below sequences locally on `c`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stale_failed_installations_entry_does_not_excuse_a_leafs_revoke() {
     let r = restored_dm().await;

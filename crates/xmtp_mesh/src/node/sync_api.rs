@@ -266,6 +266,22 @@ impl MeshNode {
     pub fn set_local_inbox_for_test(&self, inbox_id: &str) {
         self.inner.store.lock().set_local_inbox(inbox_id).unwrap();
     }
+
+    /// Test only (review round 1, M1/F9): fold a peer-supplied log into this
+    /// node's store directly, as a session's `on_identity_log` would, but
+    /// without a live peer session -- so a test can simulate "the update
+    /// landed while this node's sync was stopped" (`ingest_identity_log` is
+    /// otherwise `pub(crate)`, and a bound node has no other way to receive
+    /// a foreign inbox's update outside a running session).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub async fn ingest_identity_log_for_test(
+        &self,
+        inbox_id: &str,
+        updates: Vec<IdentityUpdateLog>,
+    ) -> Result<Option<i64>, MeshError> {
+        self.ingest_identity_log(inbox_id, updates).await
+    }
 }
 
 /// Welcome delivery and group-message sequencing between peers. Sessions call

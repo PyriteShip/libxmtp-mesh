@@ -634,3 +634,46 @@ async fn a_shared_group_peer_gets_exactly_one_conflict_reply_per_inbox() {
         "at most one conflict reply per inbox per session (review I1)"
     );
 }
+
+/// §4.7 after a restore: A created the A–B DM, so its node was the
+/// sequencer. A′ restores alone, meets B, gets the conflict, re-bases and
+/// revokes A; B takes over sequencing the DM, and it resumes with B
+/// sending first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dm_the_original_phone_created_resumes_after_a_restore() {
+    let hub = LoopbackHub::new();
+    let wallet = generate_local_wallet();
+    let a = peer_on(&hub, "a", MeshNode::in_memory().unwrap(), &wallet).await;
+    let inbox = a.client.inbox_id().to_string();
+    let b = peer(&hub, "b").await;
+    b.node
+        .set_peer_verify_timeout_for_test(Duration::from_secs(60));
+    hub.link("a", "b");
+    has_key_package(&a.node, &b).await;
+    has_key_package(&b.node, &a).await;
+    let (_a_ab, b_ab) = dm_both_ways(&a, &b, "ab").await;
+    hub.unlink("a", "b");
+    a.node.stop_sync();
+
+    // S1 (whole-second winner rule, progress.md): a's and a2's CreateInbox
+    // signatures must land in different whole seconds for a's origin to
+    // reliably rank earlier than a2's fork (deviation from the brief's 2 ms,
+    // same as Task 4's convergence.rs tests).
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let a2 = peer_on(&hub, "a2", MeshNode::in_memory().unwrap(), &wallet).await;
+    let mut a2_events = a2.node.subscribe_events();
+    hub.link("a2", "b");
+    assert_eq!(
+        next_resync(&mut a2_events, &inbox).await,
+        ResyncOutcome::RebaseNeeded
+    );
+    rebase_and_revoke(&a2, &wallet).await;
+    eventually("b verifies a2", || async { verifies(&b.node, &a2) }).await;
+    eventually("b takes over the DM A created", || async {
+        b.node.group_sequencer_for_test(&b_ab.group_id).unwrap() == Some(b.installation())
+    })
+    .await;
+    has_key_package(&b.node, &a2).await;
+    b_ab.update_installations().await.unwrap();
+    send_and_see_new(&b_ab, &a2, "b-first").await;
+}
