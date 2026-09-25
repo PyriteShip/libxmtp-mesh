@@ -677,3 +677,311 @@ async fn a_dm_the_original_phone_created_resumes_after_a_restore() {
     b_ab.update_installations().await.unwrap();
     send_and_see_new(&b_ab, &a2, "b-first").await;
 }
+
+/// `peer`'s client adds a fresh installation (another device) to its inbox,
+/// signed by the recovery `wallet`: one more update on the log.
+async fn add_device(peer: &TestPeer, wallet: &PrivateKeySigner) {
+    use xmtp_cryptography::XmtpInstallationCredential;
+    use xmtp_id::associations::MemberIdentifier;
+    use xmtp_id::associations::builder::SignatureRequestBuilder;
+    use xmtp_id::associations::test_utils::{
+        WalletTestExt, add_installation_key_signature, add_wallet_signature,
+    };
+    let key = XmtpInstallationCredential::new();
+    let mut add = SignatureRequestBuilder::new(peer.client.inbox_id())
+        .add_association(
+            MemberIdentifier::installation(key.public_slice().to_vec()),
+            wallet.member_identifier(),
+        )
+        .build();
+    add_installation_key_signature(&mut add, &key).await;
+    add_wallet_signature(&mut add, wallet).await;
+    peer.client
+        .identity_updates()
+        .apply_signature_request(add)
+        .await
+        .unwrap();
+}
+
+/// Ruling S4 (final review I1): A registers (seq 1), C meets A then, and A
+/// adds two devices (seq 2 and 3), which B sees. The restored A′ forks, meets
+/// the stale C first (holding only seq 1), replaces its log with that
+/// prefix and re-bases at seq 2′. When A′ then meets B, who holds the full
+/// log 1..3, the two logs first differ at seq 2, where B's genuine update is
+/// older: A′ replaces its log again and re-bases at seq 4, so B verifies it
+/// (before S4, B kept dropping A′ as `PeerNotMember` forever). C heals too
+/// the next time it meets A′.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_owner_that_re_based_onto_a_stale_log_re_bases_again_on_the_full_log() {
+    let hub = LoopbackHub::new();
+    let wallet = generate_local_wallet();
+    let a = peer_on(&hub, "a", MeshNode::in_memory().unwrap(), &wallet).await;
+    let inbox = a.client.inbox_id().to_string();
+
+    let c = peer(&hub, "c").await;
+    c.node
+        .set_peer_verify_timeout_for_test(Duration::from_secs(60));
+    hub.link("a", "c");
+    eventually("c verifies a", || async { verifies(&c.node, &a) }).await;
+    hub.unlink("a", "c");
+    let stale = node_log(&c.node, &inbox);
+    assert_eq!(stale.len(), 1, "c holds only seq 1");
+
+    add_device(&a, &wallet).await;
+    add_device(&a, &wallet).await;
+    let full = node_log(&a.node, &inbox);
+    assert_eq!(full.len(), 3);
+    let b = peer(&hub, "b").await;
+    b.node
+        .set_peer_verify_timeout_for_test(Duration::from_secs(60));
+    hub.link("a", "b");
+    eventually("b verifies a on the full log", || async {
+        verifies(&b.node, &a) && node_log(&b.node, &inbox) == full
+    })
+    .await;
+    hub.unlink("a", "b");
+    a.node.stop_sync();
+
+    // Whole seconds (S1): a2's CreateInbox, and later its re-base at seq 2′,
+    // land in strictly later seconds than A's genuine updates.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let a2 = peer_on(&hub, "a2", MeshNode::in_memory().unwrap(), &wallet).await;
+    // A′ replaces twice in this test, well inside the 60 s flap window.
+    a2.node.set_replace_flap_window_for_test(Duration::ZERO);
+    let mut a2_events = a2.node.subscribe_events();
+
+    // A′ meets the stale C: C's seq 1 is older, so A′ takes the prefix and
+    // re-bases onto it at seq 2′.
+    hub.link("a2", "c");
+    assert_eq!(
+        next_resync(&mut a2_events, &inbox).await,
+        ResyncOutcome::RebaseNeeded
+    );
+    assert!(rebase(&a2, &wallet).await);
+    eventually("c appends the re-base at 2′ and verifies a2", || async {
+        verifies(&c.node, &a2) && node_log(&c.node, &inbox).len() == 2
+    })
+    .await;
+    hub.unlink("a2", "c");
+    let on_stale = node_log(&a2.node, &inbox);
+    assert_eq!(on_stale[0], full[0]);
+    assert_ne!(on_stale[1], full[1], "a2's seq 2′ is its own re-base");
+
+    // A′ meets B: first difference at seq 2, B's genuine update is older.
+    hub.link("a2", "b");
+    assert_eq!(
+        next_resync(&mut a2_events, &inbox).await,
+        ResyncOutcome::RebaseNeeded,
+        "a2 must take B's full log and re-base again"
+    );
+    assert_eq!(client_log(&a2, &inbox), full, "no hybrid on the owner");
+    assert!(rebase(&a2, &wallet).await);
+    eventually("b appends the re-base at 4 and verifies a2", || async {
+        verifies(&b.node, &a2) && node_log(&b.node, &inbox).len() == 4
+    })
+    .await;
+    hub.unlink("a2", "b");
+    let healed = node_log(&a2.node, &inbox);
+    assert_eq!(healed.len(), 4);
+    assert_eq!(healed[..3], full[..], "re-based at n+1 on the full log");
+    assert_eq!(node_log(&b.node, &inbox), healed);
+    assert_eq!(client_log(&a2, &inbox), healed);
+
+    // C, still on the stale prefix plus 2′, heals when it meets A′ again.
+    hub.link("a2", "c");
+    eventually("c replaces its log with the full one", || async {
+        node_log(&c.node, &inbox) == healed
+    })
+    .await;
+    eventually("c verifies the re-based a2", || async {
+        verifies(&c.node, &a2)
+    })
+    .await;
+
+    assert_eq!(a2.node.replacements_for_test(), 2);
+    assert_eq!(b.node.replacements_for_test(), 0);
+    assert_eq!(c.node.replacements_for_test(), 1);
+}
+
+/// The candidate an attacker builds from a healed log's genuine prefix plus
+/// one update taken from an abandoned re-base branch, renumbered to follow
+/// the prefix (re-review 1, N1).
+fn prefix_plus(
+    prefix: &[IdentityUpdateLog],
+    abandoned: &IdentityUpdateLog,
+) -> Vec<IdentityUpdateLog> {
+    let mut log = prefix.to_vec();
+    log.push(IdentityUpdateLog {
+        sequence_id: prefix.len() as u64 + 1,
+        ..abandoned.clone()
+    });
+    log
+}
+
+/// Re-review 2 N4 (owner ruling: drop the tombstone half of S6, keep the
+/// app's re-assert (b)). Without tombstones, a wallet-less attacker who
+/// captured an update from an abandoned re-base branch (S4's first re-base
+/// onto a stale copy) can still make a node -- even the healed owner's own
+/// node -- adopt `[o1, o2, o3, 2′]`, dropping the healed log's R2 revoke.
+/// But that node's app then reacts exactly as it does to any own-inbox
+/// resync (Ruling S6/(b)): it re-asserts R2, appending a fresh revoke r5′.
+/// From there every node converges on `[o1, o2, o3, 2′, r5′]`, with the lost
+/// installation revoked again: a node that took the bare attack (V) by a
+/// strict-prefix append, and a node still on the pre-attack healed log (C)
+/// by a normal replace, because 2′ still outranks r4 at seq 4. The exposure
+/// is transient (spec §7), not permanent: this is what N4 found tombstones
+/// broke.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_re_assert_after_the_same_attack_converges_every_node() {
+    let hub = LoopbackHub::new();
+    let wallet = generate_local_wallet();
+    let a = peer_on(&hub, "a", MeshNode::in_memory().unwrap(), &wallet).await;
+    let inbox = a.client.inbox_id().to_string();
+
+    let c = peer(&hub, "c").await;
+    c.node
+        .set_peer_verify_timeout_for_test(Duration::from_secs(60));
+    hub.link("a", "c");
+    eventually("c verifies a", || async { verifies(&c.node, &a) }).await;
+    hub.unlink("a", "c");
+
+    add_device(&a, &wallet).await;
+    add_device(&a, &wallet).await;
+    let full = node_log(&a.node, &inbox);
+    assert_eq!(full.len(), 3);
+    let b = peer(&hub, "b").await;
+    b.node
+        .set_peer_verify_timeout_for_test(Duration::from_secs(60));
+    hub.link("a", "b");
+    eventually("b verifies a on the full log", || async {
+        verifies(&b.node, &a) && node_log(&b.node, &inbox) == full
+    })
+    .await;
+    hub.unlink("a", "b");
+    a.node.stop_sync();
+
+    // Whole seconds (S1): A′'s updates rank after A's; its first re-base
+    // branch (2′) ranks before its second (r4, r5).
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let a2 = peer_on(&hub, "a2", MeshNode::in_memory().unwrap(), &wallet).await;
+    a2.node.set_replace_flap_window_for_test(Duration::ZERO);
+    c.node.set_replace_flap_window_for_test(Duration::ZERO);
+    let mut a2_events = a2.node.subscribe_events();
+
+    // The stale branch: [o1, 2′ (re-base), 3′ (R2 revokes A)].
+    hub.link("a2", "c");
+    assert_eq!(
+        next_resync(&mut a2_events, &inbox).await,
+        ResyncOutcome::RebaseNeeded
+    );
+    rebase_and_revoke(&a2, &wallet).await;
+    eventually("c appends 2′ and 3′", || async {
+        node_log(&c.node, &inbox).len() == 3
+    })
+    .await;
+    hub.unlink("a2", "c");
+    let stale_branch = a2.node.identity_log(&inbox).unwrap();
+    assert_eq!(stale_branch.len(), 3);
+    let re_base_2 = stale_branch[1].clone();
+
+    // The heal: [o1, o2, o3, r4 (re-base), r5 (R2)].
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    hub.link("a2", "b");
+    assert_eq!(
+        next_resync(&mut a2_events, &inbox).await,
+        ResyncOutcome::RebaseNeeded
+    );
+    rebase_and_revoke(&a2, &wallet).await;
+    eventually("b appends r4 and r5", || async {
+        node_log(&b.node, &inbox).len() == 5
+    })
+    .await;
+    let healed_log = a2.node.identity_log(&inbox).unwrap();
+    let healed = node_log(&a2.node, &inbox);
+    assert_eq!(healed.len(), 5);
+    assert_eq!(healed[..3], full[..]);
+    hub.unlink("a2", "b");
+
+    // C, a witness, heals too the next time it meets A′ -- from here it
+    // holds "the old healed log", not the attack.
+    hub.link("a2", "c");
+    eventually("c replaces its log with the healed one", || async {
+        node_log(&c.node, &inbox) == healed
+    })
+    .await;
+    hub.unlink("a2", "c");
+
+    // V never held the stale branch. A wallet-less attacker still hands it
+    // [o1, o2, o3, 2′] directly (the claimed-inbox path), and V, holding
+    // nothing for this inbox yet, just ingests it (no fork to resolve).
+    let v = peer(&hub, "v").await;
+    let attack = prefix_plus(&healed_log[..3], &re_base_2);
+    v.node
+        .ingest_identity_log_for_test(&inbox, attack.clone())
+        .await
+        .unwrap();
+    let attacked = node_log(&v.node, &inbox);
+    assert_eq!(attacked.len(), 4, "v adopts the attack log");
+    assert_eq!(attacked[..3], full[..]);
+    assert_ne!(
+        attacked[3], healed[3],
+        "v's seq 4 is the abandoned re-base, not r4"
+    );
+
+    // Without tombstones, the owner's own node takes the same attack too:
+    // 2′ still outranks r4 at seq 4.
+    a2.node
+        .replace_identity_log(&inbox, attack.clone())
+        .await
+        .unwrap();
+    let outcome = next_resync(&mut a2_events, &inbox).await;
+    assert!(
+        matches!(
+            outcome,
+            ResyncOutcome::Reloaded | ResyncOutcome::RebaseNeeded
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        node_log(&a2.node, &inbox),
+        attacked,
+        "the owner's own node adopts the same attack"
+    );
+
+    // The app's reaction to any own-inbox resync (Ruling S6/(b), no
+    // tombstones needed): re-base first if this installation dropped out,
+    // then re-assert R2.
+    if outcome == ResyncOutcome::RebaseNeeded {
+        assert!(rebase(&a2, &wallet).await);
+    }
+    revoke_all_other_installations(&a2, &wallet).await;
+    let reasserted = node_log(&a2.node, &inbox);
+    assert_eq!(reasserted.len(), attacked.len() + 1, "r5′ appended");
+    assert_eq!(reasserted[..attacked.len()], attacked[..]);
+
+    // V takes the owner's extension by a strict-prefix append.
+    hub.link("a2", "v");
+    eventually("v converges on the reasserted log", || async {
+        node_log(&v.node, &inbox) == reasserted
+    })
+    .await;
+
+    // C, still on the old healed log, converges too: 2′ outranks r4 at seq
+    // 4, so C takes the owner's whole log by a normal replace.
+    hub.link("a2", "c");
+    eventually("c converges on the reasserted log", || async {
+        node_log(&c.node, &inbox) == reasserted
+    })
+    .await;
+
+    // Everyone ends on [o1, o2, o3, 2′, r5′] with the lost installation
+    // revoked, not just the owner's own node.
+    assert_eq!(
+        association_state(&v.node, &inbox).await.installation_ids(),
+        vec![a2.installation()]
+    );
+    assert_eq!(
+        association_state(&c.node, &inbox).await.installation_ids(),
+        vec![a2.installation()]
+    );
+}

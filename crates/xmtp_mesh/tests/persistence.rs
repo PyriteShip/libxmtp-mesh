@@ -174,3 +174,35 @@ async fn restarted_node_flushes_what_it_queued() {
         "a's node holds b's group welcome"
     );
 }
+
+/// Final review I2: the replace records a pending client resync in its own
+/// transaction; the marker survives a restart (a crash before the resync),
+/// a resync of an older replace doesn't clear a newer one's marker, and the
+/// current one does.
+#[test]
+fn a_pending_client_resync_survives_reopen() {
+    let dir = TempDir::new("pending_resync");
+    let path = dir.db();
+    let row = |seq: i64| xmtp_mesh::store::IdentityRow {
+        sequence_id: seq,
+        server_timestamp_ns: seq,
+        update_bytes: vec![seq as u8],
+    };
+    {
+        let mut s = MeshStore::open(Some(&path), None).unwrap();
+        assert!(s.pending_resyncs().unwrap().is_empty());
+        s.replace_identity("inbox", &[row(1)], &[]).unwrap();
+        assert_eq!(s.pending_resyncs().unwrap(), vec![("inbox".to_string(), 1)]);
+    }
+    let mut s = MeshStore::open(Some(&path), None).unwrap();
+    assert_eq!(s.pending_resyncs().unwrap(), vec![("inbox".to_string(), 1)]);
+    s.replace_identity("inbox", &[row(1), row(2)], &[]).unwrap();
+    s.clear_pending_resync("inbox", 1).unwrap();
+    assert_eq!(
+        s.pending_resyncs().unwrap(),
+        vec![("inbox".to_string(), 2)],
+        "a stale resync keeps the newer replace's marker"
+    );
+    s.clear_pending_resync("inbox", 2).unwrap();
+    assert!(s.pending_resyncs().unwrap().is_empty());
+}

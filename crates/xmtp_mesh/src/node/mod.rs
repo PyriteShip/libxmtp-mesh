@@ -73,6 +73,9 @@ pub(crate) struct NodeInner {
     /// `hand_over_sequencers` itself is never suppressed -- only its
     /// automatic callers are.
     pub(crate) suppress_handover: AtomicBool,
+    /// Test only (final review I2): the identity task never resyncs the
+    /// client, as if the process died right after a replace committed.
+    pub(crate) suppress_client_resync: AtomicBool,
     /// Serializes `start_sync`/`stop_sync` (review M5, 2026-09-24): they
     /// update `identity_task` and `sync` under separate locks, so a
     /// concurrent start and stop could otherwise interleave and leave
@@ -182,6 +185,7 @@ impl MeshNode {
                 identity_task: Mutex::new(None),
                 legacy_identity: AtomicBool::new(false),
                 suppress_handover: AtomicBool::new(false),
+                suppress_client_resync: AtomicBool::new(false),
                 sync_lifecycle: Mutex::new(()),
             }),
         }

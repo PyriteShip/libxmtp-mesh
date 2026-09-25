@@ -100,6 +100,14 @@ struct TextRow {
 }
 
 #[derive(QueryableByName)]
+struct PendingResyncRow {
+    #[diesel(sql_type = Text)]
+    inbox_id: String,
+    #[diesel(sql_type = BigInt)]
+    generation: i64,
+}
+
+#[derive(QueryableByName)]
 struct PendingRow {
     #[diesel(sql_type = Binary)]
     group_id: Vec<u8>,
@@ -270,8 +278,10 @@ impl MeshStore {
 
     /// Replace `inbox_id`'s whole identity log with `rows` (sequence ids
     /// 1..=N, checked by the caller) and its identifier mappings with
-    /// `identifiers`, in one transaction (restore convergence §4.3). Touches
-    /// no other table.
+    /// `identifiers`, in one transaction (restore convergence §4.3). The
+    /// same transaction records a pending client resync for `inbox_id`
+    /// (final review I2, see [`Self::pending_resyncs`]). Touches no other
+    /// table.
     pub fn replace_identity(
         &mut self,
         inbox_id: &str,
@@ -296,8 +306,42 @@ impl MeshStore {
             for (identifier, kind) in identifiers {
                 s.set_identifier(identifier, *kind, inbox_id)?;
             }
+            sql_query(
+                "INSERT INTO pending_resyncs (inbox_id, generation) VALUES (?, 1) \
+                 ON CONFLICT(inbox_id) DO UPDATE SET generation = generation + 1",
+            )
+            .bind::<Text, _>(inbox_id)
+            .execute(&mut s.conn)?;
             Ok(())
         })
+    }
+
+    /// Inboxes whose log was replaced but whose local client has not
+    /// resynced yet, each with the generation of its latest replace (final
+    /// review I2). Survives a restart; the identity task replays them at
+    /// start_sync.
+    pub fn pending_resyncs(&mut self) -> Result<Vec<(String, i64)>, MeshError> {
+        let rows: Vec<PendingResyncRow> =
+            sql_query("SELECT inbox_id, generation FROM pending_resyncs ORDER BY inbox_id")
+                .load(&mut self.conn)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.inbox_id, r.generation))
+            .collect())
+    }
+
+    /// The client resynced `inbox_id` after the replace numbered
+    /// `generation`: drop its marker, unless a newer replace has landed since.
+    pub fn clear_pending_resync(
+        &mut self,
+        inbox_id: &str,
+        generation: i64,
+    ) -> Result<(), MeshError> {
+        sql_query("DELETE FROM pending_resyncs WHERE inbox_id = ? AND generation = ?")
+            .bind::<Text, _>(inbox_id)
+            .bind::<BigInt, _>(generation)
+            .execute(&mut self.conn)?;
+        Ok(())
     }
 
     pub fn set_identifier(

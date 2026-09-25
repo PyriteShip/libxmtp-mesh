@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use alloy::signers::local::PrivateKeySigner;
 use common::{
-    TestPeer, association_state, client_log, eventually, node_log, peer, peer_on, rebase,
+    TestPeer, association_state, client_log, eventually, next_resync, node_log, peer, peer_on,
+    rebase, restart_sync,
 };
 use xmtp_cryptography::XmtpInstallationCredential;
 use xmtp_cryptography::utils::generate_local_wallet;
@@ -20,7 +21,9 @@ use xmtp_id::associations::builder::SignatureRequestBuilder;
 use xmtp_id::associations::test_utils::{
     WalletTestExt, add_installation_key_signature, add_wallet_signature,
 };
-use xmtp_mesh::{ClientGroupMembership, GroupMembership, LoopbackHub, MeshNode, ResyncOutcome};
+use xmtp_mesh::{
+    ClientGroupMembership, GroupMembership, LoopbackHub, MeshNode, NodeEvent, ResyncOutcome,
+};
 use xmtp_mls::client::ClientError;
 use xmtp_mls::identity::IdentityError;
 
@@ -29,7 +32,7 @@ use xmtp_mls::identity::IdentityError;
 /// only `a2`, so its node and its client hold the fork. Afterwards every
 /// node's sync is stopped.
 struct Forked {
-    _hub: LoopbackHub,
+    hub: LoopbackHub,
     wallet: PrivateKeySigner,
     inbox: String,
     a: TestPeer,
@@ -79,7 +82,7 @@ async fn forked() -> Forked {
         node.stop_sync();
     }
     Forked {
-        _hub: hub,
+        hub,
         wallet,
         inbox,
         a,
@@ -247,5 +250,62 @@ async fn a_rebase_onto_a_full_log_is_too_many_installations() {
             .await
             .unwrap(),
         ResyncOutcome::TooManyInstallations
+    );
+}
+
+/// No IdentityResynced for `inbox` arrives on `events` within 1 s.
+async fn no_resync_for_a_second(
+    events: &mut tokio::sync::broadcast::Receiver<NodeEvent>,
+    inbox: &str,
+) -> bool {
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut resynced = false;
+    while let Ok(event) = events.try_recv() {
+        resynced |=
+            matches!(event, NodeEvent::IdentityResynced { inbox_id, .. } if inbox_id == inbox);
+    }
+    !resynced
+}
+
+/// Final review I2: the node's replace commits, then the process dies (the
+/// test hook) before the identity task resyncs the client, so the node holds
+/// the winner and the client still holds the fork. The next start_sync
+/// replays the pending resync: the client reloads the winner and asks for
+/// the re-base. Once done, a further restart replays nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_crash_between_the_replace_and_the_client_resync_heals_at_the_next_start() {
+    let f = forked().await;
+    let winner = f.a.node.identity_log(&f.inbox).unwrap();
+    let fork = client_log(&f.a2, &f.inbox);
+    restart_sync(&f.a2, f.hub.transport_for("a2"));
+    let mut events = f.a2.node.subscribe_events();
+
+    f.a2.node.suppress_client_resync_for_test(true);
+    f.a2.node
+        .replace_identity_log(&f.inbox, winner)
+        .await
+        .unwrap();
+    assert!(no_resync_for_a_second(&mut events, &f.inbox).await);
+    assert_eq!(
+        client_log(&f.a2, &f.inbox),
+        fork,
+        "the crash left the client on the fork"
+    );
+    f.a2.node.stop_sync();
+
+    // The next launch.
+    f.a2.node.suppress_client_resync_for_test(false);
+    restart_sync(&f.a2, f.hub.transport_for("a2"));
+    assert_eq!(
+        next_resync(&mut events, &f.inbox).await,
+        ResyncOutcome::RebaseNeeded
+    );
+    assert_eq!(client_log(&f.a2, &f.inbox), node_log(&f.a.node, &f.inbox));
+
+    f.a2.node.stop_sync();
+    restart_sync(&f.a2, f.hub.transport_for("a2"));
+    assert!(
+        no_resync_for_a_second(&mut events, &f.inbox).await,
+        "the pending resync was cleared once it succeeded"
     );
 }

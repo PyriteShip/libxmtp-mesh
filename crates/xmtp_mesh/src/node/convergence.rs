@@ -1,8 +1,11 @@
 //! Identity-log convergence (restore spec 2026-09-24 §4.1–§4.3). When two
-//! logs of one inbox start with different sequence-1 updates, every node
-//! keeps the one with the earlier origin, with no coordination: a node
-//! holding the losing log replaces it. Only the wallet holder can sign a
-//! `CreateInbox`, so every fork of an inbox comes from its owner.
+//! logs of one inbox differ, every node keeps the one whose update at their
+//! first differing sequence is earlier (sequence 1 for two origins; a later
+//! sequence, Ruling S4, when a restored phone re-based onto a stale, cut-short
+//! copy of the older log), with no coordination: a node holding the losing
+//! log replaces it. A log that is a prefix of the other is not a fork; it is
+//! appended. Only the wallet holder can sign these updates, so every fork of
+//! an inbox comes from its owner.
 //!
 //! **Rank on signed content only (mesh.8 Task 1 review C1, 2026-09-24).**
 //! `client_timestamp_ns`'s signature only covers whole seconds
@@ -12,7 +15,7 @@
 //! anyone holding a copy of the genuine origin — no wallet needed — re-encode
 //! it with different unsigned bytes, pair it with a truncated prefix of the
 //! genuine log, and win permanently, dropping every later update (including
-//! a revocation). So `origin_rank`/`same_origin` work only on
+//! a revocation). So `origin_rank` and the S4 comparison work only on
 //! [`UnverifiedIdentityUpdate::signature_text`](xmtp_id::associations::unverified::UnverifiedIdentityUpdate::signature_text),
 //! never on raw bytes or nanoseconds.
 
@@ -72,15 +75,58 @@ fn signature_text(proto: &IdentityUpdateProto) -> Result<String, MeshError> {
 }
 
 /// §4.1 rule 1: `a` and `b` have the identical signed text, so they are the
-/// **same origin**, whatever their bytes are (an attacker without the wallet
+/// **same update**, whatever their bytes are (an attacker without the wallet
 /// can re-encode unsigned digits, e.g. `client_timestamp_ns`'s sub-second
-/// part, without changing this). Never a replace; a later divergence is D7's.
+/// part, without changing this). At sequence 1, the same origin.
+#[cfg(test)]
 fn same_origin(a: &IdentityUpdateProto, b: &IdentityUpdateProto) -> Result<bool, MeshError> {
     Ok(signature_text(a)? == signature_text(b)?)
 }
 
-/// How a sequence-1 update ranks under §4.1, once [`same_origin`] has ruled
-/// out an exact match: the lower whole second of `client_timestamp_ns` (the
+/// The signed text of each update of a log, in sequence order.
+fn signature_texts(log: &[IdentityUpdateProto]) -> Result<Vec<String>, MeshError> {
+    log.iter().map(signature_text).collect()
+}
+
+/// Ruling S4: the index of the first sequence where two logs of one inbox
+/// (both in sequence order from 1) hold different signed content, or `None`
+/// when one is a prefix of the other -- not a fork: the longer log is
+/// simply appended.
+fn first_difference(ours: &[String], theirs: &[String]) -> Option<usize> {
+    ours.iter().zip(theirs).position(|(o, t)| o != t)
+}
+
+/// §4.1 with Ruling S4: whether `theirs` beats `ours` at `at`, their first
+/// difference ([`first_difference`]). The two updates there are ranked by
+/// [`origin_rank`] (whole seconds, then the text hash); the whole log wins
+/// or loses by that one update.
+///
+/// One guard first: if one side's update at `at` appears later in the other
+/// log, that side is a genuine log with its updates moved down (dropping
+/// the one at `at`, e.g. a revocation), which anyone holding a copy can
+/// build without the wallet. The log that holds both updates, in their
+/// original order, wins. A genuine fork's updates at `at` are distinct
+/// wallet signatures, so the guard never decides one (if both sides match
+/// the rank decides).
+fn theirs_wins_at(
+    ours: &[IdentityUpdateProto],
+    ours_texts: &[String],
+    theirs: &[IdentityUpdateProto],
+    theirs_texts: &[String],
+    at: usize,
+) -> Result<bool, MeshError> {
+    let theirs_moved_down = ours_texts[at + 1..].contains(&theirs_texts[at]);
+    let ours_moved_down = theirs_texts[at + 1..].contains(&ours_texts[at]);
+    Ok(match (theirs_moved_down, ours_moved_down) {
+        (true, false) => false,
+        (false, true) => true,
+        _ => origin_rank(&theirs[at])? < origin_rank(&ours[at])?,
+    })
+}
+
+/// How an update ranks under §4.1 -- at sequence 1, or (Ruling S4) at the
+/// first sequence where two logs differ -- once their signed texts differ:
+/// the lower whole second of `client_timestamp_ns` (the
 /// precision the signature actually covers) wins; on a tie, the lower
 /// sha256 of the signed text wins. Lower wins.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -180,56 +226,72 @@ pub enum ResyncOutcome {
 impl MeshNode {
     /// §4.2: reconcile a peer's copy of `inbox_id`'s log with ours.
     ///
-    /// Review 2026-09-24 C1/R5: a candidate whose sequence-1 update starts
-    /// a different origin from ours is never ranked, replaced or reported
-    /// as a winner before it fully verifies (every signature, contiguous
-    /// 1..=N, every update's `inbox_id`) -- an unverified log can never
-    /// produce [`Resolution::OursWins`], which is what a session may reply
-    /// with. M4: a candidate that would rank earlier by the cheap,
-    /// unverified comparison alone is refused outright, skipping that
+    /// Ruling S4: the two logs are compared at their first sequence with
+    /// different signed content. None (one is a prefix of the other, or we
+    /// hold nothing): ingested as before (Rule B), the longer log appended.
+    /// Otherwise the update at that sequence decides which whole log wins
+    /// ([`theirs_wins_at`]).
+    ///
+    /// Review 2026-09-24 C1/R5: a candidate that differs from ours is never
+    /// ranked, replaced or reported as a winner before it fully verifies
+    /// (every signature, contiguous 1..=N, every update's `inbox_id`) -- an
+    /// unverified log can never produce [`Resolution::OursWins`], which is
+    /// what a session may reply with. M4: a candidate that would win by the
+    /// cheap, unverified comparison alone is refused outright, skipping that
     /// verification, when the inbox is still inside its flap window: a
     /// genuinely verified winner would be refused by the same guard in
     /// [`Self::replace_identity_log_verified`] anyway.
     pub(crate) async fn resolve_identity_log(
         &self,
         inbox_id: &str,
-        updates: Vec<IdentityUpdateLog>,
+        mut updates: Vec<IdentityUpdateLog>,
     ) -> Result<Resolution, MeshError> {
-        let ours = self
-            .inner
-            .store
-            .lock()
-            .identity_rows(inbox_id, 0)?
-            .into_iter()
-            .next();
-        let Some(ours) = ours else {
-            self.ingest_identity_log(inbox_id, updates).await?;
-            return Ok(Resolution::SameOrigin);
-        };
-        let ours_proto = IdentityUpdateProto::decode(ours.update_bytes.as_slice())?;
-        let theirs_first = updates
+        let ours = self.held_log(inbox_id)?;
+        updates.sort_by_key(|u| u.sequence_id);
+        // The unverified candidate's contiguous run from sequence 1, for the
+        // cheap comparison only.
+        let theirs: Vec<IdentityUpdateProto> = updates
             .iter()
-            .find(|u| u.sequence_id == 1)
-            .and_then(|u| u.update.clone());
-        let Some(theirs_first) = theirs_first else {
-            self.ingest_identity_log(inbox_id, updates).await?;
-            return Ok(Resolution::SameOrigin);
-        };
-        if same_origin(&ours_proto, &theirs_first)? {
+            .enumerate()
+            .map_while(|(i, u)| (u.sequence_id == i as u64 + 1).then_some(u.update.clone())?)
+            .collect();
+        if ours.is_empty() || theirs.is_empty() {
             self.ingest_identity_log(inbox_id, updates).await?;
             return Ok(Resolution::SameOrigin);
         }
-        if origin_rank(&theirs_first)? < origin_rank(&ours_proto)? && self.flap_blocked(inbox_id) {
+        let ours_texts = signature_texts(&ours)?;
+        let theirs_texts = signature_texts(&theirs)?;
+        let Some(at) = first_difference(&ours_texts, &theirs_texts) else {
+            self.ingest_identity_log(inbox_id, updates).await?;
+            return Ok(Resolution::SameOrigin);
+        };
+        if theirs_wins_at(&ours, &ours_texts, &theirs, &theirs_texts, at)?
+            && self.flap_blocked(inbox_id)
+        {
             return Err(self.flap_blocked_error(inbox_id));
         }
         let (updates, protos, state) = verify_candidate_log(inbox_id, updates).await?;
-        if origin_rank(&protos[0])? < origin_rank(&ours_proto)? {
-            self.replace_identity_log_verified(updates, protos, state)
-                .await?;
-            Ok(Resolution::Replaced)
-        } else {
-            Ok(Resolution::OursWins(Box::new(state)))
+        let theirs_texts = signature_texts(&protos)?;
+        match first_difference(&ours_texts, &theirs_texts) {
+            Some(at) if theirs_wins_at(&ours, &ours_texts, &protos, &theirs_texts, at)? => {
+                self.replace_identity_log_verified(updates, protos, state)
+                    .await?;
+                Ok(Resolution::Replaced)
+            }
+            Some(_) => Ok(Resolution::OursWins(Box::new(state))),
+            None => {
+                self.ingest_identity_log(inbox_id, updates).await?;
+                Ok(Resolution::SameOrigin)
+            }
         }
+    }
+
+    /// This node's log of `inbox_id`, decoded, in sequence order.
+    fn held_log(&self, inbox_id: &str) -> Result<Vec<IdentityUpdateProto>, MeshError> {
+        let rows = self.inner.store.lock().identity_rows(inbox_id, 0)?;
+        rows.iter()
+            .map(|row| Ok(IdentityUpdateProto::decode(row.update_bytes.as_slice())?))
+            .collect()
     }
 
     /// Whether `updates` (the peer's own claim for `inbox_id`, e.g. on the
@@ -276,8 +338,9 @@ impl MeshNode {
     /// - runs 1..=N with no gap, all for `inbox_id`,
     /// - verifies (every signature, every update applying to the one before),
     /// - wins under §4.1 against the stored log, ranked on signed content
-    ///   only (a stored log must exist, and the two must have different
-    ///   signature text: [`same_origin`] is D7's later-divergence case),
+    ///   only at the first sequence where the two differ (Ruling S4; a
+    ///   stored log must exist, and a log that is a prefix of the other is
+    ///   not a fork: it is appended, never replaced),
     /// - and this inbox was not replaced in the last [`REPLACE_FLAP_WINDOW`].
     ///
     /// M4 (review 2026-09-24): the flap guard needs only `inbox_id`, so it
@@ -305,9 +368,9 @@ impl MeshNode {
 
     /// The rest of [`Self::replace_identity_log`], given an already fully
     /// verified candidate (its protos and resulting `AssociationState`):
-    /// wins under §4.1 against the stored log (a stored log must exist,
-    /// and the two must have different signature text: [`same_origin`] is
-    /// D7's later-divergence case), and this inbox was not replaced in the
+    /// wins under §4.1 against the stored log at their first difference
+    /// (Ruling S4: a stored log must exist, and neither may be a prefix of
+    /// the other), and this inbox was not replaced in the
     /// last [`REPLACE_FLAP_WINDOW`] (re-checked here under the store lock,
     /// even though callers already made the cheap check above -- this is
     /// the authoritative check against a concurrent replace).
@@ -346,26 +409,34 @@ impl MeshNode {
             })
             .collect();
 
-        // M1/I1: the D7, win and flap checks, and the owner's-own-inbox cap
+        // M1/I1: the prefix (S4), win and flap checks, and the owner's-own-inbox cap
         // guard, all run under one store lock (removes the
         // time-of-check/time-of-use window the separate `self.local_inbox()`
         // / `self.local_installation()` calls used to leave open).
         let mut store = self.inner.store.lock();
-        let Some(held) = store.identity_rows(inbox_id, 0)?.into_iter().next() else {
+        let held: Vec<IdentityUpdateProto> = store
+            .identity_rows(inbox_id, 0)?
+            .iter()
+            .map(|row| IdentityUpdateProto::decode(row.update_bytes.as_slice()))
+            .collect::<Result<_, _>>()?;
+        if held.is_empty() {
             return Err(MeshError::InvalidRequest(format!(
                 "no identity log of {inbox_id} to replace"
             )));
-        };
-        let held_proto = IdentityUpdateProto::decode(held.update_bytes.as_slice())?;
-        if same_origin(&held_proto, &protos[0])? {
-            return Err(MeshError::IdentityRejected(format!(
-                "the logs of {inbox_id} share their first update; a later divergence is not \
-                 replaced (D7)"
-            )));
         }
-        if origin_rank(&protos[0])? >= origin_rank(&held_proto)? {
+        let held_texts = signature_texts(&held)?;
+        let candidate_texts = signature_texts(&protos)?;
+        let Some(at) = first_difference(&held_texts, &candidate_texts) else {
             return Err(MeshError::IdentityRejected(format!(
-                "replacement log for {inbox_id} does not have the earlier origin"
+                "one log of {inbox_id} is a prefix of the other: not a fork, so it is appended, \
+                 never replaced (S4)"
+            )));
+        };
+        if !theirs_wins_at(&held, &held_texts, &protos, &candidate_texts, at)? {
+            return Err(MeshError::IdentityRejected(format!(
+                "replacement log for {inbox_id} does not have the earlier origin at sequence {} \
+                 (its first difference from ours)",
+                at + 1
             )));
         }
         let window = *self.inner.replace_flap_window.lock();
@@ -380,7 +451,7 @@ impl MeshNode {
             )));
         }
 
-        // I1: only a candidate that has already won (D7, rank and flap all
+        // I1: only a candidate that has already won (prefix, rank and flap all
         // passed) can be refused for costing us our own installation, so a
         // losing, same-origin or flap-blocked full log never raises the
         // banner (see doc comment above).
@@ -489,6 +560,13 @@ impl MeshNode {
     /// reconstructed. A sustained `LocalClient` outage is logged once,
     /// then every 10th attempt, not on every retry.
     ///
+    /// Final review I2: the replace records a pending resync in its own
+    /// store transaction ([`MeshStore::replace_identity`](crate::MeshStore::replace_identity)),
+    /// and a successful resync clears it, so the task first replays every
+    /// marker a previous run left (the process died, or `stop_sync` ran,
+    /// between the replace and the resync). A resync that fails with a
+    /// non-retryable error keeps its marker and is retried at the next start.
+    ///
     /// Also runs the §4.7 sequencer handover after every identity-log
     /// change (a replace, a plain append such as a revoke, or a lagged
     /// resync), so a group whose pinned sequencer was just revoked is
@@ -504,6 +582,19 @@ impl MeshNode {
             .spawn(async move {
                 let mut pending: HashMap<String, u32> = HashMap::new();
                 let mut retry_at: Option<tokio::time::Instant> = None;
+                // Final review I2: replay every resync a previous run
+                // committed a replace for but never finished (a crash, or
+                // stop_sync, between the two).
+                let replay = node.pending_resync_inboxes();
+                if !replay.is_empty() {
+                    for inbox_id in replay {
+                        node.retry_resync(membership.as_ref(), inbox_id, &mut pending).await;
+                    }
+                    node.hand_over(membership.as_ref()).await;
+                    if !pending.is_empty() {
+                        retry_at = Some(tokio::time::Instant::now() + IDENTITY_TASK_RETRY_INTERVAL);
+                    }
+                }
                 loop {
                     tokio::select! {
                         biased;
@@ -543,6 +634,27 @@ impl MeshNode {
             .abort_handle()
     }
 
+    /// Inboxes with a pending client resync in the store (final review I2).
+    /// A store error is logged and treated as none: the in-memory path
+    /// still resyncs every replace this run makes.
+    fn pending_resync_inboxes(&self) -> Vec<String> {
+        match self.inner.store.lock().pending_resyncs() {
+            Ok(pending) => pending.into_iter().map(|(inbox, _)| inbox).collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read pending client resyncs");
+                Vec::new()
+            }
+        }
+    }
+
+    fn pending_resync_generation(&self, inbox_id: &str) -> Option<i64> {
+        let pending = self.inner.store.lock().pending_resyncs().ok()?;
+        pending
+            .into_iter()
+            .find(|(inbox, _)| inbox == inbox_id)
+            .map(|(_, generation)| generation)
+    }
+
     /// Calls [`Self::resync_client`] for `inbox_id`; on success (or a
     /// non-retryable error) removes it from `pending`, on a retryable
     /// `LocalClient` error bumps its attempt count so the next retry's log
@@ -553,6 +665,9 @@ impl MeshNode {
         inbox_id: String,
         pending: &mut HashMap<String, u32>,
     ) {
+        if self.inner.suppress_client_resync.load(Ordering::Relaxed) {
+            return;
+        }
         let attempt = pending.get(&inbox_id).copied().unwrap_or(0) + 1;
         if self
             .resync_client(membership, inbox_id.clone(), attempt)
@@ -576,8 +691,20 @@ impl MeshNode {
         inbox_id: String,
         attempt: u32,
     ) -> bool {
+        // Read before the resync, so a replace that lands meanwhile keeps
+        // its own (newer) marker.
+        let generation = self.pending_resync_generation(&inbox_id);
         match membership.identity_log_replaced(&inbox_id).await {
             Ok(outcome) => {
+                if let Some(generation) = generation
+                    && let Err(e) = self
+                        .inner
+                        .store
+                        .lock()
+                        .clear_pending_resync(&inbox_id, generation)
+                {
+                    tracing::warn!(inbox_id, error = %e, "could not clear a pending client resync");
+                }
                 tracing::info!(
                     inbox_id,
                     ?outcome,
@@ -602,6 +729,17 @@ impl MeshNode {
                 true
             }
         }
+    }
+
+    /// Test only (final review I2): while set, the identity task skips every
+    /// client resync, as if the process died between a replace's commit and
+    /// the resync. Clear it and restart sync to model the next launch.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn suppress_client_resync_for_test(&self, suppress: bool) {
+        self.inner
+            .suppress_client_resync
+            .store(suppress, Ordering::Relaxed);
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -629,7 +767,9 @@ mod tests {
     use xmtp_proto::xmtp::identity::associations::IdentityUpdate as IdentityUpdateProto;
 
     use super::*;
-    use crate::node::test_logs::{added_installation, added_wallet, drain, origin};
+    use crate::node::test_logs::{
+        added_installation, added_wallet, drain, origin, owned_three_update_log,
+    };
     use crate::store::NewGroupMessage;
 
     fn first_bytes(node: &MeshNode, inbox_id: &str) -> Vec<u8> {
@@ -868,8 +1008,8 @@ mod tests {
     /// signed second (the rendered text, so the signature, is unchanged),
     /// and pairs it with a truncated prefix of the genuine log that drops
     /// a later update. This must never replace the stored log: same
-    /// signature text is the same origin (§4.1 rule 1), which is D7's
-    /// later-divergence case, not a fork.
+    /// signature text is the same update (§4.1 rule 1), so the truncated
+    /// log is a prefix of ours (Ruling S4): not a fork.
     #[tokio::test]
     async fn a_restamped_origin_within_its_signed_second_does_not_replace() {
         let owner = generate_local_wallet();
@@ -907,8 +1047,8 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("share their first update"),
-            "must be refused as D7 (same origin), not ranked as a winner: {err}"
+            err.to_string().contains("not a fork"),
+            "must be refused as a prefix (same update, S4), not ranked as a winner: {err}"
         );
         assert_eq!(first_bytes(&node, &inbox), bytes(&genuine));
         assert_eq!(
@@ -943,7 +1083,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(
-                err.to_string().contains("share their first update"),
+                err.to_string().contains("not a fork"),
                 "offset {offset_ns}: {err}"
             );
         }
@@ -1133,6 +1273,240 @@ mod tests {
                 .iter()
                 .all(|e| !matches!(e, NodeEvent::IdentityResynced { .. })),
             "a losing full log must never raise the too-many-installations banner"
+        );
+    }
+
+    /// Ruling S4: a log that is a strict prefix of ours, or that ours is a
+    /// strict prefix of, is not a fork. The longer log is appended; nothing
+    /// is ever replaced.
+    #[tokio::test]
+    async fn a_strict_prefix_only_appends() {
+        let (owner, inbox, log) = owned_three_update_log().await;
+        let node = MeshNode::in_memory().unwrap();
+        node.ingest_identity_log(&inbox, log[..2].to_vec())
+            .await
+            .unwrap();
+
+        // Shorter: nothing changes.
+        assert!(matches!(
+            node.resolve_identity_log(&inbox, log[..1].to_vec())
+                .await
+                .unwrap(),
+            Resolution::SameOrigin
+        ));
+        assert_eq!(node.identity_log(&inbox).unwrap().len(), 2);
+
+        // Longer: appended.
+        assert!(matches!(
+            node.resolve_identity_log(&inbox, log.clone())
+                .await
+                .unwrap(),
+            Resolution::SameOrigin
+        ));
+        assert_eq!(
+            node.identity_log(&inbox)
+                .unwrap()
+                .iter()
+                .map(bytes)
+                .collect::<Vec<_>>(),
+            log.iter().map(bytes).collect::<Vec<_>>()
+        );
+
+        // replace_identity_log refuses both directions: a prefix is not a fork.
+        let longer = vec![
+            log[0].clone(),
+            log[1].clone(),
+            log[2].clone(),
+            added_wallet(&owner, &inbox, 4, 1_004).await,
+        ];
+        for candidate in [log[..1].to_vec(), longer] {
+            let err = node
+                .replace_identity_log(&inbox, candidate)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("not a fork"), "{err}");
+        }
+        assert_eq!(node.identity_log(&inbox).unwrap().len(), 3);
+        assert_eq!(node.replacements_for_test(), 0);
+    }
+
+    /// Ruling S4: two logs of one origin that diverge later are ranked at
+    /// their FIRST differing sequence, by whole seconds then the text hash.
+    /// The whole log wins or loses by that one update.
+    #[tokio::test]
+    async fn a_later_divergence_is_ranked_at_the_first_differing_sequence() {
+        let owner = generate_local_wallet();
+        let inbox = owner.get_inbox_id(0);
+        let first = origin(&owner).await;
+        let early_2 = added_wallet(&owner, &inbox, 2, 1_002).await;
+        let early_3 = added_wallet(&owner, &inbox, 3, 1_003).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let late_2 = added_wallet(&owner, &inbox, 2, 1_002).await;
+        let full = vec![first.clone(), early_2, early_3];
+        let rebased = vec![first.clone(), late_2];
+
+        // The holder of the later seq-2 update replaces its whole log.
+        let stale = MeshNode::in_memory().unwrap();
+        stale
+            .ingest_identity_log(&inbox, rebased.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            stale
+                .resolve_identity_log(&inbox, full.clone())
+                .await
+                .unwrap(),
+            Resolution::Replaced
+        ));
+        assert_eq!(
+            stale
+                .identity_log(&inbox)
+                .unwrap()
+                .iter()
+                .map(bytes)
+                .collect::<Vec<_>>(),
+            full.iter().map(bytes).collect::<Vec<_>>()
+        );
+
+        // The holder of the older seq-2 update keeps its log.
+        let holder = MeshNode::in_memory().unwrap();
+        holder
+            .ingest_identity_log(&inbox, full.clone())
+            .await
+            .unwrap();
+        let resolution = holder
+            .resolve_identity_log(&inbox, rebased.clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(resolution, Resolution::OursWins(_)),
+            "{resolution:?}"
+        );
+        let err = holder
+            .replace_identity_log(&inbox, rebased)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not have the earlier origin"),
+            "{err}"
+        );
+        assert_eq!(holder.identity_log(&inbox).unwrap().len(), 3);
+        assert_eq!(holder.replacements_for_test(), 0);
+    }
+
+    /// Ruling S4 + R5: a wallet-less attacker who holds a copy of the
+    /// genuine log still can't win at the divergence point. A back-dated
+    /// update fails its signature; a restamp within its signed second is the
+    /// same update (a prefix, not a fork); and a genuine later update moved
+    /// down to replace an earlier one (dropping it, e.g. a revocation) loses
+    /// even when the two share a second and the text hash would favour it.
+    #[tokio::test]
+    async fn a_wallet_less_attacker_cannot_win_at_the_divergence_point() {
+        let owner = generate_local_wallet();
+        let inbox = owner.get_inbox_id(0);
+        let first = origin(&owner).await;
+        // Two genuine updates in one whole second, where the later one's
+        // text hash ranks lower: the only case the hash tie-break decides.
+        let (second, third) = loop {
+            let second = added_wallet(&owner, &inbox, 2, 1_002).await;
+            let third = added_wallet(&owner, &inbox, 3, 1_003).await;
+            let (p2, p3) = (
+                second.update.as_ref().unwrap(),
+                third.update.as_ref().unwrap(),
+            );
+            if p2.client_timestamp_ns / 1_000_000_000 == p3.client_timestamp_ns / 1_000_000_000
+                && origin_rank(p3).unwrap() < origin_rank(p2).unwrap()
+            {
+                break (second, third);
+            }
+        };
+        let genuine = vec![first.clone(), second.clone(), third.clone()];
+        let node = MeshNode::in_memory().unwrap();
+        node.ingest_identity_log(&inbox, genuine.clone())
+            .await
+            .unwrap();
+
+        // Back-dated by 5 s: the signed text changes, so the signature fails.
+        let mut back_dated = second.clone();
+        back_dated.update.as_mut().unwrap().client_timestamp_ns -= 5_000_000_000;
+        // Restamped within its signed second: the same update.
+        let mut restamped = second.clone();
+        let ts = restamped.update.as_ref().unwrap().client_timestamp_ns;
+        restamped.update.as_mut().unwrap().client_timestamp_ns =
+            (ts / 1_000_000_000) * 1_000_000_000 + (ts + 1) % 1_000_000_000;
+        // The genuine seq 3 moved down to seq 2, dropping the real seq 2.
+        let moved_down = IdentityUpdateLog {
+            sequence_id: 2,
+            ..third.clone()
+        };
+
+        for candidate in [
+            vec![first.clone(), back_dated],
+            vec![first.clone(), restamped],
+            vec![first.clone(), moved_down],
+        ] {
+            let resolved = node.resolve_identity_log(&inbox, candidate.clone()).await;
+            assert!(
+                !matches!(resolved, Ok(Resolution::Replaced)),
+                "{resolved:?}"
+            );
+            assert!(node.replace_identity_log(&inbox, candidate).await.is_err());
+            assert_eq!(
+                node.identity_log(&inbox)
+                    .unwrap()
+                    .iter()
+                    .map(bytes)
+                    .collect::<Vec<_>>(),
+                genuine.iter().map(bytes).collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(node.replacements_for_test(), 0);
+    }
+
+    /// Final review I2: the replace records a pending client resync for the
+    /// inbox in the same store transaction, so a crash before the identity
+    /// task resyncs the client is healed at the next start (see
+    /// `tests/rebase.rs` for the start_sync replay).
+    #[tokio::test]
+    async fn a_replace_records_a_pending_resync_until_the_client_resyncs() {
+        let owner = generate_local_wallet();
+        let inbox = owner.get_inbox_id(0);
+        let older = origin(&owner).await;
+        let newer = origin(&owner).await;
+        let node = MeshNode::in_memory().unwrap();
+        node.ingest_identity_log(&inbox, vec![newer]).await.unwrap();
+        assert!(
+            node.inner
+                .store
+                .lock()
+                .pending_resyncs()
+                .unwrap()
+                .is_empty()
+        );
+
+        node.replace_identity_log(&inbox, vec![older])
+            .await
+            .unwrap();
+        let pending = node.inner.store.lock().pending_resyncs().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, inbox);
+
+        // A resync that fails transiently keeps the marker; one that
+        // succeeds clears it.
+        let flaky = FlakyLocalClient {
+            remaining_failures: std::sync::atomic::AtomicUsize::new(1),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        assert!(!node.resync_client(&flaky, inbox.clone(), 1).await);
+        assert_eq!(node.inner.store.lock().pending_resyncs().unwrap().len(), 1);
+        assert!(node.resync_client(&flaky, inbox.clone(), 2).await);
+        assert!(
+            node.inner
+                .store
+                .lock()
+                .pending_resyncs()
+                .unwrap()
+                .is_empty()
         );
     }
 

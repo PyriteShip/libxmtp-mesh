@@ -429,11 +429,11 @@ impl Session {
     /// The peer's identity log for `log.inbox_id`. The log of the inbox the
     /// peer claimed in its Hello proves (or disproves) its membership. Any
     /// other inbox's log is a relay (§4.2), which only ever reconciles a log
-    /// we already hold. When the two copies start differently, the one with
-    /// the earlier origin wins on every node (§4.1): ours is replaced, or the
-    /// peer is sent ours in an IdentityConflict and stays unverified until
-    /// the verification deadline (an owner re-bases meanwhile, §4.4) instead
-    /// of being dropped. PeerNotMember stays fatal when the logs agree and
+    /// we already hold. When the two copies differ, the one with the earlier
+    /// update at their first difference wins on every node (§4.1, Ruling
+    /// S4): ours is replaced, or the peer is sent ours in an
+    /// IdentityConflict and stays unverified until the verification deadline
+    /// (an owner re-bases meanwhile, §4.4) instead of being dropped. PeerNotMember stays fatal when the logs agree and
     /// the peer is still not a member.
     async fn on_identity_log(&mut self, log: IdentityLog) -> Result<(), MeshError> {
         if self.node.legacy_identity() {
