@@ -354,6 +354,147 @@ fn notify_lost(nodes: (Option<MeshNode>, Option<MeshNode>), a: &str, b: &str) {
     }
 }
 
+/// One step of a scripted topology change (spec §10.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkOp {
+    Link(String, String),
+    Unlink(String, String),
+}
+
+impl LoopbackHub {
+    /// Apply `steps` in order, each after waiting its delay from the previous one.
+    pub async fn run_schedule(&self, steps: Vec<(Duration, LinkOp)>) {
+        for (wait, op) in steps {
+            tokio::time::sleep(wait).await;
+            match op {
+                LinkOp::Link(a, b) => self.link(&a, &b),
+                LinkOp::Unlink(a, b) => self.unlink(&a, &b),
+            }
+        }
+    }
+}
+
+fn edge(a: &str, b: &str) -> (String, String) {
+    if a < b {
+        (a.into(), b.into())
+    } else {
+        (b.into(), a.into())
+    }
+}
+
+fn degree_of(edges: &[(String, String)], n: &str) -> usize {
+    edges.iter().filter(|(a, b)| a == n || b == n).count()
+}
+
+/// A connected random graph over `names` (seeded): a random spanning tree,
+/// then up to `extra` more edges. No node gets more than `max_degree` links
+/// where the tree allows it (BLE holds about 4 connections). Edges are
+/// normalised `(a, b)` with `a < b`.
+pub fn random_topology(
+    names: &[String],
+    extra: usize,
+    max_degree: usize,
+    seed: u64,
+) -> Vec<(String, String)> {
+    assert!(
+        !names.is_empty(),
+        "random_topology: names must not be empty"
+    );
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut order: Vec<String> = names.to_vec();
+    for i in (1..order.len()).rev() {
+        order.swap(i, rng.random_range(0..=i));
+    }
+    let mut edges = Vec::new();
+    for i in 1..order.len() {
+        let open: Vec<&String> = order[..i]
+            .iter()
+            .filter(|n| degree_of(&edges, n) < max_degree)
+            .collect();
+        let to = if open.is_empty() {
+            &order[rng.random_range(0..i)]
+        } else {
+            open[rng.random_range(0..open.len())]
+        };
+        edges.push(edge(&order[i], to));
+    }
+    for _ in 0..extra * 4 {
+        if edges.len() >= order.len() - 1 + extra {
+            break;
+        }
+        let a = &order[rng.random_range(0..order.len())];
+        let b = &order[rng.random_range(0..order.len())];
+        let e = edge(a, b);
+        if a != b
+            && !edges.contains(&e)
+            && degree_of(&edges, a) < max_degree
+            && degree_of(&edges, b) < max_degree
+        {
+            edges.push(e);
+        }
+    }
+    edges
+}
+
+/// `steps` churn steps, `every` apart (seeded): each unlinks a random live
+/// pair or links a random new pair within `max_degree`, alternating. An
+/// unlink turn with no live pair to remove falls through to a link turn.
+pub fn churn_schedule(
+    names: &[String],
+    start: &[(String, String)],
+    steps: usize,
+    every: Duration,
+    max_degree: usize,
+    seed: u64,
+) -> Vec<(Duration, LinkOp)> {
+    assert!(
+        max_degree >= 1,
+        "churn_schedule: max_degree must be at least 1, got 0"
+    );
+    assert!(
+        names.len() >= 2,
+        "churn_schedule: names must have at least 2 entries, got {}",
+        names.len()
+    );
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut edges: Vec<(String, String)> = start.to_vec();
+    let mut out = Vec::with_capacity(steps);
+    while out.len() < steps {
+        let unlink = out.len() % 2 == 0 && !edges.is_empty();
+        if unlink {
+            let (a, b) = edges.swap_remove(rng.random_range(0..edges.len()));
+            out.push((every, LinkOp::Unlink(a, b)));
+            continue;
+        }
+        // Bounded like random_topology's extra-edge search: give up rather
+        // than spin forever once no legal pair is left to add.
+        let max_attempts = names.len() * names.len() * 4;
+        let mut linked = false;
+        for _ in 0..max_attempts {
+            let a = &names[rng.random_range(0..names.len())];
+            let b = &names[rng.random_range(0..names.len())];
+            let e = edge(a, b);
+            if a != b
+                && !edges.contains(&e)
+                && degree_of(&edges, a) < max_degree
+                && degree_of(&edges, b) < max_degree
+            {
+                edges.push(e.clone());
+                out.push((every, LinkOp::Link(e.0, e.1)));
+                linked = true;
+                break;
+            }
+        }
+        assert!(
+            linked,
+            "churn_schedule: no pair available to link under max_degree={max_degree} ({} names, {} live edges)",
+            names.len(),
+            edges.len()
+        );
+    }
+    out
+}
+
 struct LoopbackTransport {
     hub: LoopbackHub,
     me: PeerId,
@@ -479,6 +620,110 @@ mod tests {
         hub.unlink("a", "b");
         hub.link("a", "b");
         tokio::time::sleep(ms(800)).await;
+        assert!(hub.is_linked("a", "b"));
+    }
+
+    fn names(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("n{i}")).collect()
+    }
+
+    fn connected(names: &[String], edges: &[(String, String)]) -> bool {
+        let mut seen = std::collections::HashSet::from([names[0].clone()]);
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for (a, b) in edges {
+                if seen.contains(a) != seen.contains(b) {
+                    seen.insert(a.clone());
+                    seen.insert(b.clone());
+                    changed = true;
+                }
+            }
+        }
+        seen.len() == names.len()
+    }
+
+    fn degree(edges: &[(String, String)], n: &str) -> usize {
+        edges.iter().filter(|(a, b)| a == n || b == n).count()
+    }
+
+    #[test]
+    fn random_topology_is_connected_capped_and_seeded() {
+        let names = names(50);
+        let edges = random_topology(&names, 20, 4, 7);
+        assert!(connected(&names, &edges));
+        assert!(names.iter().all(|n| degree(&edges, n) <= 4));
+        assert_eq!(
+            edges,
+            random_topology(&names, 20, 4, 7),
+            "same seed, same graph"
+        );
+        assert_ne!(edges, random_topology(&names, 20, 4, 8));
+        for (a, b) in &edges {
+            assert!(a < b, "edges are normalised (a < b)");
+        }
+    }
+
+    #[test]
+    fn churn_schedule_keeps_the_degree_cap() {
+        let names = names(20);
+        let start = random_topology(&names, 5, 4, 1);
+        let steps = churn_schedule(&names, &start, 40, ms(100), 4, 1);
+        assert_eq!(steps.len(), 40);
+        let mut edges: std::collections::HashSet<(String, String)> = start.into_iter().collect();
+        for (wait, op) in steps {
+            assert_eq!(wait, ms(100));
+            match op {
+                LinkOp::Link(a, b) => assert!(edges.insert((a, b)), "links a new pair"),
+                LinkOp::Unlink(a, b) => assert!(edges.remove(&(a, b)), "unlinks a live pair"),
+            }
+            let list: Vec<_> = edges.iter().cloned().collect();
+            assert!(names.iter().all(|n| degree(&list, n) <= 4));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "names")]
+    fn random_topology_rejects_empty_names() {
+        random_topology(&[], 0, 4, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_degree")]
+    fn churn_schedule_rejects_zero_max_degree() {
+        let names = names(4);
+        let start = random_topology(&names, 1, 4, 1);
+        churn_schedule(&names, &start, 1, ms(100), 0, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "names")]
+    fn churn_schedule_rejects_too_few_names() {
+        churn_schedule(&names(1), &[], 1, ms(100), 4, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "no pair")]
+    fn churn_schedule_panics_rather_than_hangs_when_no_pair_is_left() {
+        // 3 names, degree cap 1: once any one edge exists, the other two
+        // names are both already at the cap, so no second edge is legal.
+        // Step 0 (even, edges empty) links the only pair the seed picks
+        // first; step 1 (odd, always a link turn) then has nothing left.
+        let names = names(3);
+        churn_schedule(&names, &[], 2, ms(100), 1, 1);
+    }
+
+    #[tokio::test]
+    async fn run_schedule_applies_steps_in_order() {
+        let hub = hub_with_two(LinkProfile::ble_1m());
+        hub.run_schedule(vec![
+            (ms(0), LinkOp::Link("a".into(), "b".into())),
+            (ms(50), LinkOp::Unlink("a".into(), "b".into())),
+        ])
+        .await;
+        assert!(!hub.is_linked("a", "b"));
+        hub.run_schedule(vec![(ms(10), LinkOp::Link("a".into(), "b".into()))])
+            .await;
         assert!(hub.is_linked("a", "b"));
     }
 }

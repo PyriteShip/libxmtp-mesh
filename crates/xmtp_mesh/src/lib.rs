@@ -44,7 +44,7 @@ pub use node::{MeshNode, MeshStream, NodeEvent, Resolution, ResyncOutcome, Verif
 pub use store::{InsertOutcome, MeshStore, NewGroupMessage, StoredGroupMessage, StoredWelcome};
 pub use sync::frames::MAX_FRAME_LEN;
 pub use sync::{
-    ClientGroupMembership, ClientHelloSigner, GroupMembership, HelloSigner, LinkProfile,
-    LoopbackHub, MeshTransport, PeerId, frames,
+    ClientGroupMembership, ClientHelloSigner, GroupMembership, HelloSigner, LinkOp, LinkProfile,
+    LoopbackHub, MeshTransport, PeerId, churn_schedule, frames, random_topology,
 };
 pub use verifier::EoaOnlyVerifier;
