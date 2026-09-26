@@ -42,6 +42,10 @@ pub enum MeshError {
     Connection(#[from] diesel::ConnectionError),
     #[error("migration: {0}")]
     Migration(String),
+    /// Relay processing failed (bad envelope, key, seal or signature). Never
+    /// fatal to a session: relayed traffic is not the link peer's own.
+    #[error("relay: {0}")]
+    Relay(String),
     /// The local client could not report a group's members.
     #[error("group membership: {0}")]
     Membership(String),

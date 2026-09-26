@@ -1,4 +1,4 @@
-mod auth;
+pub(crate) mod auth;
 pub mod frames;
 mod loopback;
 mod membership;

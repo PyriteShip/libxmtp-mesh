@@ -35,6 +35,7 @@
 mod error;
 mod mls_parse;
 pub mod node;
+mod relay;
 pub mod store;
 pub mod sync;
 mod verifier;

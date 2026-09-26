@@ -13,6 +13,7 @@ workspace = true
 test-utils = []
 
 [dependencies]
+aes-gcm = { workspace = true }
 alloy.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
@@ -20,6 +21,8 @@ diesel = { workspace = true, features = ["sqlite"] }
 diesel_migrations = { workspace = true, features = ["sqlite"] }
 futures = { workspace = true, features = ["std"] }
 hex.workspace = true
+hkdf = { workspace = true }
+hmac = "0.12.1"
 http = "1.2"
 libsqlite3-sys = { version = "0.35", features = ["bundled-sqlcipher-vendored-openssl"] }
 openmls = { workspace = true }
