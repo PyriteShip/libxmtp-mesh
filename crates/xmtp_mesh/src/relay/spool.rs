@@ -64,7 +64,9 @@ pub(crate) fn accept(
     };
     let hash = envelope::hash(sealed);
     store.transaction(|s| {
-        if s.relay_is_seen(&hash)? {
+        // The spool row too: a capped seen-set may have forgotten an
+        // envelope that is still held.
+        if s.relay_is_seen(&hash)? || s.spool_get(&hash)?.is_some() {
             return Ok(Accept::Duplicate);
         }
         s.relay_purge(now_secs)?;
@@ -97,7 +99,7 @@ pub(crate) fn accept(
             drop_at: expires_at.min(now_secs + cfg.hold.as_secs() as i64),
             from_installation: from.to_vec(),
         })?;
-        s.relay_mark_seen(&hash, expires_at)?;
+        s.relay_mark_seen(&hash, expires_at, cfg.max_seen)?;
         Ok(Accept::New {
             hash,
             share_evicted,
@@ -123,12 +125,27 @@ impl TokenBucket {
         }
     }
 
-    /// Refill to `now`, then say whether `n` tokens are available.
-    pub(crate) fn allows(&mut self, n: f64, now: Instant) -> bool {
+    fn refill(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
         self.tokens = (self.tokens + elapsed * self.per_sec).min(self.capacity);
         self.last = now;
+    }
+
+    /// Refill to `now`, then say whether `n` tokens are available.
+    pub(crate) fn allows(&mut self, n: f64, now: Instant) -> bool {
+        self.refill(now);
         self.tokens >= n
+    }
+
+    /// Refill to `now`; the tokens available.
+    pub(crate) fn level(&mut self, now: Instant) -> f64 {
+        self.refill(now);
+        self.tokens
+    }
+
+    /// Refill to `now`; whether it is back at capacity (as good as new).
+    pub(crate) fn is_full(&mut self, now: Instant) -> bool {
+        self.level(now) >= self.capacity
     }
 
     pub(crate) fn take(&mut self, n: f64) {
@@ -356,6 +373,37 @@ mod tests {
         assert_eq!(s.spool_get(&hash).unwrap().unwrap().drop_at, NOW + 600);
     }
 
+    /// Final review Important 7: accept keeps the seen-set within
+    /// `max_seen`; an envelope still in the spool whose seen entry was
+    /// forgotten is still a duplicate.
+    #[test]
+    fn accept_caps_the_seen_set() {
+        let mut s = MeshStore::open_in_memory().unwrap();
+        let cfg = RelayConfig {
+            max_seen: 2,
+            ..small()
+        };
+        let first = sealed(10, (NOW + M) as u64);
+        for i in 0..4 {
+            let e = if i == 0 {
+                first.clone()
+            } else {
+                sealed(10, (NOW + 2 * M) as u64)
+            };
+            assert!(matches!(
+                accept(&mut s, &cfg, 3, &e, &[i + 1], NOW).unwrap(),
+                Accept::New { .. }
+            ));
+        }
+        assert_eq!(s.relay_seen_count().unwrap(), 2);
+        assert!(!s.relay_is_seen(&envelope::hash(&first)).unwrap());
+        assert_eq!(
+            accept(&mut s, &cfg, 3, &first, b"q", NOW).unwrap(),
+            Accept::Duplicate,
+            "still spooled"
+        );
+    }
+
     #[test]
     fn token_bucket_bursts_then_refills() {
         let t0 = Instant::now();
@@ -382,6 +430,8 @@ mod tests {
             (2000, 2560 * 1024)
         );
         assert_eq!(c.push_delay_ms, (100, 500));
+        assert_eq!(c.answer_delay_ms, (2_000, 10_000));
+        assert_eq!(c.max_seen, 16 * c.max_entries);
         assert_eq!(c.origin_ttl, (3, 5));
         assert_eq!(
             (c.share_cap(), c.share_cap_bytes()),

@@ -172,3 +172,34 @@ async fn pairing_pins_one_relay_key_on_both_sides() {
     );
     assert!(s.node.relay_key_for_test(&a_dm.group_id).is_none());
 }
+
+/// Final review Important 8: relay disabled and enabled again with the
+/// link still up (its Hellos both offered relay) relays both ways, without
+/// re-linking.
+#[tokio::test(flavor = "multi_thread")]
+async fn re_enable_without_relinking_relays_both_ways() {
+    let hub = LoopbackHub::new();
+    let (a, _) = relay_peer(&hub, "a").await;
+    let (b, _) = relay_peer(&hub, "b").await;
+    hub.link("a", "b");
+    verified(&a, 1).await;
+    verified(&b, 1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    b.node.disable_relay();
+    b.node
+        .enable_relay_with(
+            std::sync::Arc::new(xmtp_mesh::ClientRelayExporter(b.client.clone())),
+            fast_relay_config(),
+        )
+        .unwrap();
+    let from_a = a.node.originate_random_for_test(100, 5);
+    eventually("b holds a's envelope", || async {
+        b.node.relay_spool_has_for_test(&from_a)
+    })
+    .await;
+    let from_b = b.node.originate_random_for_test(100, 5);
+    eventually("a holds b's envelope", || async {
+        a.node.relay_spool_has_for_test(&from_b)
+    })
+    .await;
+}

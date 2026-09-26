@@ -4,8 +4,8 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    app_payloads, eventually, eventually_for, pair_dm, relay_keys_confirmed as keys_confirmed,
-    relay_peer,
+    app_payloads, eventually, eventually_for, fast_relay_config, pair_dm,
+    relay_keys_confirmed as keys_confirmed, relay_peer, relay_peer_with,
 };
 use xmtp_mesh::LoopbackHub;
 use xmtp_mls::groups::GroupError;
@@ -283,5 +283,127 @@ async fn a_lost_ack_is_repaired_by_the_next_retry() {
         a.node.relay_peer_acked_high_for_test(&gid) == a.node.max_group_id_for_test(&gid).unwrap()
     })
     .await;
+    drop(b);
+}
+
+/// Final review Important 2: a joiner's message left unsent while relay
+/// was off (as after an app restart) goes out once relay is enabled again,
+/// without waiting for new content.
+#[tokio::test(flavor = "multi_thread")]
+async fn unsent_content_goes_out_when_relay_is_enabled() {
+    let hub = LoopbackHub::new();
+    let (a, _) = relay_peer(&hub, "a").await;
+    let (b, _) = relay_peer(&hub, "b").await;
+    let (d, _) = relay_peer(&hub, "d").await;
+    let (a_dm, d_dm) = pair_dm(&hub, &a, &d).await;
+    let gid = a_dm.group_id.clone();
+    keys_confirmed(&a, &d, &gid).await;
+    hub.unlink("a", "d");
+    hub.link("a", "b");
+    hub.link("b", "d");
+    // Whatever a relays on losing d settles first, so nothing from a's
+    // side pulls d's message out later.
+    eventually_for("a's stored ack is current", 30, || async {
+        a.node.relay_peer_acked_high_for_test(&gid) == a.node.max_group_id_for_test(&gid).unwrap()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    hub.unlink("b", "d");
+    d.node.disable_relay();
+    send(&d_dm, b"sent while relay was off").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    d.node
+        .enable_relay_with(
+            std::sync::Arc::new(xmtp_mesh::ClientRelayExporter(d.client.clone())),
+            fast_relay_config(),
+        )
+        .unwrap();
+    hub.link("b", "d");
+    eventually_for("a gets it", 30, || async {
+        a_dm.sync().await.ok();
+        app_payloads(&a_dm).contains(&b"sent while relay was off".to_vec())
+    })
+    .await;
+    drop(b);
+}
+
+/// Final review Important 3: rows a direct session had not delivered when
+/// the link dropped go over relay (spec §6.1), without new content. The
+/// sequencer's pushes are suppressed so the direct session leaves one
+/// behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lost_direct_link_falls_back_to_relay() {
+    let hub = LoopbackHub::new();
+    let (a, _) = relay_peer(&hub, "a").await;
+    let (b, _) = relay_peer(&hub, "b").await;
+    let (d, _) = relay_peer(&hub, "d").await;
+    let (a_dm, d_dm) = pair_dm(&hub, &a, &d).await;
+    let gid = a_dm.group_id.clone();
+    keys_confirmed(&a, &d, &gid).await;
+    hub.link("a", "b");
+    hub.link("b", "d");
+    a.node.suppress_group_push_for_test(true);
+    let before = a.node.max_group_id_for_test(&gid).unwrap();
+    send(&a_dm, b"left behind").await;
+    eventually("a sequenced it", || async {
+        a.node.max_group_id_for_test(&gid).unwrap() > before
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(a.node.relay_stats().originated, 0, "direct: not relayed");
+    hub.unlink("a", "d");
+    eventually_for("d gets it over relay", 30, || async {
+        d_dm.sync().await.ok();
+        app_payloads(&d_dm).contains(&b"left behind".to_vec())
+    })
+    .await;
+    drop(b);
+}
+
+/// Final review Important 9 (spec §9, answer timing): the joiner's ack to
+/// a delivered sync leaves only after the answer delay, then settles.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delivery_triggered_ack_waits_the_answer_delay() {
+    let hub = LoopbackHub::new();
+    let (a, _) = relay_peer(&hub, "a").await;
+    let (b, _) = relay_peer(&hub, "b").await;
+    let slow = xmtp_mesh::RelayConfig {
+        answer_delay_ms: (3_000, 3_000),
+        ..fast_relay_config()
+    };
+    let (d, _) = relay_peer_with(&hub, "d", slow).await;
+    let (a_dm, _) = pair_dm(&hub, &a, &d).await;
+    let gid = a_dm.group_id.clone();
+    keys_confirmed(&a, &d, &gid).await;
+    hub.unlink("a", "d");
+    hub.link("a", "b");
+    hub.link("b", "d");
+    let before = a.node.max_group_id_for_test(&gid).unwrap();
+    send(&a_dm, b"answer later").await;
+    eventually("a sequenced it", || async {
+        a.node.max_group_id_for_test(&gid).unwrap() > before
+    })
+    .await;
+    // No client sync on d: its own sends would carry the ack instead.
+    eventually_for("d holds a's rows", 30, || async {
+        d.node.max_group_id_for_test(&gid).unwrap() > before
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(2_000)).await;
+    assert_eq!(
+        d.node.relay_stats().originated,
+        0,
+        "no ack before the delay"
+    );
+    eventually_for(
+        "the ack goes out and a's stored ack catches up",
+        15,
+        || async {
+            a.node.relay_peer_acked_high_for_test(&gid)
+                == a.node.max_group_id_for_test(&gid).unwrap()
+        },
+    )
+    .await;
+    assert!(d.node.relay_stats().originated >= 1);
     drop(b);
 }

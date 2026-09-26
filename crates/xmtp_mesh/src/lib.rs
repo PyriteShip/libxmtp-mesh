@@ -74,7 +74,15 @@
 //! stale (e.g. a lost pure ack), never as a ping-pong. A joiner that cannot
 //! resolve a `Ref` against its local store asks the sequencer for sealed
 //! `Full` rows instead (`need_full_after`). Lag across a peer's own multiple
-//! installations is out of scope here, per base spec D7.
+//! installations is out of scope here, per base spec D7. An answer that a
+//! delivery triggers waits a random 2–10 s (`answer_delay_ms`): this blurs,
+//! but does not remove, what a phone next to the recipient can see (an
+//! envelope going in, a fresh one coming out). A DM whose last direct link
+//! drops falls back to relay, and enabling relay schedules every relayed
+//! DM, so nothing waits for new content. The relay key is re-offered (the
+//! same key) when the other member's installation changes or the
+//! sequencer is re-pinned. The seen-set is capped by entry count
+//! (`max_seen`); its entries expire with the envelope's own expiry.
 mod error;
 mod mls_parse;
 pub mod node;

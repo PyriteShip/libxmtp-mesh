@@ -51,6 +51,20 @@ struct OriginRow {
 }
 
 #[derive(QueryableByName)]
+struct ShortRow {
+    #[diesel(sql_type = Binary)]
+    v: Vec<u8>,
+}
+
+#[derive(QueryableByName)]
+struct ConfirmedByRow {
+    #[diesel(sql_type = Bool)]
+    confirmed: bool,
+    #[diesel(sql_type = Binary)]
+    confirmed_by: Vec<u8>,
+}
+
+#[derive(QueryableByName)]
 struct TotalsRow {
     #[diesel(sql_type = BigInt)]
     n: i64,
@@ -81,7 +95,15 @@ impl MeshStore {
         Ok(rows[0].v > 0)
     }
 
-    pub fn relay_mark_seen(&mut self, hash: &[u8], forget_at: i64) -> Result<(), MeshError> {
+    /// Remember `hash` until `forget_at` (the envelope's own expiry, so the
+    /// entry outlives the envelope's liveness), then keep at most
+    /// `max_seen` entries, forgetting the soonest-to-expire first (spec §5.1).
+    pub fn relay_mark_seen(
+        &mut self,
+        hash: &[u8],
+        forget_at: i64,
+        max_seen: usize,
+    ) -> Result<(), MeshError> {
         sql_query(
             "INSERT INTO relay_seen (hash, forget_at) VALUES (?, ?) \
              ON CONFLICT(hash) DO UPDATE SET forget_at = MAX(forget_at, excluded.forget_at)",
@@ -89,7 +111,24 @@ impl MeshStore {
         .bind::<Binary, _>(hash)
         .bind::<BigInt, _>(forget_at)
         .execute(&mut self.conn)?;
+        let n: Vec<I64Row> =
+            sql_query("SELECT COUNT(*) AS v FROM relay_seen").load(&mut self.conn)?;
+        let over = n[0].v - i64::try_from(max_seen).unwrap_or(i64::MAX);
+        if over > 0 {
+            sql_query(
+                "DELETE FROM relay_seen WHERE hash IN \
+                 (SELECT hash FROM relay_seen ORDER BY forget_at ASC LIMIT ?)",
+            )
+            .bind::<BigInt, _>(over)
+            .execute(&mut self.conn)?;
+        }
         Ok(())
+    }
+
+    pub fn relay_seen_count(&mut self) -> Result<i64, MeshError> {
+        let rows: Vec<I64Row> =
+            sql_query("SELECT COUNT(*) AS v FROM relay_seen").load(&mut self.conn)?;
+        Ok(rows[0].v)
     }
 
     pub fn spool_insert(&mut self, e: &SpoolEntry) -> Result<(), MeshError> {
@@ -121,6 +160,18 @@ impl MeshStore {
         .bind::<Binary, _>(short)
         .load(&mut self.conn)?;
         Ok(rows.into_iter().next())
+    }
+
+    /// The 8-byte digest ids of up to `limit` pushable entries, newest drop
+    /// first (spec §5.2), without loading the sealed blobs.
+    pub fn spool_pushable_ids(&mut self, limit: usize) -> Result<Vec<Vec<u8>>, MeshError> {
+        let rows: Vec<ShortRow> = sql_query(
+            "SELECT substr(hash, 1, 8) AS v FROM relay_spool WHERE ttl > 0 \
+             ORDER BY drop_at DESC LIMIT ?",
+        )
+        .bind::<BigInt, _>(i64::try_from(limit).unwrap_or(i64::MAX))
+        .load(&mut self.conn)?;
+        Ok(rows.into_iter().map(|r| r.v).collect())
     }
 
     pub fn spool_pushable(&mut self) -> Result<Vec<SpoolEntry>, MeshError> {
@@ -197,12 +248,81 @@ impl MeshStore {
     ) -> Result<(), MeshError> {
         sql_query(
             "INSERT INTO relay_keys (group_id, relay_key, confirmed) VALUES (?, ?, ?) \
-             ON CONFLICT(group_id) DO UPDATE SET relay_key = excluded.relay_key, confirmed = excluded.confirmed",
+             ON CONFLICT(group_id) DO UPDATE SET relay_key = excluded.relay_key, confirmed = excluded.confirmed, \
+             confirmed_by = CASE WHEN excluded.confirmed THEN confirmed_by ELSE x'' END",
         )
         .bind::<Binary, _>(group_id)
         .bind::<Binary, _>(key.as_slice())
         .bind::<Bool, _>(confirmed)
         .execute(&mut self.conn)?;
+        Ok(())
+    }
+
+    /// The installation that confirmed `group_id`'s relay key (empty while
+    /// unconfirmed), if a key is stored.
+    pub fn relay_key_confirmed_by(
+        &mut self,
+        group_id: &[u8],
+    ) -> Result<Option<Vec<u8>>, MeshError> {
+        let rows: Vec<ConfirmedByRow> =
+            sql_query("SELECT confirmed, confirmed_by FROM relay_keys WHERE group_id = ?")
+                .bind::<Binary, _>(group_id)
+                .load(&mut self.conn)?;
+        Ok(rows
+            .into_iter()
+            .next()
+            .map(|r| if r.confirmed { r.confirmed_by } else { vec![] }))
+    }
+
+    /// Store `key` as confirmed by installation `by` (spec §4.5). When it
+    /// was confirmed by another installation before (the other member
+    /// reinstalled), the stored peer ack belonged to that installation, so
+    /// it is reset: syncs start from the beginning again. Returns whether
+    /// the confirming installation changed.
+    pub fn confirm_relay_key(
+        &mut self,
+        group_id: &[u8],
+        key: &[u8; 32],
+        by: &[u8],
+    ) -> Result<bool, MeshError> {
+        self.transaction(|s| {
+            let before: Vec<ConfirmedByRow> =
+                sql_query("SELECT confirmed, confirmed_by FROM relay_keys WHERE group_id = ?")
+                    .bind::<Binary, _>(group_id)
+                    .load(&mut s.conn)?;
+            let changed = before
+                .first()
+                .is_some_and(|r| r.confirmed && !r.confirmed_by.is_empty() && r.confirmed_by != by);
+            sql_query(
+                "INSERT INTO relay_keys (group_id, relay_key, confirmed, confirmed_by) \
+                 VALUES (?, ?, 1, ?) ON CONFLICT(group_id) DO UPDATE SET \
+                 relay_key = excluded.relay_key, confirmed = 1, confirmed_by = excluded.confirmed_by",
+            )
+            .bind::<Binary, _>(group_id)
+            .bind::<Binary, _>(key.as_slice())
+            .bind::<Binary, _>(by)
+            .execute(&mut s.conn)?;
+            if changed {
+                s.reset_peer_acked_high(group_id)?;
+            }
+            Ok(changed)
+        })
+    }
+
+    /// The group's sequencer was re-pinned (§4.7 handover): the new
+    /// sequencer must offer the key again and its peer ack starts over.
+    /// Keeps the key itself, so the same key is re-offered.
+    pub(crate) fn relay_unconfirm_for_repin(&mut self, group_id: &[u8]) -> Result<(), MeshError> {
+        sql_query("UPDATE relay_keys SET confirmed = 0, confirmed_by = x'' WHERE group_id = ?")
+            .bind::<Binary, _>(group_id)
+            .execute(&mut self.conn)?;
+        self.reset_peer_acked_high(group_id)
+    }
+
+    fn reset_peer_acked_high(&mut self, group_id: &[u8]) -> Result<(), MeshError> {
+        sql_query("DELETE FROM relay_dm WHERE group_id = ?")
+            .bind::<Binary, _>(group_id)
+            .execute(&mut self.conn)?;
         Ok(())
     }
 
@@ -343,7 +463,7 @@ mod tests {
         s.spool_insert(&entry(2, 50, b"p", 512)).unwrap();
         assert!(s.spool_evict_soonest().unwrap());
         assert!(s.spool_get(&[2; 32]).unwrap().is_none());
-        s.relay_mark_seen(&[9; 32], 10).unwrap();
+        s.relay_mark_seen(&[9; 32], 10, 100).unwrap();
         s.relay_purge(100).unwrap();
         assert!(
             s.spool_get(&[1; 32]).unwrap().is_none(),
@@ -394,13 +514,126 @@ mod tests {
         let path = path.to_str().unwrap();
         {
             let mut s = MeshStore::open(Some(path), None).unwrap();
-            s.relay_mark_seen(&[5; 32], i64::MAX).unwrap();
+            s.relay_mark_seen(&[5; 32], i64::MAX, 100).unwrap();
         }
         let mut s = MeshStore::open(Some(path), None).unwrap();
         assert!(s.relay_is_seen(&[5; 32]).unwrap());
         assert!(s.relay_is_seen_short(&[5; 8]).unwrap());
         drop(s);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[derive(QueryableByName)]
+    struct PlanRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        detail: String,
+    }
+
+    fn plan(s: &mut MeshStore, sql: &str, bind: &[u8]) -> String {
+        let rows: Vec<PlanRow> = sql_query(format!("EXPLAIN QUERY PLAN {sql}"))
+            .bind::<Binary, _>(bind)
+            .load(&mut s.conn)
+            .unwrap();
+        rows.into_iter()
+            .map(|r| r.detail)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    /// Final review Important 1: the lookups `on_digest`, `on_want`, the
+    /// purge and the share check run under the store lock use indexes, not
+    /// full scans.
+    #[test]
+    fn relay_lookups_use_indexes() {
+        let mut s = MeshStore::open_in_memory().unwrap();
+        for (sql, index) in [
+            (
+                "SELECT COUNT(*) AS v FROM relay_seen WHERE substr(hash, 1, 8) = ?",
+                "relay_seen_short",
+            ),
+            (
+                "SELECT hash FROM relay_spool WHERE substr(hash, 1, 8) = ? LIMIT 1",
+                "relay_spool_short",
+            ),
+            (
+                "DELETE FROM relay_seen WHERE forget_at <= ?",
+                "relay_seen_forget_at",
+            ),
+            (
+                "SELECT COUNT(*) AS v FROM relay_spool WHERE from_installation = ?",
+                "relay_spool_from",
+            ),
+        ] {
+            let p = plan(&mut s, sql, &[1; 8]);
+            assert!(p.contains(index), "{sql}: {p}");
+        }
+    }
+
+    /// Final review Important 7: the seen-set is capped by entry count,
+    /// forgetting the soonest `forget_at` first.
+    #[test]
+    fn seen_set_is_capped_soonest_forget_first() {
+        let mut s = MeshStore::open_in_memory().unwrap();
+        for (h, forget_at) in [(1u8, 50), (2, 10), (3, 40), (4, 30)] {
+            s.relay_mark_seen(&[h; 32], forget_at, 3).unwrap();
+        }
+        assert_eq!(s.relay_seen_count().unwrap(), 3);
+        assert!(!s.relay_is_seen(&[2; 32]).unwrap(), "soonest forgotten");
+        s.relay_mark_seen(&[5; 32], 100, 2).unwrap();
+        assert_eq!(s.relay_seen_count().unwrap(), 2);
+        assert!(s.relay_is_seen(&[1; 32]).unwrap());
+        assert!(s.relay_is_seen(&[5; 32]).unwrap());
+    }
+
+    #[test]
+    fn pushable_ids_are_short_and_skip_ttl_zero() {
+        let mut s = MeshStore::open_in_memory().unwrap();
+        s.spool_insert(&entry(1, 100, b"p", 512)).unwrap();
+        s.spool_insert(&entry(2, 200, b"p", 512)).unwrap();
+        s.spool_insert(&SpoolEntry {
+            ttl: 0,
+            ..entry(3, 300, b"p", 512)
+        })
+        .unwrap();
+        assert_eq!(
+            s.spool_pushable_ids(10).unwrap(),
+            vec![vec![2; 8], vec![1; 8]]
+        );
+        assert_eq!(s.spool_pushable_ids(1).unwrap(), vec![vec![2; 8]]);
+    }
+
+    /// Final review Important 6: a confirmation by a different installation
+    /// (the other member reinstalled) resets the peer ack; a sequencer
+    /// re-pin unconfirms the key (keeping it) and resets the ack.
+    #[test]
+    fn reconfirm_by_a_new_installation_and_repin_reset_the_dm() {
+        let mut s = MeshStore::open_in_memory().unwrap();
+        assert!(!s.confirm_relay_key(&[1], &[3; 32], b"old").unwrap());
+        assert_eq!(
+            s.relay_key_confirmed_by(&[1]).unwrap(),
+            Some(b"old".to_vec())
+        );
+        s.note_peer_acked_high(&[1], 5).unwrap();
+        assert!(!s.confirm_relay_key(&[1], &[3; 32], b"old").unwrap());
+        assert_eq!(s.peer_acked_high(&[1]).unwrap(), 5, "same installation");
+        assert!(s.confirm_relay_key(&[1], &[3; 32], b"new").unwrap());
+        assert_eq!(s.peer_acked_high(&[1]).unwrap(), 0, "new installation");
+        assert_eq!(
+            s.relay_key_confirmed_by(&[1]).unwrap(),
+            Some(b"new".to_vec())
+        );
+
+        s.note_peer_acked_high(&[1], 7).unwrap();
+        s.repin_sequencer(&[1], b"next").unwrap();
+        assert_eq!(s.relay_key(&[1]).unwrap(), Some(([3; 32], false)));
+        assert_eq!(s.relay_key_confirmed_by(&[1]).unwrap(), Some(vec![]));
+        assert_eq!(s.peer_acked_high(&[1]).unwrap(), 0);
+        s.confirm_relay_key(&[1], &[3; 32], b"new").unwrap();
+        s.note_peer_acked_high(&[1], 7).unwrap();
+        s.repin_sequencer_and_drain_pending(&[1], b"again", 0)
+            .unwrap();
+        assert_eq!(s.relay_key(&[1]).unwrap(), Some(([3; 32], false)));
+        assert_eq!(s.peer_acked_high(&[1]).unwrap(), 0);
     }
 
     #[test]

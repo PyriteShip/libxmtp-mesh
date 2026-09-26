@@ -462,6 +462,8 @@ impl MeshStore {
                 .bind::<Binary, _>(installation)
                 .bind::<Binary, _>(group_id)
                 .execute(&mut s.conn)?;
+            // Relay spec §4.5: the new sequencer offers the relay key again.
+            s.relay_unconfirm_for_repin(group_id)?;
             Ok(())
         })
     }
@@ -485,6 +487,8 @@ impl MeshStore {
                 .bind::<Binary, _>(installation)
                 .bind::<Binary, _>(group_id)
                 .execute(&mut s.conn)?;
+            // Relay spec §4.5: the new sequencer offers the relay key again.
+            s.relay_unconfirm_for_repin(group_id)?;
             let mut rows = Vec::new();
             for message in s.pending_for(group_id)? {
                 let (row, inserted) = s.append_sequenced(&message, now_ns)?;

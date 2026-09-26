@@ -716,8 +716,9 @@ impl Session {
         // Both Hellos must have offered relay: a session that did not
         // advertise it never links up, even if relay was enabled since.
         if self.peer_relay && self.self_relay {
-            self.node.relay_link_up(
+            self.node.relay_session_link_up(
                 &self.peer,
+                self.id,
                 self.peer_installation(),
                 self.peer_inbox.clone().unwrap_or_default(),
             );
@@ -1044,8 +1045,9 @@ impl Session {
             None => return Ok(()),
         };
         if sequencer == local {
+            // Clamped to what we hold (relay_note_peer_high).
             self.node
-                .relay_note_peer_high(&gid, interest.high_id as i64);
+                .relay_note_peer_high(&gid, i64::try_from(interest.high_id).unwrap_or(i64::MAX));
             self.serve_sequenced(&gid, interest.high_id as i64)?;
         } else if sequencer == peer {
             self.flush_pending(&gid).await?;

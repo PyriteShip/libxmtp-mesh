@@ -84,6 +84,11 @@ pub(crate) struct NodeInner {
     pub(crate) sync_lifecycle: Mutex<()>,
     /// The relay engine while relay is enabled (spec 2026-09-24 multi-hop).
     pub(crate) relay: Mutex<Option<Arc<crate::relay::engine::RelayEngine>>>,
+    /// Verified live sessions whose Hellos both offered relay: peer ->
+    /// (installation, inbox). Kept while relay is off, so re-enabling links
+    /// them up (the peer still thinks we relay). Lock order: `sessions`,
+    /// then this, then `relay`.
+    pub(crate) relay_links: Mutex<HashMap<PeerId, (Vec<u8>, String)>>,
 }
 
 /// Default time an authenticated peer has to prove inbox membership.
@@ -190,6 +195,7 @@ impl MeshNode {
                 suppress_client_resync: AtomicBool::new(false),
                 sync_lifecycle: Mutex::new(()),
                 relay: Mutex::new(None),
+                relay_links: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -401,7 +407,7 @@ impl MeshNode {
         }
         drop(sessions);
         drop(sync);
-        self.disable_relay();
+        self.disable_relay_locked();
         drop(old);
     }
 

@@ -32,22 +32,42 @@ pub struct RelayStats {
     pub dropped_rate: u64,
     pub pushed: u64,
     pub originated: u64,
+    /// Relay DM payloads applied here (every delivery, spooled or not).
     pub delivered: u64,
+    /// Envelopes for one of our DMs that a rate or admission limit kept
+    /// out of the spool and that were delivered anyway (spec §5.4); a
+    /// subset of the envelopes behind `delivered`.
+    pub delivered_unspooled: u64,
     pub refs_sent: u64,
 }
 
 pub(crate) struct Link {
     pub(crate) installation: Vec<u8>,
     pub(crate) inbox: String,
+    /// What the peer phone holds, as far as this link knows.
     holds: HashSet<[u8; 8]>,
+    /// Ids this link asked the peer for (`SpoolWant`), so a sibling link to
+    /// the same phone does not ask again (D18).
+    wanted: HashSet<[u8; 8]>,
     next_offer: Instant,
 }
 
-/// Rate budget of one neighbour phone, shared by all its links (D18).
+/// Rate budget of one neighbour phone, shared by all its links (D18). It
+/// outlives the phone's links until it has refilled, so reconnecting does
+/// not reset it.
 struct Neighbour {
     envelopes: TokenBucket,
     bytes: TokenBucket,
 }
+
+impl Neighbour {
+    fn is_full(&mut self, now: Instant) -> bool {
+        self.envelopes.is_full(now) && self.bytes.is_full(now)
+    }
+}
+
+/// Most neighbour budgets kept; beyond it the fullest unlinked one goes.
+const MAX_NEIGHBOURS: usize = 256;
 
 pub(crate) struct EngineState {
     pub(crate) links: HashMap<String, Link>,
@@ -60,8 +80,92 @@ pub(crate) struct EngineState {
     pub(crate) dm: HashMap<Vec<u8>, super::dm::Schedule>,
     /// Envelopes from a signer we cannot place yet (spec §6.4).
     pub(crate) quarantine: super::dm::Quarantine,
+    /// Verified direct peers and their inboxes, from node events: a lost
+    /// one sends its DMs back to relay (spec §6.1).
+    pub(crate) direct: HashMap<String, String>,
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) hooks: TestHooks,
+}
+
+impl EngineState {
+    fn new(cfg: &RelayConfig, now: Instant) -> Self {
+        Self {
+            links: HashMap::new(),
+            neighbours: HashMap::new(),
+            global_envelopes: TokenBucket::new(
+                cfg.global_envelopes_per_min as f64,
+                cfg.global_envelopes_per_min as f64,
+                now,
+            ),
+            global_bytes: TokenBucket::new(
+                cfg.global_bytes_per_min as f64,
+                cfg.global_bytes_per_min as f64,
+                now,
+            ),
+            stats: RelayStats::default(),
+            dm: HashMap::new(),
+            quarantine: super::dm::Quarantine::new(cfg.quarantine_max, cfg.quarantine_for),
+            direct: HashMap::new(),
+            #[cfg(any(test, feature = "test-utils"))]
+            hooks: TestHooks::default(),
+        }
+    }
+
+    /// The installation behind `peer`'s link, if it is a relay link.
+    fn installation_of(&self, peer: &str) -> Option<Vec<u8>> {
+        self.links.get(peer).map(|l| l.installation.clone())
+    }
+
+    /// Record that the phone `installation` holds `short`, on all its links.
+    fn mark_held(&mut self, installation: &[u8], short: [u8; 8]) {
+        for link in self.links.values_mut() {
+            if link.installation == installation {
+                link.holds.insert(short);
+            }
+        }
+    }
+
+    fn phone_holds(&self, installation: &[u8], short: &[u8; 8]) -> bool {
+        self.links
+            .values()
+            .any(|l| l.installation == installation && l.holds.contains(short))
+    }
+
+    /// Drop budgets of phones with no link that have refilled: a fresh one
+    /// would be the same.
+    fn prune_neighbours(&mut self, now: Instant) {
+        let linked: HashSet<Vec<u8>> = self
+            .links
+            .values()
+            .map(|l| l.installation.clone())
+            .collect();
+        self.neighbours
+            .retain(|inst, nb| linked.contains(inst) || !nb.is_full(now));
+    }
+
+    /// Make room for one more budget: evict the fullest unlinked one.
+    fn bound_neighbours(&mut self, now: Instant) {
+        while self.neighbours.len() >= MAX_NEIGHBOURS {
+            let linked: HashSet<Vec<u8>> = self
+                .links
+                .values()
+                .map(|l| l.installation.clone())
+                .collect();
+            let fullest = self
+                .neighbours
+                .iter_mut()
+                .filter(|(inst, _)| !linked.contains(*inst))
+                .map(|(inst, nb)| (inst.clone(), nb.envelopes.level(now)))
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(inst, _)| inst);
+            match fullest {
+                Some(inst) => {
+                    self.neighbours.remove(&inst);
+                }
+                None => break,
+            }
+        }
+    }
 }
 
 /// Switches that let integration tests force relay DM edge cases.
@@ -83,7 +187,7 @@ pub(crate) struct RelayEngine {
     exporter: Arc<dyn RelayExporter>,
     /// The sync runtime: every engine spawn runs here, so callers (e.g.
     /// `originate`) may be on any thread.
-    runtime: tokio::runtime::Handle,
+    pub(crate) runtime: tokio::runtime::Handle,
     pub(crate) state: Mutex<EngineState>,
     _stop: oneshot::Sender<()>,
 }
@@ -154,37 +258,43 @@ impl RelayEngine {
         let now = Instant::now();
         {
             let mut st = self.state.lock();
-            st.neighbours
-                .entry(installation.clone())
-                .or_insert_with(|| Neighbour {
-                    envelopes: TokenBucket::new(
-                        self.cfg.share_cap() as f64,
-                        self.cfg.neighbour_envelopes_per_min as f64,
-                        now,
-                    ),
-                    bytes: TokenBucket::new(
-                        self.cfg.share_cap_bytes() as f64,
-                        self.cfg.neighbour_bytes_per_min as f64,
-                        now,
-                    ),
-                });
+            if !st.neighbours.contains_key(&installation) {
+                st.bound_neighbours(now);
+                st.neighbours.insert(
+                    installation.clone(),
+                    Neighbour {
+                        envelopes: TokenBucket::new(
+                            self.cfg.share_cap() as f64,
+                            self.cfg.neighbour_envelopes_per_min as f64,
+                            now,
+                        ),
+                        bytes: TokenBucket::new(
+                            self.cfg.share_cap_bytes() as f64,
+                            self.cfg.neighbour_bytes_per_min as f64,
+                            now,
+                        ),
+                    },
+                );
+            }
             st.links.insert(
                 peer.to_string(),
                 Link {
                     installation,
                     inbox,
                     holds: HashSet::new(),
+                    wanted: HashSet::new(),
                     next_offer: now,
                 },
             );
         }
         let Some(node) = self.node() else { return };
-        let ids: Vec<Vec<u8>> = match node.inner.store.lock().spool_pushable() {
-            Ok(entries) => entries
-                .into_iter()
-                .take(self.cfg.max_entries)
-                .filter_map(|e| e.hash.get(..8).map(<[u8]>::to_vec))
-                .collect(),
+        let ids = match node
+            .inner
+            .store
+            .lock()
+            .spool_pushable_ids(self.cfg.max_entries)
+        {
+            Ok(ids) => ids,
             Err(e) => {
                 tracing::warn!(error = %e, "relay: spool unavailable");
                 vec![]
@@ -197,18 +307,10 @@ impl RelayEngine {
             .spawn(async move { engine.offer_keys(&peer).await });
     }
 
+    /// The phone's rate budget stays (pruned on tick once refilled), so a
+    /// reconnect does not reset it (D18).
     fn link_down(&self, peer: &str) {
-        let mut st = self.state.lock();
-        let Some(link) = st.links.remove(peer) else {
-            return;
-        };
-        if !st
-            .links
-            .values()
-            .any(|l| l.installation == link.installation)
-        {
-            st.neighbours.remove(&link.installation);
-        }
+        self.state.lock().links.remove(peer);
     }
 
     // ---- frames ----
@@ -240,21 +342,43 @@ impl RelayEngine {
             .take(self.cfg.max_entries)
             .filter_map(|id| id.as_slice().try_into().ok())
             .collect();
-        if let Some(link) = self.state.lock().links.get_mut(peer) {
-            link.holds.extend(ids.iter().copied());
+        match self.state.lock().links.get_mut(peer) {
+            Some(link) => link.holds.extend(ids.iter().copied()),
+            None => return Ok(()), // not a relay link (yet): ignored
         }
         let node = self
             .node()
             .ok_or_else(|| MeshError::Relay("node gone".into()))?;
-        let mut want = Vec::new();
+        let mut unseen = Vec::new();
         {
             let mut store = node.inner.store.lock();
-            for id in &ids {
-                if !store.relay_is_seen_short(id)? {
-                    want.push(id.to_vec());
+            for id in ids {
+                if !store.relay_is_seen_short(&id)? {
+                    unseen.push(id);
                 }
             }
         }
+        // Ask once per phone: skip what a sibling link already asked for.
+        let want: Vec<Vec<u8>> = {
+            let mut st = self.state.lock();
+            let Some(installation) = st.installation_of(peer) else {
+                return Ok(());
+            };
+            let asked: HashSet<[u8; 8]> = st
+                .links
+                .iter()
+                .filter(|(p, l)| p.as_str() != peer && l.installation == installation)
+                .flat_map(|(_, l)| l.wanted.iter().copied())
+                .collect();
+            let unseen: Vec<[u8; 8]> = unseen
+                .into_iter()
+                .filter(|id| !asked.contains(id))
+                .collect();
+            if let Some(link) = st.links.get_mut(peer) {
+                link.wanted.extend(unseen.iter().copied());
+            }
+            unseen.into_iter().map(|id| id.to_vec()).collect()
+        };
         if !want.is_empty() {
             self.send(peer, Body::SpoolWant(SpoolWant { ids: want }));
         }
@@ -266,17 +390,26 @@ impl RelayEngine {
             .node()
             .ok_or_else(|| MeshError::Relay("node gone".into()))?;
         for id in w.ids.iter().take(self.cfg.max_entries) {
+            let Ok(short) = <[u8; 8]>::try_from(id.as_slice()) else {
+                continue;
+            };
+            // Once per phone: a sibling link's want (or an earlier push)
+            // already covers it. Checked and marked in one step.
+            {
+                let mut st = self.state.lock();
+                let Some(installation) = st.installation_of(peer) else {
+                    return Ok(()); // not a relay link: ignored
+                };
+                if st.phone_holds(&installation, &short) {
+                    continue;
+                }
+                st.mark_held(&installation, short);
+            }
             let Some(entry) = node.inner.store.lock().spool_by_short(id)? else {
                 continue;
             };
             if entry.ttl <= 0 {
                 continue;
-            }
-            if let (Some(link), Ok(short)) = (
-                self.state.lock().links.get_mut(peer),
-                <[u8; 8]>::try_from(id.as_slice()),
-            ) {
-                link.holds.insert(short);
             }
             self.send(
                 peer,
@@ -305,11 +438,16 @@ impl RelayEngine {
                 stats,
                 ..
             } = &mut *st;
-            let Some(link) = links.get_mut(peer) else {
+            let Some(installation) = links.get(peer).map(|l| l.installation.clone()) else {
                 return Ok(());
             };
-            link.holds.insert(short_id(&hash));
-            let Some(nb) = neighbours.get_mut(&link.installation) else {
+            let short = short_id(&hash);
+            for l in links.values_mut() {
+                if l.installation == installation {
+                    l.holds.insert(short);
+                }
+            }
+            let Some(nb) = neighbours.get_mut(&installation) else {
                 return Ok(());
             };
             let ok = nb.envelopes.allows(1.0, now)
@@ -385,7 +523,12 @@ impl RelayEngine {
         match seen {
             Ok(false) => {
                 if self.try_deliver(sealed).await {
-                    let marked = node.inner.store.lock().relay_mark_seen(hash, expires_at);
+                    self.state.lock().stats.delivered_unspooled += 1;
+                    let marked = node.inner.store.lock().relay_mark_seen(
+                        hash,
+                        expires_at,
+                        self.cfg.max_seen,
+                    );
                     if let Err(e) = marked {
                         tracing::warn!(error = %e, "relay: seen-set unavailable");
                     }
@@ -432,18 +575,28 @@ impl RelayEngine {
             _ => return,
         };
         let short = short_id(&hash);
+        // One link per phone (D18): its sibling links are marked as holding
+        // it too, so they neither push it again nor ask for it.
         let targets: Vec<String> = {
             let mut st = self.state.lock();
+            let holding: HashSet<Vec<u8>> = st
+                .links
+                .values()
+                .filter(|l| l.holds.contains(&short))
+                .map(|l| l.installation.clone())
+                .collect();
+            let mut chosen: HashSet<Vec<u8>> = HashSet::new();
             let mut out = Vec::new();
             for (peer, link) in st.links.iter_mut() {
-                if peer == from_link
-                    || source == Some(link.installation.as_slice())
-                    || link.holds.contains(&short)
-                {
+                if peer == from_link || source == Some(link.installation.as_slice()) {
                     continue;
                 }
+                let first = !holding.contains(&link.installation)
+                    && chosen.insert(link.installation.clone());
                 link.holds.insert(short);
-                out.push(peer.clone());
+                if first {
+                    out.push(peer.clone());
+                }
             }
             st.stats.pushed += out.len() as u64;
             out
@@ -485,9 +638,13 @@ impl RelayEngine {
 
     // ---- relay-key pinning (spec §4.5) ----
 
+    /// Offer each DM we sequence with `peer`'s inbox its relay key, unless
+    /// `peer`'s installation already confirmed it. A key confirmed by
+    /// another installation (the other member reinstalled) or unconfirmed
+    /// by a sequencer re-pin is offered again, the same key (spec §4.5).
     async fn offer_keys(&self, peer: &str) {
         let Some(node) = self.node() else { return };
-        let (inbox, due) = {
+        let (inbox, installation) = {
             let mut st = self.state.lock();
             let Some(link) = st.links.get_mut(peer) else {
                 return;
@@ -497,11 +654,8 @@ impl RelayEngine {
                 return;
             }
             link.next_offer = now + self.cfg.key_reoffer;
-            (link.inbox.clone(), true)
+            (link.inbox.clone(), link.installation.clone())
         };
-        if !due {
-            return;
-        }
         let Ok(Some(local)) = node.local_installation() else {
             return;
         };
@@ -510,26 +664,37 @@ impl RelayEngine {
             if node.sequencer_of(&gid).ok().flatten().as_deref() != Some(local.as_slice()) {
                 continue;
             }
-            if self.other_member(&gid).await.as_deref() != Some(inbox.as_str()) {
+            // Cheap store checks before the async membership lookup.
+            let confirmed_here = {
+                let mut store = node.inner.store.lock();
+                match store.relay_key(&gid) {
+                    Ok(Some((_, true))) => store
+                        .relay_key_confirmed_by(&gid)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|by| by.is_empty() || by == installation),
+                    _ => false,
+                }
+            };
+            if confirmed_here {
                 continue;
             }
-            let existing = node.inner.store.lock().relay_key(&gid).ok().flatten();
-            if matches!(existing, Some((_, true))) {
+            if self.other_member(&gid).await.as_deref() != Some(inbox.as_str()) {
                 continue;
             }
             let Ok(Some((epoch, secret))) = self.exporter.exporter_secret(&gid).await else {
                 continue;
             };
             // Create-if-absent in one store call: two concurrent offers
-            // (two links to one phone) must offer the same key.
+            // (two links to one phone) must offer the same key; a stored
+            // key is re-offered as it is.
             let key = match node
                 .inner
                 .store
                 .lock()
                 .relay_key_or_insert(&gid, &rand::random())
             {
-                Ok((_, true)) => continue,
-                Ok((k, false)) => k,
+                Ok((k, _)) => k,
                 Err(e) => {
                     tracing::warn!(error = %e, "relay: could not store a relay key");
                     continue;
@@ -581,7 +746,7 @@ impl RelayEngine {
         node.inner
             .store
             .lock()
-            .set_relay_key(&o.group_id, &key, true)?;
+            .confirm_relay_key(&o.group_id, &key, &installation)?;
         self.on_key_confirmed(&o.group_id);
         self.send(
             peer,
@@ -596,7 +761,7 @@ impl RelayEngine {
         let node = self
             .node()
             .ok_or_else(|| MeshError::Relay("node gone".into()))?;
-        let Some((_, inbox)) = self.link_identity(peer) else {
+        let Some((installation, inbox)) = self.link_identity(peer) else {
             return Ok(());
         };
         let local = node.local_installation()?;
@@ -611,7 +776,8 @@ impl RelayEngine {
             let Some((key, _)) = store.relay_key(&a.group_id)? else {
                 return Ok(());
             };
-            store.set_relay_key(&a.group_id, &key, true)?;
+            // A new confirming installation resets the peer ack (reinstall).
+            store.confirm_relay_key(&a.group_id, &key, &installation)?;
         }
         self.on_key_confirmed(&a.group_id);
         Ok(())
@@ -625,7 +791,11 @@ impl RelayEngine {
         {
             tracing::warn!(error = %e, "relay purge failed");
         }
-        let peers: Vec<String> = self.state.lock().links.keys().cloned().collect();
+        let peers: Vec<String> = {
+            let mut st = self.state.lock();
+            st.prune_neighbours(Instant::now());
+            st.links.keys().cloned().collect()
+        };
         for peer in peers {
             self.offer_keys(&peer).await;
         }
@@ -691,11 +861,18 @@ impl MeshNode {
 
     /// Start relaying (spec phase 1). Call after `start_sync` and before
     /// links come up: only sessions started afterwards advertise relay.
+    ///
+    /// Live sessions whose Hellos both offered relay (e.g. from before a
+    /// `disable_relay`) link up at once, and every relayed DM is scheduled,
+    /// so content left unsent by a restart or a disable goes out.
     pub fn enable_relay_with(
         &self,
         exporter: Arc<dyn RelayExporter>,
         cfg: RelayConfig,
     ) -> Result<(), MeshError> {
+        // Serialized with start_sync/stop_sync: a concurrent stop_sync
+        // cannot leave an engine running without sync.
+        let _lifecycle = self.inner.sync_lifecycle.lock();
         let runtime = self
             .inner
             .sync
@@ -704,43 +881,47 @@ impl MeshNode {
             .map(|c| c.runtime.clone())
             .ok_or(MeshError::SyncNotStarted)?;
         let (stop_tx, stop_rx) = oneshot::channel();
-        let now = Instant::now();
-        let quarantine = super::dm::Quarantine::new(cfg.quarantine_max, cfg.quarantine_for);
         let engine = Arc::new(RelayEngine {
             node: Arc::downgrade(&self.inner),
-            state: Mutex::new(EngineState {
-                links: HashMap::new(),
-                neighbours: HashMap::new(),
-                global_envelopes: TokenBucket::new(
-                    cfg.global_envelopes_per_min as f64,
-                    cfg.global_envelopes_per_min as f64,
-                    now,
-                ),
-                global_bytes: TokenBucket::new(
-                    cfg.global_bytes_per_min as f64,
-                    cfg.global_bytes_per_min as f64,
-                    now,
-                ),
-                stats: RelayStats::default(),
-                dm: HashMap::new(),
-                quarantine,
-                #[cfg(any(test, feature = "test-utils"))]
-                hooks: TestHooks::default(),
-            }),
+            state: Mutex::new(EngineState::new(&cfg, Instant::now())),
             cfg,
             exporter,
             runtime: runtime.clone(),
             _stop: stop_tx,
         });
         let events = self.subscribe_events();
+        let verified = self.verified_peers();
+        {
+            let mut st = engine.state.lock();
+            for p in verified {
+                st.direct.insert(p.peer, p.inbox_id);
+            }
+        }
         let old = self.inner.relay.lock().replace(engine.clone());
         drop(old);
         runtime.spawn(RelayEngine::run(Arc::downgrade(&engine), events, stop_rx));
+        let live: Vec<(String, (Vec<u8>, String))> = self
+            .inner
+            .relay_links
+            .lock()
+            .iter()
+            .map(|(p, v)| (p.clone(), v.clone()))
+            .collect();
+        for (peer, (installation, inbox)) in live {
+            engine.link_up(&peer, installation, inbox);
+        }
+        engine.on_lagged_dm();
         Ok(())
     }
 
     /// Stop relaying: no pushes, relay frames ignored, nothing originated.
     pub fn disable_relay(&self) {
+        let _lifecycle = self.inner.sync_lifecycle.lock();
+        self.disable_relay_locked();
+    }
+
+    /// `disable_relay` for a caller already holding `sync_lifecycle`.
+    pub(crate) fn disable_relay_locked(&self) {
         let old = self.inner.relay.lock().take();
         drop(old); // dropping `_stop` ends the engine task
     }
@@ -755,13 +936,38 @@ impl MeshNode {
             .unwrap_or_default()
     }
 
+    /// [`Self::relay_link_up`] for the verified session `session_id`,
+    /// unless it is no longer `peer`'s current session.
+    pub(crate) fn relay_session_link_up(
+        &self,
+        peer: &str,
+        session_id: u64,
+        installation: Vec<u8>,
+        inbox: String,
+    ) {
+        {
+            let sessions = self.inner.sessions.lock();
+            if sessions.get(peer).is_none_or(|h| h.id != session_id) {
+                return;
+            }
+        }
+        self.relay_link_up(peer, installation, inbox);
+    }
+
+    /// A verified session whose Hellos both offered relay. Remembered for
+    /// the session's life, so a later `enable_relay` links it up too.
     pub(crate) fn relay_link_up(&self, peer: &str, installation: Vec<u8>, inbox: String) {
+        self.inner
+            .relay_links
+            .lock()
+            .insert(peer.to_string(), (installation.clone(), inbox.clone()));
         if let Some(e) = self.relay_engine() {
             e.link_up(peer, installation, inbox);
         }
     }
 
     pub(crate) fn relay_link_down(&self, peer: &str) {
+        self.inner.relay_links.lock().remove(peer);
         if let Some(e) = self.relay_engine() {
             e.link_down(peer);
         }
@@ -773,8 +979,14 @@ impl MeshNode {
         }
     }
 
+    /// A direct peer's `Interest` says it holds rows up to `high`; clamped
+    /// to what we hold, so a bogus claim cannot skip rows it lacks.
     pub(crate) fn relay_note_peer_high(&self, group_id: &[u8], high: i64) {
-        if let Err(e) = self.inner.store.lock().note_peer_acked_high(group_id, high) {
+        let mut store = self.inner.store.lock();
+        let noted = store
+            .max_group_id(group_id)
+            .and_then(|max| store.note_peer_acked_high(group_id, high.min(max)));
+        if let Err(e) = noted {
             tracing::warn!(error = %e, "relay: could not note peer high");
         }
     }
@@ -977,6 +1189,308 @@ mod tests {
         node.disable_relay();
     }
 
+    const GID: &[u8] = b"dm";
+
+    /// A node whose local installation is `[1; 32]` in inbox "me",
+    /// sequencing the DM `GID` with "them", relay enabled with `cfg` (long
+    /// tick and re-offer unless set), every frame sent recorded.
+    fn relay_node(cfg: RelayConfig) -> (MeshNode, Arc<Sent>) {
+        let local = vec![1; 32];
+        let node = MeshNode::in_memory().unwrap();
+        {
+            let mut store = node.inner.store.lock();
+            store.set_local_installation(&local).unwrap();
+            store.set_local_inbox("me").unwrap();
+            store.pin_sequencer(GID, &local).unwrap();
+        }
+        let sent = Arc::new(Sent::default());
+        *node.inner.sync.lock() = Some(crate::node::SyncConfig {
+            signer: Arc::new(StubSigner(local)),
+            transport: sent.clone(),
+            membership: Arc::new(Dm),
+            runtime: tokio::runtime::Handle::current(),
+        });
+        node.enable_relay_with(Arc::new(SlowExporter), cfg).unwrap();
+        (node, sent)
+    }
+
+    fn quiet() -> RelayConfig {
+        RelayConfig {
+            tick: std::time::Duration::from_secs(3600),
+            key_reoffer: std::time::Duration::from_secs(3600),
+            push_delay_ms: (0, 10),
+            ..RelayConfig::default()
+        }
+    }
+
+    fn live_sealed() -> Vec<u8> {
+        let expires = envelope::coarse_expiry(now_secs() as u64, 60);
+        envelope::seal(&rand::random(), expires, &[0; 100]).unwrap()
+    }
+
+    fn relay(sealed: &[u8]) -> Body {
+        Body::Relay(RelayEnvelope {
+            ttl: 3,
+            copies: 0,
+            sealed: sealed.to_vec(),
+        })
+    }
+
+    /// Frames sent to `peers`, decoded.
+    fn frames_to(sent: &Sent, peers: &[&str]) -> Vec<Body> {
+        sent.0
+            .lock()
+            .iter()
+            .filter(|(p, _)| peers.contains(&p.as_str()))
+            .filter_map(|(_, f)| frames::decode(f).ok())
+            .collect()
+    }
+
+    fn count(bodies: &[Body], f: impl Fn(&Body) -> bool) -> usize {
+        bodies.iter().filter(|b| f(b)).count()
+    }
+
+    fn engine(node: &MeshNode) -> Arc<RelayEngine> {
+        node.relay_engine().unwrap()
+    }
+
+    async fn settle() {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    /// Final review Important 4 (and D18): two links to one phone share one
+    /// budget, and a reconnect does not refill it. The budget is pruned only
+    /// once it has refilled with no link, and the map is bounded.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reconnect_does_not_refill_the_rate_budget() {
+        let cfg = RelayConfig {
+            max_entries: 8, // share cap 2 = the bucket's burst
+            neighbour_envelopes_per_min: 1,
+            ..quiet()
+        };
+        let (node, _sent) = relay_node(cfg);
+        let them = vec![2; 32];
+        node.relay_link_up("p1", them.clone(), "them".into());
+        node.relay_link_up("p2", them.clone(), "them".into());
+        node.on_relay_frame("p1", relay(&live_sealed())).await;
+        node.on_relay_frame("p2", relay(&live_sealed())).await;
+        node.on_relay_frame("p1", relay(&live_sealed())).await;
+        let s = node.relay_stats();
+        assert_eq!(
+            (s.accepted, s.dropped_rate),
+            (2, 1),
+            "one budget, two links"
+        );
+
+        node.relay_link_down("p1");
+        node.relay_link_down("p2");
+        node.relay_link_up("p1", them.clone(), "them".into());
+        node.on_relay_frame("p1", relay(&live_sealed())).await;
+        let s = node.relay_stats();
+        assert_eq!(
+            (s.accepted, s.dropped_rate),
+            (2, 2),
+            "reconnecting did not refill the budget"
+        );
+
+        let e = engine(&node);
+        node.relay_link_down("p1");
+        let now = Instant::now();
+        e.state.lock().prune_neighbours(now);
+        assert!(
+            e.state.lock().neighbours.contains_key(&them),
+            "not refilled yet"
+        );
+        e.state
+            .lock()
+            .prune_neighbours(now + std::time::Duration::from_secs(600));
+        assert!(
+            !e.state.lock().neighbours.contains_key(&them),
+            "refilled: pruned"
+        );
+
+        for i in 0..(MAX_NEIGHBOURS + 10) {
+            let inst = (i as u32).to_be_bytes().to_vec();
+            node.relay_link_up("px", inst, "x".into());
+            node.relay_link_down("px");
+        }
+        assert!(e.state.lock().neighbours.len() <= MAX_NEIGHBOURS);
+        node.disable_relay();
+    }
+
+    /// Final review Important 5 (D18, spec §5.3): two links to one phone
+    /// carry each envelope once: one push, one want, one answer; a receipt
+    /// on one link marks the sibling as holding it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_links_to_one_phone_carry_each_envelope_once() {
+        let (node, sent) = relay_node(quiet());
+        let them = vec![2; 32];
+        node.relay_link_up("p1", them.clone(), "them".into());
+        node.relay_link_up("p2", them.clone(), "them".into());
+        node.relay_link_up("p3", vec![3; 32], "other".into());
+        settle().await;
+        sent.0.lock().clear();
+        let is_relay = |b: &Body| matches!(b, Body::Relay(_));
+
+        // Push: once to the two-link phone, once to the other.
+        node.originate_random_for_test(100, 5);
+        settle().await;
+        assert_eq!(count(&frames_to(&sent, &["p1", "p2"]), is_relay), 1);
+        assert_eq!(count(&frames_to(&sent, &["p3"]), is_relay), 1);
+
+        // Digest: the same id offered on both links is asked for once.
+        let id = vec![0xAB; 8];
+        let digest = || {
+            Body::SpoolDigest(SpoolDigest {
+                ids: vec![id.clone()],
+            })
+        };
+        sent.0.lock().clear();
+        node.on_relay_frame("p1", digest()).await;
+        node.on_relay_frame("p2", digest()).await;
+        let wants = frames_to(&sent, &["p1", "p2"]);
+        assert_eq!(count(&wants, |b| matches!(b, Body::SpoolWant(_))), 1);
+
+        // Want: both links ask for one entry; it is sent once.
+        let sealed = live_sealed();
+        let hash = envelope::hash(&sealed);
+        node.inner
+            .store
+            .lock()
+            .spool_insert(&crate::store::SpoolEntry {
+                hash: hash.to_vec(),
+                sealed,
+                ttl: 3,
+                drop_at: now_secs() + 60,
+                from_installation: vec![9; 32],
+            })
+            .unwrap();
+        let want = || {
+            Body::SpoolWant(SpoolWant {
+                ids: vec![short_id(&hash).to_vec()],
+            })
+        };
+        sent.0.lock().clear();
+        node.on_relay_frame("p1", want()).await;
+        node.on_relay_frame("p2", want()).await;
+        assert_eq!(count(&frames_to(&sent, &["p1", "p2"]), is_relay), 1);
+
+        // Receipt on p1: p2 is known to hold it too.
+        let incoming = live_sealed();
+        node.on_relay_frame("p1", relay(&incoming)).await;
+        let short = short_id(&envelope::hash(&incoming));
+        assert!(
+            engine(&node).state.lock().links["p2"]
+                .holds
+                .contains(&short)
+        );
+        node.disable_relay();
+    }
+
+    /// Final review Important 8: a peer without a registered relay link
+    /// gets no answer to a digest or a want.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn frames_from_a_peer_without_a_relay_link_are_ignored() {
+        let (node, sent) = relay_node(quiet());
+        let hash = node.originate_random_for_test(100, 5);
+        settle().await;
+        sent.0.lock().clear();
+        node.on_relay_frame(
+            "stranger",
+            Body::SpoolDigest(SpoolDigest {
+                ids: vec![vec![0xCD; 8]],
+            }),
+        )
+        .await;
+        node.on_relay_frame(
+            "stranger",
+            Body::SpoolWant(SpoolWant {
+                ids: vec![hash[..8].to_vec()],
+            }),
+        )
+        .await;
+        assert!(sent.0.lock().is_empty(), "no SpoolWant, no Relay");
+        node.disable_relay();
+    }
+
+    fn offered_keys(sent: &Sent, peer: &str) -> Vec<[u8; 32]> {
+        frames_to(sent, &[peer])
+            .into_iter()
+            .filter_map(|b| match b {
+                Body::RelayKeyOffer(o) => Some(
+                    unwrap_key(&[7; 32], &o.group_id, o.epoch, &o.nonce, &o.ciphertext).unwrap(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Final review Important 6 (spec §4.5): a key confirmed by the other
+    /// member's old installation is offered, unchanged, to its new one; the
+    /// new confirmation resets the peer ack. A sequencer re-pin unconfirms
+    /// the key, so it is offered again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reinstalled_member_is_offered_the_same_key() {
+        let (node, sent) = relay_node(quiet());
+        let (old, new) = (vec![2; 32], vec![3; 32]);
+        {
+            let mut store = node.inner.store.lock();
+            store.confirm_relay_key(GID, &[9; 32], &old).unwrap();
+            store.note_peer_acked_high(GID, 5).unwrap();
+        }
+        node.relay_link_up("p_old", old.clone(), "them".into());
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(offered_keys(&sent, "p_old").is_empty(), "confirmed by it");
+
+        node.relay_link_up("p_new", new.clone(), "them".into());
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while offered_keys(&sent, "p_new").is_empty() {
+            assert!(Instant::now() < deadline, "offer to the new installation");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(offered_keys(&sent, "p_new"), vec![[9; 32]], "the same key");
+        node.on_relay_frame(
+            "p_new",
+            Body::RelayKeyAck(RelayKeyAck {
+                group_id: GID.to_vec(),
+            }),
+        )
+        .await;
+        {
+            let mut store = node.inner.store.lock();
+            assert_eq!(
+                store.relay_key_confirmed_by(GID).unwrap(),
+                Some(new.clone())
+            );
+            assert_eq!(store.peer_acked_high(GID).unwrap(), 0, "ack starts over");
+        }
+
+        // Re-pin (handover back to us): unconfirmed, so offered again.
+        node.inner
+            .store
+            .lock()
+            .repin_sequencer(GID, &[1; 32])
+            .unwrap();
+        sent.0.lock().clear();
+        node.relay_link_up("p_new", new, "them".into());
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while offered_keys(&sent, "p_new").is_empty() {
+            assert!(Instant::now() < deadline, "offer after a re-pin");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(offered_keys(&sent, "p_new"), vec![[9; 32]]);
+        node.disable_relay();
+    }
+
+    /// Final review minor: a direct peer's claimed high is clamped to the
+    /// rows we hold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_high_is_clamped_to_what_we_hold() {
+        let node = MeshNode::in_memory().unwrap();
+        node.relay_note_peer_high(GID, 1000);
+        assert_eq!(node.inner.store.lock().peer_acked_high(GID).unwrap(), 0);
+    }
+
     /// Item 12: `disable_relay` drops the node's engine handle, and that
     /// alone must end the engine task (the task must not keep the engine,
     /// and so its stop sender, alive).
@@ -991,17 +1505,7 @@ mod tests {
         let (events_tx, events) = broadcast::channel(4);
         let engine = Arc::new(RelayEngine {
             node: Weak::new(),
-            state: Mutex::new(EngineState {
-                links: HashMap::new(),
-                neighbours: HashMap::new(),
-                global_envelopes: TokenBucket::new(1.0, 1.0, now),
-                global_bytes: TokenBucket::new(1.0, 1.0, now),
-                stats: RelayStats::default(),
-                dm: HashMap::new(),
-                quarantine: super::super::dm::Quarantine::new(1, std::time::Duration::ZERO),
-                #[cfg(any(test, feature = "test-utils"))]
-                hooks: TestHooks::default(),
-            }),
+            state: Mutex::new(EngineState::new(&cfg, now)),
             cfg,
             exporter: Arc::new(NoExporter),
             runtime: tokio::runtime::Handle::current(),

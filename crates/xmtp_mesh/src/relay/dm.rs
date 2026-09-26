@@ -44,6 +44,15 @@ impl Schedule {
         self.generation = self.generation.wrapping_add(1);
     }
 
+    /// A delivery calls for an answer: send after `delay` (spec §9, answer
+    /// timing), or at the already scheduled time if that is sooner; that
+    /// time does not depend on the delivery. Restarts the retry schedule.
+    pub(crate) fn answer(&mut self, now: Instant, delay: Duration) {
+        let at = now + delay;
+        let at = self.next_at.map_or(at, |t| t.min(at));
+        self.now(at);
+    }
+
     pub(crate) fn after_send(&mut self, at: Instant, retry_after: &[Duration]) {
         self.attempt += 1;
         self.next_at = retry_after.get(self.attempt - 1).map(|d| at + *d);
@@ -249,6 +258,53 @@ pub(crate) fn carries_held(rows: &[RelayRow], have: i64) -> bool {
         .any(|id| i64::try_from(id).is_ok_and(|id| id <= have))
 }
 
+/// What a delivered relay payload may do (spec §4.6, §6.4).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    Ignore,
+    /// The signer is not (yet) an installation of the other member.
+    Quarantine,
+    /// A joiner's `RelayPending` for us, the DM's sequencer.
+    Pending,
+    /// The sequencer's `RelaySync` for us, the joiner.
+    Sync,
+}
+
+/// Authorize a verified payload for the DM `key_gid` whose relay key
+/// opened it. `other_installations`: the other member's installations, or
+/// `None` when the DM has no single other member.
+pub(crate) fn authorize(
+    key_gid: &[u8],
+    body: Option<&relay_payload::Body>,
+    signer: &[u8],
+    local: &[u8],
+    sequencer: Option<&[u8]>,
+    other_installations: Option<&[Vec<u8>]>,
+) -> Verdict {
+    if signer == local {
+        return Verdict::Ignore; // our own envelope coming back
+    }
+    let Some(others) = other_installations else {
+        return Verdict::Ignore;
+    };
+    if !others.iter().any(|i| i == signer) {
+        return Verdict::Quarantine;
+    }
+    match body {
+        Some(relay_payload::Body::Pending(p))
+            if p.group_id == key_gid && sequencer == Some(local) =>
+        {
+            Verdict::Pending
+        }
+        Some(relay_payload::Body::Sync(s))
+            if s.group_id == key_gid && sequencer == Some(signer) =>
+        {
+            Verdict::Sync
+        }
+        _ => Verdict::Ignore,
+    }
+}
+
 /// `(force_refs, no_full_request, drop_pure_acks)`; all off outside tests.
 fn hooks(st: &super::engine::EngineState) -> (bool, bool, bool) {
     #[cfg(any(test, feature = "test-utils"))]
@@ -274,6 +330,13 @@ impl RelayEngine {
             .entry(gid.to_vec())
             .or_default()
             .now(Instant::now());
+    }
+
+    /// A random answer delay from `answer_delay_ms` (spec §9).
+    pub(crate) fn answer_delay(&self) -> Duration {
+        use rand::RngExt;
+        let (lo, hi) = self.cfg.answer_delay_ms;
+        Duration::from_millis(rand::rng().random_range(lo..=hi.max(lo)))
     }
 
     /// Stop `gid`'s schedule, unless new content re-armed it since
@@ -309,6 +372,20 @@ impl RelayEngine {
     pub(crate) fn on_event_dm(self: &Arc<Self>, event: NodeEvent) {
         let Some(node) = self.node() else { return };
         match event {
+            NodeEvent::PeerVerified { peer, inbox_id, .. } => {
+                self.state.lock().direct.insert(peer, inbox_id);
+            }
+            NodeEvent::PeerLost { peer } => {
+                let lost = {
+                    let mut st = self.state.lock();
+                    st.direct
+                        .remove(&peer)
+                        .filter(|inbox| !st.direct.values().any(|i| i == inbox))
+                };
+                if let Some(inbox) = lost {
+                    self.fall_back_to_relay(inbox);
+                }
+            }
             NodeEvent::PendingAdded(gid) => self.schedule_now(&gid),
             NodeEvent::GroupSequenced(row) => {
                 let local = node.local_installation().ok().flatten();
@@ -318,6 +395,22 @@ impl RelayEngine {
             }
             _ => {}
         }
+    }
+
+    /// The last direct link to `inbox` is gone: its DMs go back to relay
+    /// (spec §6.1). While it was direct, `send_dm` left them to the session,
+    /// which may not have synced everything before the link dropped.
+    fn fall_back_to_relay(self: &Arc<Self>, inbox: String) {
+        let engine = self.clone();
+        self.runtime.spawn(async move {
+            let Some(node) = engine.node() else { return };
+            let keys = node.inner.store.lock().relay_keys().unwrap_or_default();
+            for (gid, _, confirmed) in keys {
+                if confirmed && engine.other_member(&gid).await.as_deref() == Some(inbox.as_str()) {
+                    engine.schedule_now(&gid);
+                }
+            }
+        });
     }
 
     /// Missed node events: resync every relayed DM.
@@ -516,18 +609,24 @@ impl RelayEngine {
         if signer == local {
             return Ok(());
         }
-        let Some(other) = self.other_member(&gid).await else {
-            return Ok(());
+        let others = match self.other_member(&gid).await {
+            Some(other) => Some(node.installations_of(&other).await?),
+            None => None,
         };
-        if !node.installations_of(&other).await?.contains(&signer) {
-            self.state.lock().quarantine.push(sealed.to_vec(), since);
-            return Ok(());
-        }
-        match payload.body {
-            Some(relay_payload::Body::Pending(p)) if p.group_id == gid => {
-                if node.sequencer_of(&gid)?.as_deref() != Some(local.as_slice()) {
-                    return Ok(());
-                }
+        let sequencer = node.sequencer_of(&gid)?;
+        let verdict = authorize(
+            &gid,
+            payload.body.as_ref(),
+            &signer,
+            &local,
+            sequencer.as_deref(),
+            others.as_deref(),
+        );
+        match (verdict, payload.body) {
+            (Verdict::Quarantine, _) => {
+                self.state.lock().quarantine.push(sealed.to_vec(), since);
+            }
+            (Verdict::Pending, Some(relay_payload::Body::Pending(p))) => {
                 // The ack first (clamped to what we hold), so one bad input
                 // below cannot discard it.
                 let (acked_before, max_before) = {
@@ -554,6 +653,7 @@ impl RelayEngine {
                         "relay: Full rows asked below the peer ack; not servable"
                     );
                 }
+                let delay = self.answer_delay();
                 {
                     let mut st = self.state.lock();
                     st.stats.delivered += 1;
@@ -566,15 +666,12 @@ impl RelayEngine {
                         acked_after > acked_before,
                         wants_full.is_some(),
                     ) {
-                        s.now(Instant::now());
+                        s.answer(Instant::now(), delay);
                     }
                 }
                 sequenced?;
             }
-            Some(relay_payload::Body::Sync(s)) if s.group_id == gid => {
-                if node.sequencer_of(&gid)?.as_deref() != Some(signer.as_slice()) {
-                    return Ok(());
-                }
+            (Verdict::Sync, Some(relay_payload::Body::Sync(s))) => {
                 let have = node.inner.store.lock().max_group_id(&gid)?;
                 let carried_held = carries_held(&s.rows, have);
                 let (rows, stalled) = resolve_rows(
@@ -593,13 +690,14 @@ impl RelayEngine {
                 // A gap is filled by the sequencer's retry.
                 let _gap = node.ingest_sequenced(&gid, rows)?;
                 let stored = node.inner.store.lock().max_group_id(&gid)? > have;
+                let delay = self.answer_delay();
                 let mut st = self.state.lock();
                 st.stats.delivered += 1;
                 let s = st.dm.entry(gid.clone()).or_default();
                 s.stalled = stalled;
                 if sync_needs_ack(stored, stalled, carried_held) {
                     s.ack_due = true;
-                    s.now(Instant::now());
+                    s.answer(Instant::now(), delay);
                 }
             }
             _ => {}
@@ -877,6 +975,131 @@ mod tests {
         let g = s.generation;
         s.now(Instant::now());
         assert_ne!(s.generation, g);
+    }
+
+    /// Final review Important 9: an answer a delivery triggered waits the
+    /// answer delay, unless the schedule was already due sooner.
+    #[test]
+    fn a_delivery_triggered_answer_waits() {
+        let t = Instant::now();
+        let mut s = Schedule::default();
+        s.answer(t, Duration::from_secs(5));
+        assert_eq!(
+            (s.next_at, s.attempt),
+            (Some(t + Duration::from_secs(5)), 0)
+        );
+        let g = s.generation;
+        s.after_send(t, &[Duration::from_secs(1)]);
+        s.answer(t, Duration::from_secs(5));
+        assert_eq!(
+            (s.next_at, s.attempt),
+            (Some(t + Duration::from_secs(1)), 0),
+            "a sooner retry is kept"
+        );
+        assert_ne!(s.generation, g);
+    }
+
+    fn pending_body(gid: &[u8]) -> relay_payload::Body {
+        relay_payload::Body::Pending(RelayPending {
+            group_id: gid.to_vec(),
+            messages: vec![],
+            acked_high: 0,
+            need_full_after: None,
+        })
+    }
+
+    fn sync_body(gid: &[u8]) -> relay_payload::Body {
+        relay_payload::Body::Sync(RelaySync {
+            group_id: gid.to_vec(),
+            rows: vec![],
+        })
+    }
+
+    /// Ledger test item (auth rejection, spec §4.6/§6.4): who may send what.
+    #[test]
+    fn relayed_payloads_are_authorized() {
+        let (gid, me, them, them2) = (
+            b"dm".as_slice(),
+            b"me".as_slice(),
+            b"them".to_vec(),
+            b"them2".to_vec(),
+        );
+        let others = vec![them.clone()];
+        let pending = pending_body(gid);
+        let sync = sync_body(gid);
+        // We sequence: their Pending is ours to apply.
+        assert_eq!(
+            authorize(gid, Some(&pending), &them, me, Some(me), Some(&others)),
+            Verdict::Pending
+        );
+        // A Pending reaching a node that is not the sequencer is ignored.
+        assert_eq!(
+            authorize(gid, Some(&pending), &them, me, Some(&them), Some(&others)),
+            Verdict::Ignore
+        );
+        // They sequence: their Sync is ours to apply.
+        assert_eq!(
+            authorize(gid, Some(&sync), &them, me, Some(&them), Some(&others)),
+            Verdict::Sync
+        );
+        // A Sync signed by a member installation that is not the sequencer.
+        let both = vec![them.clone(), them2.clone()];
+        assert_eq!(
+            authorize(gid, Some(&sync), &them2, me, Some(&them), Some(&both)),
+            Verdict::Ignore
+        );
+        // A payload for another DM than the key's.
+        assert_eq!(
+            authorize(
+                gid,
+                Some(&pending_body(b"other")),
+                &them,
+                me,
+                Some(me),
+                Some(&others)
+            ),
+            Verdict::Ignore
+        );
+        assert_eq!(
+            authorize(
+                gid,
+                Some(&sync_body(b"other")),
+                &them,
+                me,
+                Some(&them),
+                Some(&others)
+            ),
+            Verdict::Ignore
+        );
+        // Our own envelope, no other member, an empty payload.
+        assert_eq!(
+            authorize(gid, Some(&pending), me, me, Some(me), Some(&others)),
+            Verdict::Ignore
+        );
+        assert_eq!(
+            authorize(gid, Some(&pending), &them, me, Some(me), None),
+            Verdict::Ignore
+        );
+        assert_eq!(
+            authorize(gid, None, &them, me, Some(me), Some(&others)),
+            Verdict::Ignore
+        );
+        // An unknown signer waits in quarantine, and is released (applied)
+        // once its installation appears in the other member's log.
+        let mut q = Quarantine::new(4, Duration::from_secs(600));
+        let t = Instant::now();
+        assert_eq!(
+            authorize(gid, Some(&pending), &them2, me, Some(me), Some(&others)),
+            Verdict::Quarantine
+        );
+        q.push(b"sealed".to_vec(), t);
+        let released = q.take_live_since(t + Duration::from_secs(1));
+        assert_eq!(released.len(), 1);
+        assert_eq!(
+            authorize(gid, Some(&pending), &them2, me, Some(me), Some(&both)),
+            Verdict::Pending,
+            "re-checked after the log grew: applied"
+        );
     }
 
     /// Spec §6.4 (at most 10 min): a failed re-check puts the envelope back

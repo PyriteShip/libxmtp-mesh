@@ -557,6 +557,7 @@ pub fn fast_relay_config() -> RelayConfig {
     RelayConfig {
         hold: Duration::from_secs(60),
         push_delay_ms: (10, 50),
+        answer_delay_ms: (0, 50),
         retry_after: vec![
             Duration::from_secs(1),
             Duration::from_secs(2),

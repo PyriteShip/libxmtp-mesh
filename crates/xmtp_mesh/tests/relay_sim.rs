@@ -105,6 +105,10 @@ async fn a_recipient_gets_its_message_past_a_spent_rate_budget() {
         "nothing from b was spooled: the DM came in over the limit"
     );
     assert!(after.delivered > before.delivered);
+    assert!(
+        after.delivered_unspooled > before.delivered_unspooled,
+        "counted as delivered past a limit"
+    );
 
     // Replay, five times over, every DM envelope b passed on to d (all of
     // them came in over the limit, so none is in d's spool).

@@ -8,6 +8,9 @@ pub struct RelayConfig {
     pub hold: Duration,
     pub max_entries: usize,
     pub max_bytes: usize,
+    /// Most `relay_seen` entries kept; beyond it the soonest to be forgotten
+    /// go first (spec §5.1). Default 16 × `max_entries`.
+    pub max_seen: usize,
     /// Per neighbour phone (verified installation), shared by all its links (D18).
     pub neighbour_envelopes_per_min: u32,
     pub neighbour_bytes_per_min: u32,
@@ -15,6 +18,11 @@ pub struct RelayConfig {
     pub global_bytes_per_min: u32,
     /// Random wait before pushing a new envelope on, for timing privacy.
     pub push_delay_ms: (u64, u64),
+    /// Random wait before a DM answer that a delivery triggered (an ack, or
+    /// a sync answering a pending), so a phone next to the recipient cannot
+    /// pair an envelope going in with a fresh one coming out (spec §9).
+    /// Answers to local new content are not delayed.
+    pub answer_delay_ms: (u64, u64),
     /// Re-sends after the first send, each a fresh seal (spec §6.1).
     pub retry_after: Vec<Duration>,
     /// How often an unacked relay-key offer is repeated on a live link.
@@ -33,11 +41,13 @@ impl Default for RelayConfig {
             hold: Duration::from_secs(600),
             max_entries: 4096,
             max_bytes: 8 * 1024 * 1024,
+            max_seen: 16 * 4096,
             neighbour_envelopes_per_min: 200,
             neighbour_bytes_per_min: 256 * 1024,
             global_envelopes_per_min: 2000,
             global_bytes_per_min: 2560 * 1024,
             push_delay_ms: (100, 500),
+            answer_delay_ms: (2_000, 10_000),
             retry_after: [2, 5, 15, 60]
                 .into_iter()
                 .map(|m| Duration::from_secs(m * 60))
