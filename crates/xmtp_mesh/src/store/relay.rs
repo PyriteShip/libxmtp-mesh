@@ -25,6 +25,9 @@ pub struct SpoolEntry {
     pub from_installation: Vec<u8>,
 }
 
+/// One `relay_keys` row: `(group_id, relay_key, confirmed)`.
+pub type RelayKeyRow = (Vec<u8>, [u8; 32], bool);
+
 #[derive(QueryableByName)]
 struct KeyRow {
     #[diesel(sql_type = Binary)]
@@ -223,7 +226,7 @@ impl MeshStore {
         })
     }
 
-    pub fn relay_keys(&mut self) -> Result<Vec<(Vec<u8>, [u8; 32], bool)>, MeshError> {
+    pub fn relay_keys(&mut self) -> Result<Vec<RelayKeyRow>, MeshError> {
         let rows: Vec<KeyRow> =
             sql_query("SELECT group_id, relay_key, confirmed FROM relay_keys ORDER BY group_id")
                 .load(&mut self.conn)?;

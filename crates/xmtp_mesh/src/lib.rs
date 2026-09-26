@@ -32,6 +32,49 @@
 //! becomes known to the client (`GroupKnown`), and on every later frame about
 //! the group, then acts on it (pin, serve, flush or announce). Membership
 //! lookups run on the session task with no store lock held.
+//!
+//! # Multi-hop relay (spec 2026-09-24-mesh-multihop-relay-design.md)
+//!
+//! Off unless [`MeshNode::enable_relay`] is called after `start_sync`. Each
+//! node keeps a bounded spool of sealed envelopes and floods it to relay
+//! neighbours (digest on connect, delayed split-horizon pushes, per-neighbour
+//! rate and share limits). An envelope shows relays only a per-envelope tag,
+//! a coarse expiry, a TTL and a padded size: it hardens linkability, it does
+//! not give anonymity (no cover traffic). DM traffic is sealed under a per-DM relay
+//! key that the sequencer hands the joiner over a direct link, encrypted
+//! under the MLS exporter secret. Relay frames are never fatal to a session.
+//! Not protest-safe until rotating-token discovery and Noise ship: `Hello`
+//! still carries the inbox id in the clear, and spool digests are readable.
+//!
+//! Limits are per neighbour phone (keyed by its verified installation key),
+//! shared across all of that phone's links, not per link. The tag is
+//! per envelope, not per DM: `expires_at` is coarse (600 s buckets plus
+//! random jitter), so two envelopes of one DM share no visible bytes and
+//! nothing in the header says how many envelopes a DM has sent. A
+//! neighbour's share of the spool is capped by entry count (25% of
+//! entries); its bytes are bounded separately, by its per-neighbour byte
+//! rate, not by the share. The share is not a hard admission refusal: once
+//! a neighbour is at its share, a newcomer envelope from that neighbour
+//! evicts that neighbour's own soonest-drop entry (newest wins), so a
+//! burst of relayed spam cannot lock the neighbour's slot and starve its
+//! later honest traffic. Rate buckets (envelope and byte) still bound how
+//! fast a neighbour can push, independent of the share. An envelope
+//! addressed to this node is delivered even when the rate or share limit
+//! kept it out of the spool, as long as it is still live (not expired) and
+//! has not been seen before; it is then marked seen so a replay is a no-op,
+//! but it is never stored in the spool or pushed onward. Known limit:
+//! honest traffic relayed through a phone that also forwards spam competes
+//! with that spam inside that phone's share, at phones that are not the
+//! message's recipient; this is Sybil-cheap like the rest of the relay
+//! limits (N radios get N budgets) and relationship-tiered shares are the
+//! planned phase-2 mitigation.
+//!
+//! The DM relay protocol (`RelayPending`/`RelaySync`) retries on a fixed
+//! schedule and acks only on progress or when the sequencer's ack looks
+//! stale (e.g. a lost pure ack), never as a ping-pong. A joiner that cannot
+//! resolve a `Ref` against its local store asks the sequencer for sealed
+//! `Full` rows instead (`need_full_after`). Lag across a peer's own multiple
+//! installations is out of scope here, per base spec D7.
 mod error;
 mod mls_parse;
 pub mod node;
