@@ -8,8 +8,10 @@ use sha2::{Digest, Sha256};
 
 use crate::MeshError;
 
+mod relay;
 #[cfg(test)]
 mod tests;
+pub use relay::SpoolEntry;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 const META_LOCAL_INSTALLATION: &str = "local_installation";
@@ -530,10 +532,14 @@ impl MeshStore {
         Ok(self.sequenced_by_hash(group_id, hash)?.is_some())
     }
 
-    fn insert_group_row(&mut self, row: &StoredGroupMessage) -> Result<(), MeshError> {
+    fn insert_group_row(
+        &mut self,
+        row: &StoredGroupMessage,
+        from_peer: bool,
+    ) -> Result<(), MeshError> {
         sql_query(
-            "INSERT INTO group_messages (group_id, id, created_ns, data, sender_hmac, should_push, is_commit, data_hash) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO group_messages (group_id, id, created_ns, data, sender_hmac, should_push, is_commit, data_hash, from_peer) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind::<Binary, _>(&row.group_id)
         .bind::<BigInt, _>(row.id)
@@ -543,6 +549,7 @@ impl MeshStore {
         .bind::<Bool, _>(row.should_push)
         .bind::<Bool, _>(row.is_commit)
         .bind::<Binary, _>(sha256(&row.data))
+        .bind::<Bool, _>(from_peer)
         .execute(&mut self.conn)?;
         Ok(())
     }
@@ -553,6 +560,18 @@ impl MeshStore {
         &mut self,
         msg: &NewGroupMessage,
         now_ns: i64,
+    ) -> Result<(StoredGroupMessage, bool), MeshError> {
+        self.append_sequenced_marked(msg, now_ns, false)
+    }
+
+    /// [`append_sequenced`](Self::append_sequenced), recording whether the
+    /// message came from a peer's `Pending` (multi-hop relay sends such rows
+    /// back as a `Ref`, spec §6.3).
+    pub fn append_sequenced_marked(
+        &mut self,
+        msg: &NewGroupMessage,
+        now_ns: i64,
+        from_peer: bool,
     ) -> Result<(StoredGroupMessage, bool), MeshError> {
         self.transaction(|s| {
             if let Some(existing) = s.sequenced_by_hash(&msg.group_id, &sha256(&msg.data))? {
@@ -567,7 +586,7 @@ impl MeshStore {
                 should_push: msg.should_push,
                 is_commit: msg.is_commit,
             };
-            s.insert_group_row(&row)?;
+            s.insert_group_row(&row, from_peer)?;
             Ok((row, true))
         })
     }
@@ -585,7 +604,7 @@ impl MeshStore {
             if row.id != have + 1 {
                 return Ok(InsertOutcome::Gap { have });
             }
-            s.insert_group_row(row)?;
+            s.insert_group_row(row, false)?;
             Ok(InsertOutcome::Inserted)
         })
     }

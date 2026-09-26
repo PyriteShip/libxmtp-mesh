@@ -509,7 +509,7 @@ impl MeshNode {
                     should_push: v1.should_push,
                     is_commit: parsed.is_commit,
                 };
-                let (row, inserted) = store.append_sequenced(&msg, Self::now_ns())?;
+                let (row, inserted) = store.append_sequenced_marked(&msg, Self::now_ns(), true)?;
                 if inserted {
                     events.push(NodeEvent::GroupSequenced(row));
                 }
