@@ -42,7 +42,7 @@ mod verifier;
 
 pub use error::MeshError;
 pub use node::{MeshNode, MeshStream, NodeEvent, Resolution, ResyncOutcome, VerifiedPeer};
-pub use relay::RelayConfig;
+pub use relay::{ClientRelayExporter, RelayConfig, RelayExporter, RelayStats};
 pub use store::{InsertOutcome, MeshStore, NewGroupMessage, StoredGroupMessage, StoredWelcome};
 pub use sync::frames::MAX_FRAME_LEN;
 pub use sync::{

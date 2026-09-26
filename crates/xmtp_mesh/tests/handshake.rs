@@ -189,6 +189,7 @@ fn hello(installation_key: Vec<u8>, challenge: [u8; 32]) -> Vec<u8> {
         installation_key,
         inbox_id: String::new(),
         challenge: challenge.to_vec(),
+        relay: 0,
     }))
 }
 

@@ -549,3 +549,101 @@ impl Drop for SimulateUnreconciledFailedLeaf {
         xmtp_mls::groups::group_membership::set_test_mode_simulate_unreconciled_failed_leaf(false);
     }
 }
+
+use xmtp_mesh::{ClientRelayExporter, RelayConfig};
+
+/// Relay timings shrunk for tests; limits as the spec.
+pub fn fast_relay_config() -> RelayConfig {
+    RelayConfig {
+        hold: Duration::from_secs(60),
+        push_delay_ms: (10, 50),
+        retry_after: vec![
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(4),
+        ],
+        key_reoffer: Duration::from_millis(200),
+        tick: Duration::from_millis(100),
+        ..RelayConfig::default()
+    }
+}
+
+/// A recorded peer with relay enabled (before any link comes up).
+pub async fn relay_peer(hub: &LoopbackHub, name: &str) -> (TestPeer, Arc<Recording>) {
+    relay_peer_with(hub, name, fast_relay_config()).await
+}
+
+pub async fn relay_peer_with(
+    hub: &LoopbackHub,
+    name: &str,
+    cfg: RelayConfig,
+) -> (TestPeer, Arc<Recording>) {
+    let (p, rec) = recorded_peer(hub, name).await;
+    p.node
+        .enable_relay_with(Arc::new(ClientRelayExporter(p.client.clone())), cfg)
+        .unwrap();
+    (p, rec)
+}
+
+/// Link `a`–`b`, have `a` create a DM with `b` and say "hi", wait until both
+/// clients hold the DM and `b` has "hi". Returns `(a_dm, b_dm)`.
+pub async fn pair_dm(hub: &LoopbackHub, a: &TestPeer, b: &TestPeer) -> (MeshGroup, MeshGroup) {
+    hub.link(&a.name, &b.name);
+    eventually("paired", || async {
+        a.node.has_key_package(&b.installation()).unwrap()
+    })
+    .await;
+    let a_dm = a
+        .client
+        .find_or_create_dm(b.client.inbox_id(), None)
+        .await
+        .unwrap();
+    a_dm.send_message(b"hi", SendMessageOpts::default())
+        .await
+        .unwrap();
+    eventually("b has the DM", || async {
+        b.client.sync_welcomes().await.unwrap();
+        b.client
+            .find_groups(GroupQueryArgs::default())
+            .unwrap()
+            .len()
+            == 1
+    })
+    .await;
+    let b_dm = b
+        .client
+        .find_groups(GroupQueryArgs::default())
+        .unwrap()
+        .remove(0);
+    eventually("b sees hi", || async {
+        b_dm.sync().await.ok();
+        app_payloads(&b_dm) == vec![b"hi".to_vec()]
+    })
+    .await;
+    (a_dm, b_dm)
+}
+
+/// Wait until both `a` and `b` hold a confirmed relay key for `gid`.
+pub async fn relay_keys_confirmed(a: &TestPeer, b: &TestPeer, gid: &[u8]) {
+    eventually("relay key confirmed on both sides", || async {
+        matches!(
+            (
+                a.node.relay_key_for_test(gid),
+                b.node.relay_key_for_test(gid)
+            ),
+            (Some((_, true)), Some((_, true)))
+        )
+    })
+    .await;
+}
+
+/// Hashes of the `Relay` frames in `frames` (raw frames to one peer).
+pub fn relay_hashes(frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    frames
+        .iter()
+        .filter_map(|f| match frames::decode(f).ok()? {
+            Body::Relay(env) => Some(xmtp_mesh::store::sha256(&env.sealed)),
+            _ => None,
+        })
+        .collect()
+}

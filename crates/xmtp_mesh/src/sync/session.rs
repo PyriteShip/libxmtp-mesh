@@ -154,6 +154,10 @@ pub(crate) struct Session {
     pub(crate) handshake_deadline: Option<Instant>,
     pub(crate) hello_resends: u8,
     pub(crate) peer_interest: HashSet<Vec<u8>>,
+    /// The peer's Hello offered relay v1.
+    pub(crate) peer_relay: bool,
+    /// Our last Hello to this peer offered relay v1.
+    pub(crate) self_relay: bool,
     /// Groups whose membership check for this peer has not passed yet, with
     /// what the peer asked; re-checked every [`MEMBERSHIP_RETRY_INTERVAL`]
     /// (and on `GroupKnown`) for up to [`MEMBERSHIP_RETRY_WINDOW`].
@@ -197,6 +201,8 @@ pub(crate) fn spawn(
         handshake_deadline: None,
         hello_resends: 0,
         peer_interest: HashSet::new(),
+        peer_relay: false,
+        self_relay: false,
         deferred: HashMap::new(),
         retry_at: None,
         conflict_sent: HashSet::new(),
@@ -320,11 +326,13 @@ impl Session {
         }
     }
 
-    fn send_hello(&self) {
+    fn send_hello(&mut self) {
+        self.self_relay = self.node.relay_enabled();
         self.send(Body::Hello(Hello {
             installation_key: self.signer.installation_key(),
             inbox_id: self.node.local_inbox().ok().flatten().unwrap_or_default(),
             challenge: self.challenge.to_vec(),
+            relay: if self.self_relay { frames::RELAY_V1 } else { 0 },
         }));
     }
 
@@ -353,6 +361,7 @@ impl Session {
         if self.state == State::AwaitHello {
             self.peer_installation = Some(hello.installation_key);
             self.peer_inbox = Some(hello.inbox_id);
+            self.peer_relay = hello.relay >= frames::RELAY_V1;
             self.state = State::AwaitAuth;
         }
         self.send(Body::Auth(Auth {
@@ -704,6 +713,15 @@ impl Session {
     /// identity logs of inboxes that share a group with it (§4.2). Every step always runs; the first error
     /// is returned for logging.
     async fn on_verified(&mut self) -> Result<(), MeshError> {
+        // Both Hellos must have offered relay: a session that did not
+        // advertise it never links up, even if relay was enabled since.
+        if self.peer_relay && self.self_relay {
+            self.node.relay_link_up(
+                &self.peer,
+                self.peer_installation(),
+                self.peer_inbox.clone().unwrap_or_default(),
+            );
+        }
         let welcomes = self.send_welcomes();
         let announced = self.announce_all().await;
         let relayed = self.relay_identity_logs().await;
@@ -753,6 +771,17 @@ impl Session {
             Body::Interest(interest) => self.on_interest(interest).await,
             Body::Sequenced(sequenced) => self.on_sequenced(sequenced).await,
             Body::Pending(pending) => self.on_pending(pending).await,
+            body @ (Body::Relay(_)
+            | Body::SpoolDigest(_)
+            | Body::SpoolWant(_)
+            | Body::RelayKeyOffer(_)
+            | Body::RelayKeyAck(_)) => {
+                // Relay errors are never fatal to a session: the engine logs them.
+                if self.peer_relay {
+                    self.node.on_relay_frame(&self.peer, body).await;
+                }
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -1015,6 +1044,8 @@ impl Session {
             None => return Ok(()),
         };
         if sequencer == local {
+            self.node
+                .relay_note_peer_high(&gid, interest.high_id as i64);
             self.serve_sequenced(&gid, interest.high_id as i64)?;
         } else if sequencer == peer {
             self.flush_pending(&gid).await?;

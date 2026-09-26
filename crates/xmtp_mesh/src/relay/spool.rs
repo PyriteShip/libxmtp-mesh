@@ -1,9 +1,6 @@
 //! Spool admission (spec §5.1, §5.4, §8): validate, dedup, cap one
 //! neighbour's share, evict soonest-drop when full. Rate limits are the engine's
 //! (in-memory [`TokenBucket`]s), checked before this runs.
-// The engine (Task 7) is the only caller of most of this module's
-// `pub(crate)` surface; until then it is dead code outside tests.
-#![allow(dead_code)]
 use tokio::time::Instant;
 
 use super::RelayConfig;

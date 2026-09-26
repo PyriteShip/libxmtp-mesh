@@ -190,6 +190,26 @@ impl MeshStore {
         Ok(())
     }
 
+    /// The stored relay key for `group_id`, first storing `candidate`
+    /// (unconfirmed) if there is none. One transaction, so concurrent offers
+    /// for one group always agree on one key.
+    pub fn relay_key_or_insert(
+        &mut self,
+        group_id: &[u8],
+        candidate: &[u8; 32],
+    ) -> Result<([u8; 32], bool), MeshError> {
+        self.transaction(|s| {
+            sql_query(
+                "INSERT OR IGNORE INTO relay_keys (group_id, relay_key, confirmed) VALUES (?, ?, 0)",
+            )
+            .bind::<Binary, _>(group_id)
+            .bind::<Binary, _>(candidate.as_slice())
+            .execute(&mut s.conn)?;
+            s.relay_key(group_id)?
+                .ok_or_else(|| MeshError::Relay("relay key missing after insert".into()))
+        })
+    }
+
     pub fn relay_keys(&mut self) -> Result<Vec<(Vec<u8>, [u8; 32], bool)>, MeshError> {
         let rows: Vec<KeyRow> =
             sql_query("SELECT group_id, relay_key, confirmed FROM relay_keys ORDER BY group_id")
@@ -349,6 +369,25 @@ mod tests {
         assert!(s.relay_is_seen_short(&[5; 8]).unwrap());
         drop(s);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn relay_key_or_insert_keeps_the_first_key() {
+        let mut s = MeshStore::open_in_memory().unwrap();
+        assert_eq!(
+            s.relay_key_or_insert(&[1], &[3; 32]).unwrap(),
+            ([3; 32], false)
+        );
+        assert_eq!(
+            s.relay_key_or_insert(&[1], &[4; 32]).unwrap(),
+            ([3; 32], false)
+        );
+        s.set_relay_key(&[1], &[3; 32], true).unwrap();
+        assert_eq!(
+            s.relay_key_or_insert(&[1], &[5; 32]).unwrap(),
+            ([3; 32], true)
+        );
+        assert_eq!(s.relay_key(&[1]).unwrap(), Some(([3; 32], true)));
     }
 
     #[test]

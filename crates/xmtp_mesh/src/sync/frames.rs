@@ -8,6 +8,9 @@ use crate::MeshError;
 
 pub const FRAME_VERSION: u32 = 1;
 
+/// Relay protocol version (spec §5.2, §7).
+pub const RELAY_V1: u32 = 1;
+
 /// Largest encoded frame a node sends or accepts.
 pub const MAX_FRAME_LEN: usize = 1024 * 1024;
 
@@ -89,7 +92,10 @@ pub struct Frame {
     pub ttl: u32,
     #[prost(uint32, tag = "3")]
     pub hops: u32,
-    #[prost(oneof = "frame::Body", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19")]
+    #[prost(
+        oneof = "frame::Body",
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24"
+    )]
     pub body: Option<frame::Body>,
 }
 
@@ -119,6 +125,16 @@ pub mod frame {
         /// decode this as an empty frame and ignore it.
         #[prost(message, tag = "19")]
         IdentityConflict(super::IdentityLog),
+        #[prost(message, tag = "20")]
+        Relay(super::RelayEnvelope),
+        #[prost(message, tag = "21")]
+        SpoolDigest(super::SpoolDigest),
+        #[prost(message, tag = "22")]
+        SpoolWant(super::SpoolWant),
+        #[prost(message, tag = "23")]
+        RelayKeyOffer(super::RelayKeyOffer),
+        #[prost(message, tag = "24")]
+        RelayKeyAck(super::RelayKeyAck),
     }
 }
 
@@ -130,6 +146,9 @@ pub struct Hello {
     pub inbox_id: String,
     #[prost(bytes = "vec", tag = "3")]
     pub challenge: Vec<u8>,
+    /// Relay protocol version the sender speaks (0: none; [`RELAY_V1`]).
+    #[prost(uint32, tag = "4")]
+    pub relay: u32,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -198,6 +217,52 @@ pub struct Pending {
     pub group_id: Vec<u8>,
     #[prost(message, repeated, tag = "2")]
     pub messages: Vec<GroupMessageInput>,
+}
+
+/// One relayed envelope (spec §4.2). `ttl`/`copies` change per hop;
+/// `sealed` is forwarded byte-for-byte and never re-encoded.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct RelayEnvelope {
+    #[prost(uint32, tag = "1")]
+    pub ttl: u32,
+    #[prost(uint32, tag = "2")]
+    pub copies: u32,
+    #[prost(bytes = "vec", tag = "3")]
+    pub sealed: Vec<u8>,
+}
+
+/// "What I hold": 8-byte envelope ids (spec §5.2). Link-local, never relayed.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct SpoolDigest {
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    pub ids: Vec<Vec<u8>>,
+}
+
+/// The ids from a peer's digest that we lack. Link-local, never relayed.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct SpoolWant {
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    pub ids: Vec<Vec<u8>>,
+}
+
+/// The DM sequencer's relay key, encrypted under the exporter secret at
+/// `epoch` (spec §4.5). Direct links only.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct RelayKeyOffer {
+    #[prost(bytes = "vec", tag = "1")]
+    pub group_id: Vec<u8>,
+    #[prost(uint64, tag = "2")]
+    pub epoch: u64,
+    #[prost(bytes = "vec", tag = "3")]
+    pub nonce: Vec<u8>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub ciphertext: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct RelayKeyAck {
+    #[prost(bytes = "vec", tag = "1")]
+    pub group_id: Vec<u8>,
 }
 
 pub fn encode(body: frame::Body) -> Vec<u8> {
@@ -319,5 +384,52 @@ mod tests {
             decode(&bytes).unwrap(),
             frame::Body::IdentityConflict(IdentityLog { inbox_id, .. }) if inbox_id == "inbox"
         ));
+    }
+
+    #[test]
+    fn hello_without_relay_field_decodes_as_zero() {
+        // An older build's Hello: fields 1-3 only.
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct OldHello {
+            #[prost(bytes = "vec", tag = "1")]
+            installation_key: Vec<u8>,
+            #[prost(string, tag = "2")]
+            inbox_id: String,
+            #[prost(bytes = "vec", tag = "3")]
+            challenge: Vec<u8>,
+        }
+        let old = OldHello {
+            installation_key: vec![1; 32],
+            inbox_id: "i".into(),
+            challenge: vec![2; 32],
+        };
+        let hello = Hello::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(hello.relay, 0);
+    }
+
+    #[test]
+    fn relay_frames_round_trip() {
+        for body in [
+            frame::Body::Relay(RelayEnvelope {
+                ttl: 3,
+                copies: 0,
+                sealed: vec![9; 512],
+            }),
+            frame::Body::SpoolDigest(SpoolDigest {
+                ids: vec![vec![1; 8]],
+            }),
+            frame::Body::SpoolWant(SpoolWant {
+                ids: vec![vec![2; 8]],
+            }),
+            frame::Body::RelayKeyOffer(RelayKeyOffer {
+                group_id: vec![3],
+                epoch: 4,
+                nonce: vec![5; 12],
+                ciphertext: vec![6; 48],
+            }),
+            frame::Body::RelayKeyAck(RelayKeyAck { group_id: vec![3] }),
+        ] {
+            assert_eq!(decode(&encode(body.clone())).unwrap(), body);
+        }
     }
 }

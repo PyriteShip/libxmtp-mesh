@@ -82,6 +82,8 @@ pub(crate) struct NodeInner {
     /// `sync` set with no identity task, or an identity task running with
     /// no `sync`. Held for each method's whole critical section.
     pub(crate) sync_lifecycle: Mutex<()>,
+    /// The relay engine while relay is enabled (spec 2026-09-24 multi-hop).
+    pub(crate) relay: Mutex<Option<Arc<crate::relay::engine::RelayEngine>>>,
 }
 
 /// Default time an authenticated peer has to prove inbox membership.
@@ -187,6 +189,7 @@ impl MeshNode {
                 suppress_handover: AtomicBool::new(false),
                 suppress_client_resync: AtomicBool::new(false),
                 sync_lifecycle: Mutex::new(()),
+                relay: Mutex::new(None),
             }),
         }
     }
@@ -398,6 +401,7 @@ impl MeshNode {
         }
         drop(sessions);
         drop(sync);
+        self.disable_relay();
         drop(old);
     }
 
@@ -417,6 +421,7 @@ impl MeshNode {
     /// Clear `peer`'s authentication and presence, emitting `PeerLost` if it
     /// was verified. Callers hold `sessions`.
     fn forget_peer(&self, peer: &str) {
+        self.relay_link_down(peer);
         self.inner.authenticated.lock().remove(peer);
         if self.inner.verified.lock().remove(peer).is_some() {
             self.emit(vec![NodeEvent::PeerLost {
@@ -471,12 +476,13 @@ impl MeshNode {
     /// inbox's log): drop it from presence. Only the current session may.
     pub(crate) fn session_unverified(&self, peer: &str, session_id: u64) {
         let sessions = self.inner.sessions.lock();
-        if sessions.get(peer).is_some_and(|h| h.id == session_id)
-            && self.inner.verified.lock().remove(peer).is_some()
-        {
-            self.emit(vec![NodeEvent::PeerLost {
-                peer: peer.to_string(),
-            }]);
+        if sessions.get(peer).is_some_and(|h| h.id == session_id) {
+            self.relay_link_down(peer);
+            if self.inner.verified.lock().remove(peer).is_some() {
+                self.emit(vec![NodeEvent::PeerLost {
+                    peer: peer.to_string(),
+                }]);
+            }
         }
     }
 
