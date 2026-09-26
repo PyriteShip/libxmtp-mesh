@@ -152,6 +152,19 @@ impl MeshStore {
         Ok(n > 0)
     }
 
+    /// Like [`Self::spool_evict_soonest`], limited to one neighbour's entries
+    /// (newest wins within a full share, spec §5.4).
+    pub fn spool_evict_soonest_from(&mut self, installation: &[u8]) -> Result<bool, MeshError> {
+        let n = sql_query(
+            "DELETE FROM relay_spool WHERE hash = \
+             (SELECT hash FROM relay_spool WHERE from_installation = ? \
+              ORDER BY drop_at ASC LIMIT 1)",
+        )
+        .bind::<Binary, _>(installation)
+        .execute(&mut self.conn)?;
+        Ok(n > 0)
+    }
+
     pub fn relay_purge(&mut self, now_secs: i64) -> Result<(), MeshError> {
         sql_query("DELETE FROM relay_spool WHERE drop_at <= ?")
             .bind::<BigInt, _>(now_secs)
@@ -335,6 +348,22 @@ mod tests {
         );
         assert!(!s.relay_is_seen(&[9; 32]).unwrap());
         assert!(!s.spool_evict_soonest().unwrap(), "empty spool");
+    }
+
+    #[test]
+    fn evicts_soonest_drop_within_one_neighbour() {
+        let mut s = MeshStore::open_in_memory().unwrap();
+        s.spool_insert(&entry(1, 10, b"q", 512)).unwrap();
+        s.spool_insert(&entry(2, 100, b"p", 512)).unwrap();
+        s.spool_insert(&entry(3, 50, b"p", 512)).unwrap();
+        assert!(s.spool_evict_soonest_from(b"p").unwrap());
+        assert!(s.spool_get(&[3; 32]).unwrap().is_none());
+        assert!(
+            s.spool_get(&[1; 32]).unwrap().is_some(),
+            "other neighbour kept"
+        );
+        assert!(s.spool_get(&[2; 32]).unwrap().is_some());
+        assert!(!s.spool_evict_soonest_from(b"none").unwrap());
     }
 
     #[test]

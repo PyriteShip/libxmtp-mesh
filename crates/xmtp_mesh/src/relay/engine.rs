@@ -26,6 +26,8 @@ pub struct RelayStats {
     pub duplicate: u64,
     pub dropped_invalid: u64,
     pub dropped_expired: u64,
+    /// Entries pushed out of a neighbour's full share to admit its newer
+    /// envelope (newest wins, spec §5.4); nothing is refused for the share.
     pub dropped_share: u64,
     pub dropped_rate: u64,
     pub pushed: u64,
@@ -292,7 +294,7 @@ impl RelayEngine {
     async fn on_relay(self: &Arc<Self>, peer: &str, env: RelayEnvelope) -> Result<(), MeshError> {
         let hash = envelope::hash(&env.sealed);
         let len = env.sealed.len() as f64;
-        {
+        let within_rate = {
             let now = Instant::now();
             let mut st = self.state.lock();
             let EngineState {
@@ -314,14 +316,21 @@ impl RelayEngine {
                 && nb.bytes.allows(len, now)
                 && global_envelopes.allows(1.0, now)
                 && global_bytes.allows(len, now);
-            if !ok {
+            if ok {
+                nb.envelopes.take(1.0);
+                nb.bytes.take(len);
+                global_envelopes.take(1.0);
+                global_bytes.take(len);
+            } else {
                 stats.dropped_rate += 1;
-                return Ok(());
             }
-            nb.envelopes.take(1.0);
-            nb.bytes.take(len);
-            global_envelopes.take(1.0);
-            global_bytes.take(len);
+            ok
+        };
+        if !within_rate {
+            // Not stored or pushed, but a recipient never misses its own
+            // message to relay limits.
+            self.deliver_unspooled(&hash, &env.sealed).await;
+            return Ok(());
         }
         let from = match self.state.lock().links.get(peer) {
             Some(l) => l.installation.clone(),
@@ -344,23 +353,53 @@ impl RelayEngine {
         {
             let mut st = self.state.lock();
             match outcome {
-                Accept::New { .. } => st.stats.accepted += 1,
+                Accept::New { share_evicted, .. } => {
+                    st.stats.accepted += 1;
+                    st.stats.dropped_share += u64::from(share_evicted);
+                }
                 Accept::Duplicate => st.stats.duplicate += 1,
                 Accept::Dropped(DropReason::Invalid) => st.stats.dropped_invalid += 1,
                 Accept::Dropped(DropReason::Expired) => st.stats.dropped_expired += 1,
-                Accept::Dropped(DropReason::Share) => st.stats.dropped_share += 1,
             }
         }
-        if let Accept::New { hash } = outcome {
-            self.try_deliver(&env.sealed).await;
-            self.schedule_push(hash, peer.to_string());
+        match outcome {
+            Accept::New { hash, .. } => {
+                self.try_deliver(&env.sealed).await;
+                self.schedule_push(hash, peer.to_string());
+            }
+            Accept::Dropped(_) => self.deliver_unspooled(&hash, &env.sealed).await,
+            Accept::Duplicate => {}
         }
         Ok(())
     }
 
+    /// Try to deliver a live envelope the limits kept out of the spool,
+    /// unless it was already seen. One that matched our keys is then marked
+    /// seen, so a replay of it is a no-op rather than more delivery work.
+    async fn deliver_unspooled(self: &Arc<Self>, hash: &[u8; 32], sealed: &[u8]) {
+        let Ok(expires_at) = spool::live_expiry(sealed, now_secs()) else {
+            return;
+        };
+        let Some(node) = self.node() else { return };
+        let seen = node.inner.store.lock().relay_is_seen(hash);
+        match seen {
+            Ok(false) => {
+                if self.try_deliver(sealed).await {
+                    let marked = node.inner.store.lock().relay_mark_seen(hash, expires_at);
+                    if let Err(e) = marked {
+                        tracing::warn!(error = %e, "relay: seen-set unavailable");
+                    }
+                }
+            }
+            Ok(true) => {}
+            Err(e) => tracing::warn!(error = %e, "relay: seen-set unavailable"),
+        }
+    }
+
     /// Open `sealed` if it is for one of our DMs and act on it (spec §6.2).
-    pub(crate) async fn try_deliver(self: &Arc<Self>, sealed: &[u8]) {
-        self.try_deliver_dm(sealed).await;
+    /// Returns whether it matched one of our DM relay keys.
+    pub(crate) async fn try_deliver(self: &Arc<Self>, sealed: &[u8]) -> bool {
+        self.try_deliver_dm(sealed).await
     }
 
     // ---- pushing ----
@@ -435,7 +474,7 @@ impl RelayEngine {
             spool::accept(&mut store, &self.cfg, ttl, &sealed, b"", now_secs())
         };
         match outcome {
-            Ok(Accept::New { hash }) => {
+            Ok(Accept::New { hash, .. }) => {
                 self.state.lock().stats.originated += 1;
                 self.schedule_push(hash, String::new());
             }

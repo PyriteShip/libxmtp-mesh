@@ -1,5 +1,6 @@
 //! Spool admission (spec §5.1, §5.4, §8): validate, dedup, cap one
-//! neighbour's share, evict soonest-drop when full. Rate limits are the engine's
+//! neighbour's share (newest wins: a full share evicts its own soonest-drop
+//! entry), evict soonest-drop when full. Rate limits are the engine's
 //! (in-memory [`TokenBucket`]s), checked before this runs.
 use tokio::time::Instant;
 
@@ -15,14 +16,35 @@ const MAX_AHEAD_SECS: i64 = 25 * 3600;
 pub(crate) enum DropReason {
     Invalid,
     Expired,
-    Share,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Accept {
-    New { hash: [u8; 32] },
+    /// `share_evicted`: how many of the sender's soonest-drop entries were
+    /// pushed out of its full share to make room.
+    New {
+        hash: [u8; 32],
+        share_evicted: u32,
+    },
     Duplicate,
     Dropped(DropReason),
+}
+
+/// The envelope's signed expiry if its header is well formed and it is live
+/// now (not expired, not implausibly far ahead).
+pub(crate) fn live_expiry(sealed: &[u8], now_secs: i64) -> Result<i64, DropReason> {
+    let header = envelope::header(sealed).ok_or(DropReason::Invalid)?;
+    if header.expires_at % EXPIRY_BUCKET_SECS != 0 {
+        return Err(DropReason::Invalid);
+    }
+    let expires_at = header.expires_at.min(i64::MAX as u64) as i64;
+    if expires_at <= now_secs {
+        return Err(DropReason::Expired);
+    }
+    if expires_at > now_secs + MAX_AHEAD_SECS {
+        return Err(DropReason::Invalid);
+    }
+    Ok(expires_at)
 }
 
 pub(crate) fn accept(
@@ -33,27 +55,26 @@ pub(crate) fn accept(
     from: &[u8],
     now_secs: i64,
 ) -> Result<Accept, MeshError> {
-    let Some(header) = envelope::header(sealed) else {
+    if ttl > MAX_TTL {
         return Ok(Accept::Dropped(DropReason::Invalid));
+    }
+    let expires_at = match live_expiry(sealed, now_secs) {
+        Ok(at) => at,
+        Err(reason) => return Ok(Accept::Dropped(reason)),
     };
-    if ttl > MAX_TTL || header.expires_at % EXPIRY_BUCKET_SECS != 0 {
-        return Ok(Accept::Dropped(DropReason::Invalid));
-    }
-    let expires_at = header.expires_at.min(i64::MAX as u64) as i64;
-    if expires_at <= now_secs {
-        return Ok(Accept::Dropped(DropReason::Expired));
-    }
-    if expires_at > now_secs + MAX_AHEAD_SECS {
-        return Ok(Accept::Dropped(DropReason::Invalid));
-    }
     let hash = envelope::hash(sealed);
     store.transaction(|s| {
         if s.relay_is_seen(&hash)? {
             return Ok(Accept::Duplicate);
         }
         s.relay_purge(now_secs)?;
-        if !from.is_empty() && s.spool_count_from(from)? >= cfg.share_cap() as i64 {
-            return Ok(Accept::Dropped(DropReason::Share));
+        let mut share_evicted = 0;
+        if !from.is_empty() {
+            while s.spool_count_from(from)? >= cfg.share_cap() as i64
+                && s.spool_evict_soonest_from(from)?
+            {
+                share_evicted += 1;
+            }
         }
         loop {
             let (n, bytes) = s.spool_totals()?;
@@ -77,7 +98,10 @@ pub(crate) fn accept(
             from_installation: from.to_vec(),
         })?;
         s.relay_mark_seen(&hash, expires_at)?;
-        Ok(Accept::New { hash })
+        Ok(Accept::New {
+            hash,
+            share_evicted,
+        })
     })
 }
 
@@ -138,7 +162,7 @@ mod tests {
     fn new_then_duplicate_and_ttl_decrements_from_links() {
         let mut s = MeshStore::open_in_memory().unwrap();
         let e = sealed(10, (NOW + M) as u64);
-        let Accept::New { hash } = accept(&mut s, &small(), 4, &e, b"p", NOW).unwrap() else {
+        let Accept::New { hash, .. } = accept(&mut s, &small(), 4, &e, b"p", NOW).unwrap() else {
             panic!("new")
         };
         assert_eq!(s.spool_get(&hash).unwrap().unwrap().ttl, 3);
@@ -147,7 +171,7 @@ mod tests {
             Accept::Duplicate
         );
         let o = sealed(10, (NOW + M) as u64);
-        let Accept::New { hash } = accept(&mut s, &small(), 4, &o, b"", NOW).unwrap() else {
+        let Accept::New { hash, .. } = accept(&mut s, &small(), 4, &o, b"", NOW).unwrap() else {
             panic!("new")
         };
         assert_eq!(
@@ -198,17 +222,52 @@ mod tests {
     #[test]
     fn one_neighbour_holds_at_most_a_quarter() {
         let mut s = MeshStore::open_in_memory().unwrap();
-        let cfg = small(); // share cap 2
-        for _ in 0..2 {
-            assert!(matches!(
-                accept(&mut s, &cfg, 3, &sealed(1, (NOW + M) as u64), b"spam", NOW).unwrap(),
-                Accept::New { .. }
-            ));
+        // Share cap 2; a long hold so drop_at follows the expiry.
+        let cfg = RelayConfig {
+            hold: std::time::Duration::from_secs(10 * M as u64),
+            ..small()
+        };
+        let mut held = Vec::new();
+        for i in 0..2 {
+            let Accept::New {
+                hash,
+                share_evicted: 0,
+            } = accept(
+                &mut s,
+                &cfg,
+                3,
+                &sealed(1, (NOW + (i + 1) * M) as u64),
+                b"spam",
+                NOW,
+            )
+            .unwrap()
+            else {
+                panic!("first two fit the share")
+            };
+            held.push(hash);
         }
-        assert_eq!(
-            accept(&mut s, &cfg, 3, &sealed(1, (NOW + M) as u64), b"spam", NOW).unwrap(),
-            Accept::Dropped(DropReason::Share)
-        );
+        // Full share: the newcomer wins; the neighbour's soonest-drop entry
+        // (the first, expiring at NOW + M) goes.
+        let Accept::New {
+            hash: newest,
+            share_evicted: 1,
+        } = accept(
+            &mut s,
+            &cfg,
+            3,
+            &sealed(1, (NOW + 3 * M) as u64),
+            b"spam",
+            NOW,
+        )
+        .unwrap()
+        else {
+            panic!("newcomer accepted by evicting within the share")
+        };
+        assert_eq!(s.spool_count_from(b"spam").unwrap(), 2);
+        assert!(s.spool_get(&held[0]).unwrap().is_none());
+        assert!(s.spool_get(&held[1]).unwrap().is_some());
+        assert!(s.spool_get(&newest).unwrap().is_some());
+        // Another neighbour's share is untouched by it.
         assert!(matches!(
             accept(
                 &mut s,
@@ -219,8 +278,50 @@ mod tests {
                 NOW
             )
             .unwrap(),
-            Accept::New { .. }
+            Accept::New {
+                share_evicted: 0,
+                ..
+            }
         ));
+        assert_eq!(s.spool_count_from(b"spam").unwrap(), 2);
+    }
+
+    #[test]
+    fn a_share_already_over_the_cap_is_trimmed_below_it() {
+        let mut s = MeshStore::open_in_memory().unwrap();
+        let cfg = small(); // share cap 2
+        for i in 0..3u8 {
+            s.spool_insert(&SpoolEntry {
+                hash: vec![i; 32],
+                sealed: vec![0; 512],
+                ttl: 3,
+                drop_at: NOW + 60 + i64::from(i),
+                from_installation: b"p".to_vec(),
+            })
+            .unwrap();
+        }
+        let Accept::New { share_evicted, .. } =
+            accept(&mut s, &cfg, 3, &sealed(1, (NOW + M) as u64), b"p", NOW).unwrap()
+        else {
+            panic!("accepted")
+        };
+        assert_eq!(share_evicted, 2);
+        assert_eq!(s.spool_count_from(b"p").unwrap(), 2);
+        assert!(s.spool_get(&[2; 32]).unwrap().is_some(), "latest-drop kept");
+    }
+
+    #[test]
+    fn live_expiry_refuses_expired_and_malformed() {
+        assert_eq!(live_expiry(&sealed(1, (NOW + M) as u64), NOW), Ok(NOW + M));
+        assert_eq!(
+            live_expiry(&sealed(1, NOW as u64), NOW),
+            Err(DropReason::Expired)
+        );
+        assert_eq!(
+            live_expiry(&sealed(1, (NOW + M + 1) as u64), NOW),
+            Err(DropReason::Invalid)
+        );
+        assert_eq!(live_expiry(&[0; 17], NOW), Err(DropReason::Invalid));
     }
 
     #[test]
@@ -228,7 +329,9 @@ mod tests {
         let mut s = MeshStore::open_in_memory().unwrap();
         let cfg = small();
         let first = sealed(1, (NOW + M) as u64);
-        let Accept::New { hash: first_hash } = accept(&mut s, &cfg, 3, &first, b"", NOW).unwrap()
+        let Accept::New {
+            hash: first_hash, ..
+        } = accept(&mut s, &cfg, 3, &first, b"", NOW).unwrap()
         else {
             panic!()
         };
@@ -247,7 +350,7 @@ mod tests {
         let mut s = MeshStore::open_in_memory().unwrap();
         let cfg = small(); // hold 10 min
         let e = sealed(1, (NOW + 24 * 3600) as u64);
-        let Accept::New { hash } = accept(&mut s, &cfg, 3, &e, b"p", NOW).unwrap() else {
+        let Accept::New { hash, .. } = accept(&mut s, &cfg, 3, &e, b"p", NOW).unwrap() else {
             panic!()
         };
         assert_eq!(s.spool_get(&hash).unwrap().unwrap().drop_at, NOW + 600);

@@ -468,28 +468,49 @@ impl RelayEngine {
         Ok(())
     }
 
-    pub(crate) async fn try_deliver_dm(self: &Arc<Self>, sealed: &[u8]) {
-        self.deliver_logged(sealed, Instant::now()).await;
+    /// Whether `sealed` matched one of our DM relay keys (whether or not
+    /// it then applied).
+    pub(crate) async fn try_deliver_dm(self: &Arc<Self>, sealed: &[u8]) -> bool {
+        self.deliver_logged(sealed, Instant::now()).await
     }
 
-    /// `since`: when the envelope first arrived (quarantine age).
-    async fn deliver_logged(self: &Arc<Self>, sealed: &[u8], since: Instant) {
-        if let Err(e) = self.deliver(sealed, since).await {
+    /// `since`: when the envelope first arrived (quarantine age). Returns
+    /// whether `sealed` matched one of our DM relay keys.
+    async fn deliver_logged(self: &Arc<Self>, sealed: &[u8], since: Instant) -> bool {
+        let Some((gid, key)) = self.matching_key(sealed) else {
+            return false; // not for us: just relayed
+        };
+        if let Err(e) = self.deliver(gid, key, sealed, since).await {
             tracing::debug!(error = %e, "relay: envelope not delivered");
         }
+        true
     }
 
-    async fn deliver(self: &Arc<Self>, sealed: &[u8], since: Instant) -> Result<(), MeshError> {
+    /// The DM (`group_id`, relay key) whose tag `sealed` carries, if any.
+    fn matching_key(&self, sealed: &[u8]) -> Option<(Vec<u8>, [u8; 32])> {
+        let node = self.node()?;
+        let keys = match node.inner.store.lock().relay_keys() {
+            Ok(keys) => keys,
+            Err(e) => {
+                tracing::warn!(error = %e, "relay: keys unavailable");
+                return None;
+            }
+        };
+        keys.into_iter()
+            .find(|(_, k, _)| envelope::matches(k, sealed))
+            .map(|(gid, key, _)| (gid, key))
+    }
+
+    async fn deliver(
+        self: &Arc<Self>,
+        gid: Vec<u8>,
+        key: [u8; 32],
+        sealed: &[u8],
+        since: Instant,
+    ) -> Result<(), MeshError> {
         let node = self
             .node()
             .ok_or_else(|| MeshError::Relay("node gone".into()))?;
-        let keys = node.inner.store.lock().relay_keys()?;
-        let Some((gid, key, _)) = keys
-            .into_iter()
-            .find(|(_, k, _)| envelope::matches(k, sealed))
-        else {
-            return Ok(()); // not for us: just relayed
-        };
         let (signer, payload) = inner::verify(&envelope::open(&key, sealed)?)?;
         let local = node.local_installation()?.ok_or(MeshError::NotRegistered)?;
         if signer == local {
