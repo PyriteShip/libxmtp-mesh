@@ -54,6 +54,25 @@ pub(crate) struct EngineState {
     global_envelopes: TokenBucket,
     global_bytes: TokenBucket,
     pub(crate) stats: RelayStats,
+    /// Per relayed DM: its send/retry schedule (spec §6.1).
+    pub(crate) dm: HashMap<Vec<u8>, super::dm::Schedule>,
+    /// Envelopes from a signer we cannot place yet (spec §6.4).
+    pub(crate) quarantine: super::dm::Quarantine,
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) hooks: TestHooks,
+}
+
+/// Switches that let integration tests force relay DM edge cases.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Default)]
+pub(crate) struct TestHooks {
+    /// Sequencer: send every row as a `Ref`, as if the joiner had sent it,
+    /// to exercise the joiner's `need_full_after` fallback.
+    pub(crate) force_refs: bool,
+    /// Joiner: never ask for `Full` rows, so a stall persists.
+    pub(crate) no_full_request: bool,
+    /// Joiner: seal pure acks but do not originate them (lost acks).
+    pub(crate) drop_pure_acks: bool,
 }
 
 pub(crate) struct RelayEngine {
@@ -90,8 +109,6 @@ impl RelayEngine {
         Some((c.signer.clone(), c.transport.clone(), c.membership.clone()))
     }
 
-    // Task 8 (DM traffic) is the caller.
-    #[allow(dead_code)]
     pub(crate) fn signer(&self) -> Option<Arc<dyn HelloSigner>> {
         self.parts().map(|p| p.0)
     }
@@ -341,8 +358,10 @@ impl RelayEngine {
         Ok(())
     }
 
-    /// Open `sealed` if it is for one of our DMs and act on it (Task 8).
-    pub(crate) async fn try_deliver(self: &Arc<Self>, _sealed: &[u8]) {}
+    /// Open `sealed` if it is for one of our DMs and act on it (spec §6.2).
+    pub(crate) async fn try_deliver(self: &Arc<Self>, sealed: &[u8]) {
+        self.try_deliver_dm(sealed).await;
+    }
 
     // ---- pushing ----
 
@@ -403,8 +422,6 @@ impl RelayEngine {
     }
 
     /// Put an envelope this node sealed into the spool and push it on.
-    // Task 8 (DM traffic) is the caller.
-    #[allow(dead_code)]
     pub(crate) fn originate(self: &Arc<Self>, sealed: Vec<u8>) {
         let (lo, hi) = self.cfg.origin_ttl;
         let ttl = rand::rng().random_range(lo..=hi.max(lo));
@@ -576,17 +593,20 @@ impl RelayEngine {
         self.on_tick_dm().await;
     }
 
-    /// Task 8 fills this in.
-    pub(crate) async fn on_tick_dm(self: &Arc<Self>) {}
+    pub(crate) fn on_event(self: &Arc<Self>, event: NodeEvent) {
+        self.on_event_dm(event);
+    }
 
-    /// Task 8 fills this in.
-    pub(crate) fn on_event(self: &Arc<Self>, _event: NodeEvent) {}
+    /// Missed node events.
+    pub(crate) fn on_lagged(self: &Arc<Self>) {
+        self.on_lagged_dm();
+    }
 
-    /// Missed node events. Task 8 fills this in.
-    pub(crate) fn on_lagged(self: &Arc<Self>) {}
-
-    /// A DM's relay key just became usable on this side. Task 8 fills this in.
-    pub(crate) fn on_key_confirmed(&self, _group_id: &[u8]) {}
+    /// A DM's relay key just became usable on this side. A message sent
+    /// before then was dropped from the schedule; this picks it up.
+    pub(crate) fn on_key_confirmed(&self, group_id: &[u8]) {
+        self.schedule_now(group_id);
+    }
 
     /// The engine task. It holds the engine only weakly (and strongly only
     /// for one tick or event at a time), so dropping the node's handle
@@ -646,6 +666,7 @@ impl MeshNode {
             .ok_or(MeshError::SyncNotStarted)?;
         let (stop_tx, stop_rx) = oneshot::channel();
         let now = Instant::now();
+        let quarantine = super::dm::Quarantine::new(cfg.quarantine_max, cfg.quarantine_for);
         let engine = Arc::new(RelayEngine {
             node: Arc::downgrade(&self.inner),
             state: Mutex::new(EngineState {
@@ -662,6 +683,10 @@ impl MeshNode {
                     now,
                 ),
                 stats: RelayStats::default(),
+                dm: HashMap::new(),
+                quarantine,
+                #[cfg(any(test, feature = "test-utils"))]
+                hooks: TestHooks::default(),
             }),
             cfg,
             exporter,
@@ -746,6 +771,46 @@ impl MeshNode {
     #[doc(hidden)]
     pub fn relay_key_for_test(&self, group_id: &[u8]) -> Option<([u8; 32], bool)> {
         self.inner.store.lock().relay_key(group_id).unwrap()
+    }
+
+    /// Relay DM syncs this node sequences carry every row as a `Ref`.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn relay_force_refs_for_test(&self, on: bool) {
+        if let Some(e) = self.relay_engine() {
+            e.state.lock().hooks.force_refs = on;
+        }
+    }
+
+    /// This node, as a relay DM joiner, never asks for `Full` rows.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn relay_no_full_request_for_test(&self, on: bool) {
+        if let Some(e) = self.relay_engine() {
+            e.state.lock().hooks.no_full_request = on;
+        }
+    }
+
+    /// This node, as a relay DM joiner, loses its pure acks while `on`.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn relay_drop_pure_acks_for_test(&self, on: bool) {
+        if let Some(e) = self.relay_engine() {
+            e.state.lock().hooks.drop_pure_acks = on;
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn relay_peer_acked_high_for_test(&self, group_id: &[u8]) -> i64 {
+        self.inner.store.lock().peer_acked_high(group_id).unwrap()
+    }
+
+    /// Raise the stored peer ack, as a direct session's `relay_note_peer_high` would.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn relay_note_peer_acked_high_for_test(&self, group_id: &[u8], high: i64) {
+        self.relay_note_peer_high(group_id, high);
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -893,6 +958,10 @@ mod tests {
                 global_envelopes: TokenBucket::new(1.0, 1.0, now),
                 global_bytes: TokenBucket::new(1.0, 1.0, now),
                 stats: RelayStats::default(),
+                dm: HashMap::new(),
+                quarantine: super::super::dm::Quarantine::new(1, std::time::Duration::ZERO),
+                #[cfg(any(test, feature = "test-utils"))]
+                hooks: TestHooks::default(),
             }),
             cfg,
             exporter: Arc::new(NoExporter),

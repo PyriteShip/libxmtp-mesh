@@ -1,8 +1,5 @@
 //! What a relay envelope carries (spec §4.6), readable only by the two DM
 //! members. Relays never see or check any of it.
-// Task 8 (the sync engine) calls most of this module's `pub(crate)` surface;
-// until then it is dead code outside tests.
-#![allow(dead_code)]
 use prost::Message;
 use xmtp_proto::mls_v1::GroupMessageInput;
 
@@ -51,6 +48,12 @@ pub(crate) struct RelayPending {
     pub messages: Vec<GroupMessageInput>,
     #[prost(uint64, tag = "3")]
     pub acked_high: u64,
+    /// Set when the joiner could not resolve a `Ref` after this id (it
+    /// lacks the pending copy, e.g. another installation of its inbox sent
+    /// it): the sequencer answers with `Full` rows after it. Optional, not
+    /// `0 = none`: a fresh installation stalls with `acked_high` 0.
+    #[prost(uint64, optional, tag = "4")]
+    pub need_full_after: Option<u64>,
 }
 
 /// Sequencer → joiner: sequenced rows after the joiner's last acked id, in order.
@@ -143,6 +146,7 @@ mod tests {
                 group_id: vec![1; 16],
                 messages: vec![],
                 acked_high: 9,
+                need_full_after: None,
             })),
         }
     }

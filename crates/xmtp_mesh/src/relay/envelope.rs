@@ -5,9 +5,6 @@
 //! The tag is per envelope: `HMAC(relay_key, TAG_INFO ‖ nonce)`, so two
 //! envelopes of one DM share no visible bytes (spec §4.3). `expires_at` is
 //! coarse: a multiple of 600 s past the hold plus random jitter (§4.2).
-// Later relay tasks (inner, spool, config, keys, engine, dm) call most of
-// this module's `pub(crate)` surface; until then it is dead code outside tests.
-#![allow(dead_code)]
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use hkdf::Hkdf;
