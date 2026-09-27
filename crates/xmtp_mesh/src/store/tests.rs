@@ -269,12 +269,26 @@ fn unsigned_rows_are_signed_once() {
 /// §B13 upgrade: the migration keeps rows stored before it, without proofs.
 #[test]
 fn the_migration_keeps_existing_rows_unsigned_until_they_are_signed() {
+    // Reverts this migration by its own version, not whichever one happens
+    // to be last: a `revert_last_migration` call here would revert the
+    // wrong one once a later migration is added.
+    use diesel::migration::{Migration, MigrationSource};
+    use diesel::sqlite::Sqlite;
+    const SIGNED_SEQUENCING_MIGRATION_VERSION: &str = "20261002000000";
+
     let mut s = MeshStore::open_in_memory().unwrap();
-    s.conn.revert_last_migration(MIGRATIONS).unwrap();
+    let migrations: Vec<Box<dyn Migration<Sqlite>>> = MIGRATIONS.migrations().unwrap();
+    let signed_sequencing = migrations
+        .iter()
+        .find(|m| m.name().version().to_string() == SIGNED_SEQUENCING_MIGRATION_VERSION)
+        .expect("the signed_sequencing migration is embedded");
+    s.conn.revert_migration(&**signed_sequencing).unwrap();
     s.conn
         .batch_execute(
+            // data_hash is sha256(b"old"): sign_unsigned_rows signs from the
+            // stored hash, not by re-hashing data, so this must be genuine.
             "INSERT INTO group_messages (group_id, id, created_ns, data, sender_hmac, should_push, is_commit, data_hash, from_peer) \
-             VALUES (x'67', 1, 5, x'6f6c64', x'', 1, 0, x'00', 0);",
+             VALUES (x'67', 1, 5, x'6f6c64', x'', 1, 0, x'cba06b5736faf67e54b07b561eae94395e774c517a7d910a54369e1263ccfbd4', 0);",
         )
         .unwrap();
     s.conn.run_pending_migrations(MIGRATIONS).unwrap();

@@ -52,8 +52,11 @@ mod tests {
     }
 
     /// §B13: a row sequenced while sync is stopped (here: before the first
-    /// start) is signed by `start_sync`, before any session exists; the
-    /// signer then stays set across `stop_sync`.
+    /// start) is signed by `start_sync`, before any session exists.
+    /// `stop_sync` clears the store's signer (a Client-backed signer would
+    /// otherwise hold the node alive forever, an Arc cycle): a row
+    /// sequenced after that stays unsigned until the *next* `start_sync`'s
+    /// backfill signs it, again before any session exists.
     #[tokio::test]
     async fn start_sync_signs_rows_sequenced_while_sync_was_stopped() {
         let signer = Arc::new(KeySigner::new());
@@ -92,9 +95,77 @@ mod tests {
             .unwrap();
         let rows = node.sequenced_rows_for_test(b"g").unwrap();
         assert!(
-            rows[1].seq_signer.is_some(),
-            "the signer outlives stop_sync"
+            rows[1].seq_signer.is_none(),
+            "cleared by stop_sync: nothing unsigned is ever served, since \
+             serving only happens while sync runs"
         );
+        assert_eq!(
+            node.mesh_stats().seq_rows_signed,
+            1,
+            "not signed until the next start_sync backfill"
+        );
+
+        node.start_sync(
+            signer.clone(),
+            Arc::new(NoTransport),
+            Arc::new(Members(Some(vec![]))),
+        )
+        .unwrap();
+        let rows = node.sequenced_rows_for_test(b"g").unwrap();
+        assert_eq!(
+            rows[1].seq_signer.as_deref(),
+            Some(signer.installation_key().as_slice()),
+            "signed by the next start_sync's backfill"
+        );
+        assert!(seq::verify_proof(
+            b"g",
+            2,
+            2,
+            b"after stop",
+            &rows[1].proof()
+        ));
         assert_eq!(node.mesh_stats().seq_rows_signed, 2);
+    }
+
+    /// The review's Arc-cycle finding: a signer that itself holds a strong
+    /// reference back to the node (as `ClientHelloSigner` does in
+    /// production, through the client's own API bundle) must not be kept by
+    /// the store past `stop_sync`, or the node could never be dropped after
+    /// logout. This reproduces the cycle with an in-crate stand-in for
+    /// `ClientHelloSigner` rather than a real libxmtp client (out of this
+    /// crate's reach), and checks it is actually broken.
+    #[test]
+    fn stop_sync_drops_a_signer_that_holds_the_node_alive() {
+        struct NodeHoldingSigner(KeySigner, #[allow(dead_code)] MeshNode);
+        impl HelloSigner for NodeHoldingSigner {
+            fn installation_key(&self) -> Vec<u8> {
+                self.0.installation_key()
+            }
+            fn sign(&self, text: &str) -> Result<Vec<u8>, crate::MeshError> {
+                self.0.sign(text)
+            }
+        }
+
+        let node = MeshNode::in_memory().unwrap();
+        let weak = Arc::downgrade(&node.inner);
+        let signer: Arc<dyn HelloSigner> =
+            Arc::new(NodeHoldingSigner(KeySigner::new(), node.clone()));
+        node.inner.store.lock().set_seq_signer(signer.clone());
+        drop(signer);
+        drop(node);
+        assert!(
+            weak.upgrade().is_some(),
+            "the signer's own clone of the node keeps it alive (the cycle)"
+        );
+
+        MeshNode {
+            inner: weak.upgrade().unwrap(),
+        }
+        .stop_sync();
+        assert!(
+            weak.upgrade().is_none(),
+            "stop_sync must clear the store's signer, or the node (and its \
+             database) can never be dropped"
+        );
     }
 }

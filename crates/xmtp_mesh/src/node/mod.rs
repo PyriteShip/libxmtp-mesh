@@ -335,7 +335,10 @@ impl MeshNode {
         // §B13: sign rows as they are sequenced from now on, and sign every
         // stored row that has none (sequenced while sync was stopped, or
         // stored before signed sequencing) before a session, the relay or
-        // the handover below can serve it.
+        // the handover below can serve it. If the backfill errors (e.g. the
+        // signer fails), `?` returns before `sync` is set: sync never
+        // started, and the next `start_sync` retries the backfill from
+        // scratch (unsigned rows are untouched by a failed attempt).
         {
             let mut store = self.inner.store.lock();
             store.set_seq_signer(signer.clone());
@@ -412,12 +415,19 @@ impl MeshNode {
     /// Stop syncing: cancel every session and forget the signer and
     /// transport. Frames and connections reported afterwards are ignored
     /// until the next `start_sync` (which may use a new transport).
+    ///
+    /// Also clears the store's sequencing signer (§B13): a Client-backed
+    /// signer holds (through the client's API bundle) a reference back to
+    /// this node, so keeping it past `stop_sync` would keep the node, and
+    /// its database, from ever being dropped after logout. Rows sequenced
+    /// while stopped stay unsigned until the next `start_sync`'s backfill.
     pub fn stop_sync(&self) {
         // See `start_sync`.
         let _lifecycle = self.inner.sync_lifecycle.lock();
         if let Some(task) = self.inner.identity_task.lock().take() {
             task.abort();
         }
+        self.inner.store.lock().clear_seq_signer();
         let mut sync = self.inner.sync.lock();
         *sync = None;
         let mut sessions = self.inner.sessions.lock();

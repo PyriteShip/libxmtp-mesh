@@ -95,6 +95,21 @@ struct EquivocationRow {
     signature_b: Vec<u8>,
 }
 
+/// A row with no proof yet, for [`MeshStore::sign_unsigned_rows`]. Carries
+/// `data_hash` (already `sha256(data)`) rather than the payload itself, so
+/// signing every unsigned row need not load each one's full `data` blob.
+#[derive(QueryableByName)]
+struct UnsignedRow {
+    #[diesel(sql_type = Binary)]
+    group_id: Vec<u8>,
+    #[diesel(sql_type = BigInt)]
+    id: i64,
+    #[diesel(sql_type = BigInt)]
+    created_ns: i64,
+    #[diesel(sql_type = Binary)]
+    data_hash: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, QueryableByName)]
 pub struct StoredWelcome {
     #[diesel(sql_type = Binary)]
@@ -730,6 +745,17 @@ impl MeshStore {
         self.seq_signer = Some(signer);
     }
 
+    /// Stop signing sequenced rows and drop the held signer. Called by
+    /// `stop_sync`: in production the signer is `ClientHelloSigner`, whose
+    /// client keeps the node alive through its own API bundle, so a store
+    /// that kept the signer past `stop_sync` would keep the node (and its
+    /// database) from ever being dropped after logout. Rows sequenced while
+    /// no signer is set stay unsigned until the next `start_sync`'s
+    /// [`Self::sign_unsigned_rows`] backfill.
+    pub fn clear_seq_signer(&mut self) {
+        self.seq_signer = None;
+    }
+
     pub(crate) fn seq_counters(&self) -> Arc<SeqCounters> {
         self.seq.clone()
     }
@@ -761,26 +787,31 @@ impl MeshStore {
         let Some(signer) = self.seq_signer.clone() else {
             return Ok(0);
         };
+        let key = signer.installation_key();
         self.transaction(|s| {
-            let rows: Vec<StoredGroupMessage> = sql_query(format!(
-                "SELECT {GROUP_COLUMNS} FROM group_messages \
-                 WHERE seq_signer IS NULL OR seq_signature IS NULL ORDER BY group_id, id"
-            ))
+            // `data_hash` is already `sha256(data)` (see `insert_group_row`),
+            // so signing every unsigned row need not load each one's full
+            // payload under the store mutex.
+            let rows: Vec<UnsignedRow> = sql_query(
+                "SELECT group_id, id, created_ns, data_hash FROM group_messages \
+                 WHERE seq_signer IS NULL OR seq_signature IS NULL ORDER BY group_id, id",
+            )
             .load(&mut s.conn)?;
             for row in &rows {
-                let proof = seq::sign_row(
-                    signer.as_ref(),
+                let record = seq::SeqRecord::new(
+                    &key,
                     &row.group_id,
                     row.id as u64,
                     row.created_ns as u64,
-                    &row.data,
-                )?;
+                    row.data_hash.clone(),
+                );
+                let signature = signer.sign(&record.signing_text())?;
                 sql_query(
                     "UPDATE group_messages SET seq_signer = ?, seq_signature = ? \
                      WHERE group_id = ? AND id = ?",
                 )
-                .bind::<Binary, _>(&proof.signer)
-                .bind::<Binary, _>(&proof.signature)
+                .bind::<Binary, _>(&key)
+                .bind::<Binary, _>(&signature)
                 .bind::<Binary, _>(&row.group_id)
                 .bind::<BigInt, _>(row.id)
                 .execute(&mut s.conn)?;
