@@ -335,18 +335,20 @@ impl MeshNode {
         // §B13: sign rows as they are sequenced from now on, and sign every
         // stored row that has none (sequenced while sync was stopped, or
         // stored before signed sequencing) before a session, the relay or
-        // the handover below can serve it. If the backfill errors (e.g. the
+        // the handover below can serve it; and attest, as ours, held rows
+        // another installation signed in groups pinned to us (a §C4.7
+        // re-pin that ran while no signer was set). If the backfill errors (e.g. the
         // signer fails), `?` returns before `sync` is set: sync never
         // started, and the next `start_sync` retries the backfill from
         // scratch (unsigned rows are untouched by a failed attempt).
         {
             let mut store = self.inner.store.lock();
             store.set_seq_signer(signer.clone());
-            let signed = store.sign_unsigned_rows()?;
+            let signed = store.sign_unsigned_rows()? + store.attest_foreign_rows(None)?;
             if signed > 0 {
                 tracing::info!(
                     signed,
-                    "signed stored rows that had no sequencing proof (§B13)"
+                    "signed stored rows that had no proof, or attested held rows of our groups (§B13)"
                 );
             }
         }

@@ -282,15 +282,10 @@ pub(crate) struct SignerContext {
     pub revoked: HashSet<Vec<u8>>,
 }
 
-/// The distinct `(seq_signer, seq_attested)` pairs of a group's stored
-/// rows, in any order.
-pub(crate) type StoredSigners = Vec<(Option<Vec<u8>>, bool)>;
-
 /// The stored rows of one group, as [`check_rows`] reads them.
 pub(crate) trait RowLookup {
     fn max_id(&mut self) -> Result<i64, MeshError>;
     fn stored_at(&mut self, id: i64) -> Result<Option<StoredGroupMessage>, MeshError>;
-    fn signers(&mut self) -> Result<StoredSigners, MeshError>;
 }
 
 /// What to do with one frame's (or relayed payload's) rows.
@@ -368,12 +363,10 @@ fn conflicts_with(
 /// 1. A proof is present and verifies over the rebuilt record, as an
 ///    attestation or a sequencing signature as the row says.
 /// 2. Its signer is in `ctx.known`.
-/// 3. For a new id: the signer is the pinned sequencer and not revoked; or
-///    a revoked installation (not the pinned one) and every row below the
-///    id, stored or earlier in the frame, is revoked-signed or an
-///    attestation. So history may open with attestations and a revoked
-///    former sequencer's rows (§C4.7), but once a live installation's
-///    ordinary row exists, no revoked key adds rows after it.
+/// 3. For a new id: the signer (of a sequencing signature or an
+///    attestation) is the pinned sequencer, and it is not revoked. A
+///    revoked installation never adds a row; after a §C4.7 handover the
+///    successor serves the history it holds under its own attestations.
 /// 4. For an id already held, or repeated within the frame: the same record
 ///    is a duplicate; a different record by the same signer is
 ///    equivocation; another signer is §C4.7 id reuse and the first row
@@ -411,20 +404,6 @@ pub(crate) fn check_rows(
             return reject(SeqReject::WrongSigner);
         }
     }
-    let pinned = |s: &[u8]| ctx.sequencer.as_deref() == Some(s);
-    let revoked = |s: &[u8]| ctx.revoked.contains(s);
-    // Rule 3's "every row below is revoked-signed or an attestation".
-    let clean = |signer: Option<&[u8]>, attested: bool| attested || signer.is_some_and(revoked);
-    // Only read the stored signers when a frame row needs them.
-    let mut below_clean = None;
-    if rows.iter().any(|r| {
-        r.seq_signer
-            .as_deref()
-            .is_some_and(|s| !pinned(s) && revoked(s))
-    }) {
-        let stored = lookup.signers()?;
-        below_clean = Some(stored.iter().all(|(s, a)| clean(s.as_deref(), *a)));
-    }
     let have = lookup.max_id()?;
     let mut held = Vec::new();
     let mut new_rows: Vec<StoredGroupMessage> = Vec::new();
@@ -460,16 +439,8 @@ pub(crate) fn check_rows(
             });
         }
         let signer = row.seq_signer.as_deref().unwrap_or_default();
-        let allowed = if pinned(signer) {
-            !revoked(signer)
-        } else {
-            revoked(signer) && below_clean == Some(true)
-        };
-        if !allowed {
+        if ctx.sequencer.as_deref() != Some(signer) || ctx.revoked.contains(signer) {
             return reject(SeqReject::WrongSigner);
-        }
-        if let Some(c) = below_clean.as_mut() {
-            *c &= clean(Some(signer), row.seq_attested);
         }
         new_rows.push(row);
     }
@@ -718,13 +689,6 @@ mod tests {
         fn stored_at(&mut self, id: i64) -> Result<Option<StoredGroupMessage>, MeshError> {
             Ok(self.0.iter().find(|r| r.id == id).cloned())
         }
-        fn signers(&mut self) -> Result<StoredSigners, MeshError> {
-            Ok(self
-                .0
-                .iter()
-                .map(|r| (r.seq_signer.clone(), r.seq_attested))
-                .collect())
-        }
     }
 
     const G: &[u8] = b"group";
@@ -827,52 +791,35 @@ mod tests {
         assert_eq!(reason(&v), SeqReject::WrongSigner);
     }
 
-    /// §C4.7 handover: history signed by the revoked former sequencer
-    /// is accepted, then the successor's rows; a revoked-signed row after a
-    /// successor row is refused.
+    /// §B13 rule 3: a revoked former sequencer's rows are refused at new
+    /// ids on a node pinned to its successor, whatever lies below them.
     #[test]
-    fn revoked_history_then_the_successor_then_no_more_revoked_rows() {
+    fn a_revoked_former_sequencers_rows_are_refused_at_new_ids() {
         let (old, next) = (KeySigner::new(), KeySigner::new());
         let c = ctx(&next, &[&old, &next], &[&old]);
-        let rows = vec![
-            signed_row(&old, G, 1, b"a"),
-            signed_row(&old, G, 2, b"b"),
-            signed_row(&next, G, 3, b"c"),
-        ];
-        let v = check_rows(&c, G, rows.clone(), &mut Stored::default()).unwrap();
-        assert_eq!(accepted_ids(&v), vec![1, 2, 3]);
-        let late = signed_row(&old, G, 4, b"d");
-        let v = check_rows(&c, G, vec![late.clone()], &mut Stored(rows.clone())).unwrap();
-        assert_eq!(reason(&v), SeqReject::WrongSigner);
-        let v = check_rows(
-            &c,
-            G,
-            vec![rows[2].clone(), late],
-            &mut Stored(rows[..2].to_vec()),
-        )
-        .unwrap();
-        assert_eq!(
-            reason(&v),
-            SeqReject::WrongSigner,
-            "also when the successor row arrives in the same frame"
-        );
+        let rows = vec![signed_row(&old, G, 1, b"a"), signed_row(&next, G, 2, b"b")];
+        let v = check_rows(&c, G, rows, &mut Stored::default()).unwrap();
+        assert_eq!(reason(&v), SeqReject::WrongSigner, "on an empty store");
+        let stored = vec![attested_row(&next, G, 1, b"a")];
+        let late = signed_row(&old, G, 2, b"b");
+        let v = check_rows(&c, G, vec![late], &mut Stored(stored)).unwrap();
+        assert_eq!(reason(&v), SeqReject::WrongSigner, "after attested rows");
     }
 
-    /// §B13 rule 3: a joiner that attested its old rows at the upgrade
-    /// and later became the sequencer serves [attested, revoked, its own].
+    /// §C4.7: after a handover the successor serves the former sequencer's
+    /// rows under its own attestations, then its own rows.
     #[test]
-    fn an_attested_prefix_does_not_block_the_revoked_sequencers_history() {
+    fn the_successors_attested_history_is_accepted() {
         let (old, next) = (KeySigner::new(), KeySigner::new());
         let c = ctx(&next, &[&old, &next], &[&old]);
         let history = vec![
-            attested_row(&next, G, 1, b"attested 1"),
-            attested_row(&next, G, 2, b"attested 2"),
-            signed_row(&old, G, 3, b"old sequencer 3"),
-            signed_row(&old, G, 4, b"old sequencer 4"),
-            signed_row(&next, G, 5, b"successor 5"),
+            attested_row(&next, G, 1, b"attested at the upgrade"),
+            attested_row(&next, G, 2, b"old sequencer 2, attested at the handover"),
+            attested_row(&next, G, 3, b"old sequencer 3, attested at the handover"),
+            signed_row(&next, G, 4, b"successor 4"),
         ];
         let v = check_rows(&c, G, history.clone(), &mut Stored::default()).unwrap();
-        assert_eq!(accepted_ids(&v), vec![1, 2, 3, 4, 5]);
+        assert_eq!(accepted_ids(&v), vec![1, 2, 3, 4]);
         let v = check_rows(
             &c,
             G,
@@ -880,8 +827,8 @@ mod tests {
             &mut Stored(history[..2].to_vec()),
         )
         .unwrap();
-        assert_eq!(accepted_ids(&v), vec![3, 4, 5], "across frames too");
-        let late = signed_row(&old, G, 6, b"late");
+        assert_eq!(accepted_ids(&v), vec![3, 4], "across frames too");
+        let late = signed_row(&old, G, 5, b"late");
         let v = check_rows(&c, G, vec![late], &mut Stored(history)).unwrap();
         assert_eq!(reason(&v), SeqReject::WrongSigner);
     }
@@ -915,29 +862,31 @@ mod tests {
         assert_eq!(reason(&v), SeqReject::WrongSigner);
     }
 
-    /// §C4.7: a DM the now-revoked installation created and sequenced,
-    /// with no attestations, is accepted up to the successor's first row.
+    /// Right after the upgrade every held history is attestations only;
+    /// a revoked key still cannot append to it.
     #[test]
-    fn a_dm_ordered_by_a_revoked_installation_is_accepted_before_the_successor() {
-        let (old, next) = (KeySigner::new(), KeySigner::new());
-        let c = ctx(&next, &[&old, &next], &[&old]);
-        let stored = vec![signed_row(&old, G, 1, b"a"), signed_row(&old, G, 2, b"b")];
-        let v = check_rows(
-            &c,
-            G,
-            vec![signed_row(&old, G, 3, b"c")],
-            &mut Stored(stored.clone()),
-        )
-        .unwrap();
-        assert_eq!(accepted_ids(&v), vec![3], "only revoked rows below");
-        let v = check_rows(
-            &c,
-            G,
-            vec![signed_row(&next, G, 3, b"c")],
-            &mut Stored(stored),
-        )
-        .unwrap();
-        assert_eq!(accepted_ids(&v), vec![3]);
+    fn a_revoked_key_cannot_append_after_attestation_only_history() {
+        let (s, stolen) = (KeySigner::new(), KeySigner::new());
+        let c = ctx(&s, &[&s, &stolen], &[&stolen]);
+        let attested: Vec<_> = (1..=3)
+            .map(|id| attested_row(&s, G, id, &[id as u8]))
+            .collect();
+        let forged = signed_row(&stolen, G, 4, b"forged");
+        let v = check_rows(&c, G, vec![forged.clone()], &mut Stored(attested.clone())).unwrap();
+        assert_eq!(reason(&v), SeqReject::WrongSigner, "stored attestations");
+        let mut frame = attested;
+        frame.push(forged);
+        let v = check_rows(&c, G, frame, &mut Stored::default()).unwrap();
+        assert_eq!(reason(&v), SeqReject::WrongSigner, "one frame, fresh store");
+    }
+
+    #[test]
+    fn a_live_members_attestation_at_a_new_id_is_a_wrong_signer() {
+        let (s, member) = (KeySigner::new(), KeySigner::new());
+        let c = ctx(&s, &[&s, &member], &[]);
+        let row = attested_row(&member, G, 1, b"a");
+        let v = check_rows(&c, G, vec![row], &mut Stored::default()).unwrap();
+        assert_eq!(reason(&v), SeqReject::WrongSigner);
     }
 
     /// The node knows the pinned sequencer is revoked: the §C4.7 re-pin is

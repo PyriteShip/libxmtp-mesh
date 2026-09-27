@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::MeshError;
 use crate::sync::HelloSigner;
-use crate::sync::seq::{self, Equivocation, SeqCounters, SeqProof, StoredSigners};
+use crate::sync::seq::{self, Equivocation, SeqCounters, SeqProof};
 
 mod relay;
 #[cfg(test)]
@@ -100,11 +100,12 @@ struct EquivocationRow {
     signature_b: Vec<u8>,
 }
 
-/// A row with no proof yet, for [`MeshStore::sign_unsigned_rows`]. Carries
+/// A row to (re)sign, for [`MeshStore::sign_unsigned_rows`] and
+/// [`MeshStore::attest_foreign_rows`]. Carries
 /// `data_hash` (already `sha256(data)`) rather than the payload itself, so
 /// signing every unsigned row need not load each one's full `data` blob.
 #[derive(QueryableByName)]
-struct UnsignedRow {
+struct RowToSign {
     #[diesel(sql_type = Binary)]
     group_id: Vec<u8>,
     #[diesel(sql_type = BigInt)]
@@ -116,14 +117,6 @@ struct UnsignedRow {
     /// Stored before signed sequencing: signed as an attestation.
     #[diesel(sql_type = Bool)]
     seq_legacy: bool,
-}
-
-#[derive(QueryableByName)]
-struct SignerRow {
-    #[diesel(sql_type = Nullable<Binary>)]
-    seq_signer: Option<Vec<u8>>,
-    #[diesel(sql_type = Bool)]
-    seq_attested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, QueryableByName)]
@@ -575,6 +568,9 @@ impl MeshStore {
                 .execute(&mut s.conn)?;
             // §R4.5: the new sequencer offers the relay key again.
             s.relay_unconfirm_for_repin(group_id)?;
+            // §B13: vouch for the history we hold, so we serve only our own
+            // proofs. Without a signer, the next start_sync does it.
+            s.attest_foreign_rows(Some(group_id))?;
             let mut rows = Vec::new();
             for message in s.pending_for(group_id)? {
                 let (row, inserted) = s.append_sequenced(&message, now_ns)?;
@@ -811,7 +807,7 @@ impl MeshStore {
             // `data_hash` is already `sha256(data)` (see `insert_group_row`),
             // so signing every unsigned row need not load each one's full
             // payload under the store mutex.
-            let rows: Vec<UnsignedRow> = sql_query(
+            let rows: Vec<RowToSign> = sql_query(
                 "SELECT group_id, id, created_ns, data_hash, seq_legacy FROM group_messages \
                  WHERE seq_signer IS NULL OR seq_signature IS NULL ORDER BY group_id, id",
             )
@@ -825,20 +821,65 @@ impl MeshStore {
                     row.data_hash.clone(),
                     row.seq_legacy,
                 )?;
-                sql_query(
-                    "UPDATE group_messages SET seq_signer = ?, seq_signature = ?, seq_attested = ? \
-                     WHERE group_id = ? AND id = ?",
-                )
-                .bind::<Binary, _>(&proof.signer)
-                .bind::<Binary, _>(&proof.signature)
-                .bind::<Bool, _>(proof.attested)
-                .bind::<Binary, _>(&row.group_id)
-                .bind::<BigInt, _>(row.id)
-                .execute(&mut s.conn)?;
+                s.set_proof(&row.group_id, row.id, &proof)?;
             }
             s.seq.count_signed(rows.len() as u64);
             Ok(rows.len() as u64)
         })
+    }
+
+    /// Re-sign, as this node's own attestations, the rows it holds in
+    /// groups pinned to it that another installation signed (all such
+    /// groups, or just `group_id`), in one transaction. After a §C4.7
+    /// handover to this node the history it serves carries only its own
+    /// proofs, which a node pinned to it accepts (§B13 rule 3). Run at the
+    /// re-pin and by `start_sync` (a re-pin while no signer is set). Returns
+    /// how many were signed; 0 without a signer.
+    pub fn attest_foreign_rows(&mut self, group_id: Option<&[u8]>) -> Result<u64, MeshError> {
+        let Some(signer) = self.seq_signer.clone() else {
+            return Ok(0);
+        };
+        let key = signer.installation_key();
+        self.transaction(|s| {
+            let rows: Vec<RowToSign> = sql_query(
+                "SELECT m.group_id, m.id, m.created_ns, m.data_hash, m.seq_legacy \
+                 FROM group_messages m JOIN groups g ON g.group_id = m.group_id \
+                 WHERE g.sequencer = ? AND m.seq_signer IS NOT NULL AND m.seq_signer != ? \
+                 AND (? IS NULL OR m.group_id = ?) ORDER BY m.group_id, m.id",
+            )
+            .bind::<Binary, _>(&key)
+            .bind::<Binary, _>(&key)
+            .bind::<Nullable<Binary>, _>(group_id)
+            .bind::<Nullable<Binary>, _>(group_id)
+            .load(&mut s.conn)?;
+            for row in &rows {
+                let proof = seq::sign_hashed(
+                    signer.as_ref(),
+                    &row.group_id,
+                    row.id as u64,
+                    row.created_ns as u64,
+                    row.data_hash.clone(),
+                    true,
+                )?;
+                s.set_proof(&row.group_id, row.id, &proof)?;
+            }
+            s.seq.count_signed(rows.len() as u64);
+            Ok(rows.len() as u64)
+        })
+    }
+
+    fn set_proof(&mut self, group_id: &[u8], id: i64, proof: &SeqProof) -> Result<(), MeshError> {
+        sql_query(
+            "UPDATE group_messages SET seq_signer = ?, seq_signature = ?, seq_attested = ? \
+             WHERE group_id = ? AND id = ?",
+        )
+        .bind::<Binary, _>(&proof.signer)
+        .bind::<Binary, _>(&proof.signature)
+        .bind::<Bool, _>(proof.attested)
+        .bind::<Binary, _>(group_id)
+        .bind::<BigInt, _>(id)
+        .execute(&mut self.conn)?;
+        Ok(())
     }
 
     /// The stored row `(group_id, id)`, if any.
@@ -854,20 +895,6 @@ impl MeshStore {
         .bind::<BigInt, _>(id)
         .load(&mut self.conn)?;
         Ok(rows.into_iter().next())
-    }
-
-    /// The distinct `(seq_signer, seq_attested)` pairs of the group's
-    /// stored rows, in no particular order.
-    pub(crate) fn seq_signers(&mut self, group_id: &[u8]) -> Result<StoredSigners, MeshError> {
-        let rows: Vec<SignerRow> = sql_query(
-            "SELECT DISTINCT seq_signer, seq_attested FROM group_messages WHERE group_id = ?",
-        )
-        .bind::<Binary, _>(group_id)
-        .load(&mut self.conn)?;
-        Ok(rows
-            .into_iter()
-            .map(|r| (r.seq_signer, r.seq_attested))
-            .collect())
     }
 
     /// Keep `e` as proof (the first one seen per `(group_id, id, signer)`),

@@ -240,13 +240,9 @@ fn rows_are_looked_up_by_id_with_their_signers() {
     s.append_sequenced(&msg(b"g", b"signed"), 2).unwrap();
     assert_eq!(s.sequenced_at(b"g", 2).unwrap().unwrap().data, b"signed");
     assert!(s.sequenced_at(b"g", 3).unwrap().is_none());
-    s.append_sequenced(&msg(b"g", b"signed again"), 3).unwrap();
-    let mut signers = s.seq_signers(b"g").unwrap();
-    signers.sort();
     assert_eq!(
-        signers,
-        vec![(None, false), (Some(signer.installation_key()), false)],
-        "distinct pairs"
+        s.sequenced_at(b"g", 2).unwrap().unwrap().seq_signer,
+        Some(signer.installation_key())
     );
 }
 
@@ -265,15 +261,99 @@ fn a_stored_proof_keeps_its_attestation_flag() {
     assert_eq!(rows, vec![attested.clone(), signed.clone()]);
     assert!(rows[0].proof().attested && !rows[1].proof().attested);
     assert!(seq::verify_proof(b"g", 1, 10, b"a", &rows[0].proof()));
-    let mut signers = s.seq_signers(b"g").unwrap();
-    signers.sort();
-    assert_eq!(
-        signers,
-        vec![
-            (Some(signer.installation_key()), false),
-            (Some(signer.installation_key()), true)
-        ]
+}
+
+/// No stored rows: what a fresh node that fetches a group's history sees.
+struct NoRows;
+
+impl seq::RowLookup for NoRows {
+    fn max_id(&mut self) -> Result<i64, MeshError> {
+        Ok(0)
+    }
+    fn stored_at(&mut self, _id: i64) -> Result<Option<StoredGroupMessage>, MeshError> {
+        Ok(None)
+    }
+}
+
+/// §C4.7 + §B13: B holds rows the revoked A1 ordered. Re-pinning the group
+/// to itself, B re-signs them as its own attestations in the same
+/// transaction, so a fresh node pinned to B accepts B's whole history.
+#[test]
+fn a_repin_to_self_attests_the_held_history() {
+    let mut s = MeshStore::open_in_memory().unwrap();
+    let (a1, b) = (KeySigner::new(), Arc::new(KeySigner::new()));
+    let (a1_key, b_key) = (a1.installation_key(), b.installation_key());
+    s.pin_sequencer(b"g", &a1_key).unwrap();
+    for id in 1..=3 {
+        let row = seq::signed_row(&a1, b"g", id, &[id as u8]);
+        assert_eq!(s.insert_sequenced(&row).unwrap(), InsertOutcome::Inserted);
+    }
+    s.set_seq_signer(b.clone());
+    s.add_pending(&msg(b"g", b"pending"), 1).unwrap();
+    let drained = s
+        .repin_sequencer_and_drain_pending(b"g", &b_key, 99)
+        .unwrap();
+    assert_eq!(drained.len(), 1);
+
+    let rows = s.query_group(b"g", 0, 10, false).unwrap();
+    assert_eq!(rows.len(), 4);
+    for row in &rows[..3] {
+        assert_eq!(row.seq_signer.as_deref(), Some(b_key.as_slice()));
+        assert!(row.seq_attested, "row {}", row.id);
+        assert!(seq::verify_proof(
+            b"g",
+            row.id as u64,
+            row.created_ns as u64,
+            &row.data,
+            &row.proof()
+        ));
+    }
+    assert!(!rows[3].seq_attested, "the drained row is B's own");
+    assert!(seq::verify_proof(b"g", 4, 99, b"pending", &rows[3].proof()));
+
+    let ctx = seq::SignerContext {
+        sequencer: Some(b_key.clone()),
+        known: [a1_key.clone(), b_key.clone()].into(),
+        revoked: [a1_key].into(),
+    };
+    let v = seq::check_rows(&ctx, b"g", rows, &mut NoRows).unwrap();
+    assert!(
+        matches!(v, seq::Verdict::Accept { ref new_rows, gap: None, .. } if new_rows.len() == 4),
+        "{v:?}"
     );
+}
+
+/// Without a signer (sync stopped) the re-pin leaves the proofs; the next
+/// start's `attest_foreign_rows` attests them. A group pinned elsewhere,
+/// or a row this node signed, is left as it is.
+#[test]
+fn held_rows_of_a_group_pinned_to_self_are_attested_once_a_signer_is_set() {
+    let mut s = MeshStore::open_in_memory().unwrap();
+    let (a1, b) = (KeySigner::new(), Arc::new(KeySigner::new()));
+    let b_key = b.installation_key();
+    let foreign = seq::signed_row(&a1, b"g", 1, b"a");
+    let own = seq::signed_row(b.as_ref(), b"g", 2, b"b");
+    let elsewhere = seq::signed_row(&a1, b"h", 1, b"c");
+    for row in [&foreign, &own, &elsewhere] {
+        s.insert_sequenced(row).unwrap();
+    }
+    s.pin_sequencer(b"h", &a1.installation_key()).unwrap();
+    s.repin_sequencer_and_drain_pending(b"g", &b_key, 5)
+        .unwrap();
+    assert_eq!(
+        s.sequenced_at(b"g", 1).unwrap().unwrap(),
+        foreign,
+        "no signer yet"
+    );
+
+    s.set_seq_signer(b.clone());
+    assert_eq!(s.attest_foreign_rows(None).unwrap(), 1);
+    assert_eq!(s.attest_foreign_rows(None).unwrap(), 0, "idempotent");
+    let row = s.sequenced_at(b"g", 1).unwrap().unwrap();
+    assert!(row.seq_attested && row.seq_signer.as_deref() == Some(b_key.as_slice()));
+    assert!(seq::verify_proof(b"g", 1, 10, b"a", &row.proof()));
+    assert_eq!(s.sequenced_at(b"g", 2).unwrap().unwrap(), own);
+    assert_eq!(s.sequenced_at(b"h", 1).unwrap().unwrap(), elsewhere);
 }
 
 #[test]

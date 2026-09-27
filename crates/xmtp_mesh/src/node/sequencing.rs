@@ -127,6 +127,41 @@ mod tests {
         assert_eq!(node.mesh_stats().seq_rows_signed, 2);
     }
 
+    /// §C4.7 + §B13: a re-pin to this node while sync was stopped leaves
+    /// the former sequencer's proofs; `start_sync` attests them as ours.
+    #[tokio::test]
+    async fn start_sync_attests_held_rows_of_groups_pinned_to_us() {
+        let (former, signer) = (KeySigner::new(), Arc::new(KeySigner::new()));
+        let node = MeshNode::in_memory().unwrap();
+        {
+            let mut store = node.inner.store.lock();
+            store
+                .set_local_installation(&signer.installation_key())
+                .unwrap();
+            store
+                .insert_sequenced(&seq::signed_row(&former, b"g", 1, b"a"))
+                .unwrap();
+            store
+                .repin_sequencer_and_drain_pending(b"g", &signer.installation_key(), 1)
+                .unwrap();
+        }
+        assert_eq!(
+            node.sequenced_rows_for_test(b"g").unwrap()[0].seq_signer,
+            Some(former.installation_key())
+        );
+
+        node.start_sync(
+            signer.clone(),
+            Arc::new(NoTransport),
+            Arc::new(Members(Some(vec![]))),
+        )
+        .unwrap();
+        let row = node.sequenced_rows_for_test(b"g").unwrap().remove(0);
+        assert_eq!(row.seq_signer, Some(signer.installation_key()));
+        assert!(row.seq_attested);
+        assert!(seq::verify_proof(b"g", 1, 10, b"a", &row.proof()));
+    }
+
     /// The review's Arc-cycle finding: a signer that itself holds a strong
     /// reference back to the node (as `ClientHelloSigner` does in
     /// production, through the client's own API bundle) must not be kept by
