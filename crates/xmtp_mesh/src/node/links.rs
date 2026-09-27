@@ -22,6 +22,10 @@ use crate::sync::session::Inbound;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::sync::session::LinkSetup;
 
+/// Most radio peers remembered in back-off; beyond it the soonest to
+/// expire goes.
+const MAX_RELAY_BACKOFFS: usize = 256;
+
 impl MeshNode {
     /// Derive this phone's link keys from the account key (the secp256k1
     /// key the recovery phrase restores). Call once per process start,
@@ -256,6 +260,40 @@ impl MeshNode {
             }
         };
         *self.inner.link.dialers.write() = dialers;
+    }
+
+    /// This phone closed `peer`'s relay link (idle, at the lifetime cap, or
+    /// relay off): refuse it as a stranger for the back-off (§B14.3), so
+    /// reconnecting cannot hold a radio slot.
+    pub(crate) fn back_off_relay_peer(&self, peer: &str) {
+        let now = std::time::Instant::now();
+        let until = now + *self.inner.relay_backoff.lock();
+        let mut backoffs = self.inner.relay_backoffs.lock();
+        backoffs.retain(|_, t| *t > now);
+        if backoffs.len() >= MAX_RELAY_BACKOFFS
+            && !backoffs.contains_key(peer)
+            && let Some(soonest) = backoffs
+                .iter()
+                .min_by_key(|(_, t)| **t)
+                .map(|(p, _)| p.clone())
+        {
+            backoffs.remove(&soonest);
+        }
+        backoffs.insert(peer.to_string(), until);
+    }
+
+    /// Whether `peer` is refused as a stranger right now; counted when so.
+    pub(crate) fn relay_peer_refused(&self, peer: &str) -> bool {
+        let refused = self
+            .inner
+            .relay_backoffs
+            .lock()
+            .get(peer)
+            .is_some_and(|t| *t > std::time::Instant::now());
+        if refused {
+            self.inner.link.counters.count_relay_backoff_refused();
+        }
+        refused
     }
 
     /// A stranger relay link opened on session `session_id` (§B14.5).

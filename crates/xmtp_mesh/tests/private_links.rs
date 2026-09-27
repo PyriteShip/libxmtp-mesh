@@ -9,14 +9,16 @@ use std::time::Duration;
 
 use common::peer_on;
 use common::{
-    ClientGroupMembership, ClientHelloSigner, TestPeer, build_client, eventually, pair_dm, peer,
-    recorded_peer, relay_peer, send_and_see,
+    ClientGroupMembership, ClientHelloSigner, TestPeer, build_client, eventually,
+    fast_relay_config, pair_dm, peer, recorded_peer, relay_peer, relay_peer_with, send_and_see,
 };
 use xmtp_cryptography::utils::generate_local_wallet;
 use xmtp_db::group::GroupQueryArgs;
 use xmtp_mesh::frames::{self, Auth, Hello, Interest, KeyPackage, SpoolWant, frame::Body};
 use xmtp_mesh::link::{WINDOW_SECS, service_data};
-use xmtp_mesh::{AdvertMatch, DialIntent, LoopbackHub, MAX_FRAME_LEN, MeshError, MeshNode};
+use xmtp_mesh::{
+    AdvertMatch, DialIntent, LoopbackHub, MAX_FRAME_LEN, MeshError, MeshNode, RelayConfig,
+};
 use xmtp_mesh::{HelloSigner, LinkRole, MeshTransport, PeerId};
 
 fn inbox(p: &TestPeer) -> String {
@@ -194,6 +196,14 @@ async fn a_relay_link_carries_relay_frames_only() {
         Body::KeyPackage(KeyPackage {
             installation_key: a.installation(),
             key_package: vec![3; 10],
+        }),
+        // Relay keys travel only on contact links (§R4.5).
+        Body::RelayKeyOffer(frames::RelayKeyOffer {
+            group_id: b"g".to_vec(),
+            ..Default::default()
+        }),
+        Body::RelayKeyAck(frames::RelayKeyAck {
+            group_id: b"g".to_vec(),
         }),
     ];
     for (n, body) in forbidden.into_iter().enumerate() {
@@ -618,7 +628,10 @@ async fn empty_digests_do_not_keep_a_relay_link_open() {
         tokio::time::sleep(Duration::from_millis(500)).await;
         hub.inject("a", "b", digest(0));
     }
-    eventually("b closes the link", || async { !hub.is_linked("a", "b") }).await;
+    assert!(
+        !hub.is_linked("a", "b"),
+        "closed while the empty digests kept coming"
+    );
     let stats = b.node.mesh_stats();
     assert_eq!(
         (
@@ -1516,4 +1529,149 @@ async fn the_cap_closes_open_and_in_flight_pairings() {
     .await;
     assert!(b.node.pending_pairings().is_empty());
     assert!(b.node.contacts().unwrap().is_empty());
+}
+
+/// §R5.4: one stranger link keeps to its own budget; several stranger
+/// links together keep to the per-window cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn stranger_relay_limits_hold_per_link_and_per_window() {
+    let hub = LoopbackHub::new();
+    let cfg = RelayConfig {
+        max_entries: 16,
+        neighbour_envelopes_per_min: 1,
+        stranger_window_factor: 4,
+        ..fast_relay_config()
+    };
+    let (r, _) = relay_peer_with(&hub, "r", cfg).await;
+    // Pin r a few seconds into a window, so the test never straddles one.
+    let now = r.node.unix_now();
+    r.node
+        .set_clock_offset_for_test((WINDOW_SECS - now % WINDOW_SECS) as i64 + 5);
+    let mut strangers = Vec::new();
+    for i in 0..5 {
+        let name = format!("s{i}");
+        let (s, _) = relay_peer(&hub, &name).await;
+        hub.set_strangers(&name, "r");
+        strangers.push(s);
+    }
+    // One stranger link: burst = share cap = 4, refill 1/min.
+    hub.link("s0", "r");
+    eventually("s0 linked", || async {
+        r.node.mesh_stats().links_relay == 1
+    })
+    .await;
+    for _ in 0..6 {
+        strangers[0].node.originate_random_for_test(100, 5);
+    }
+    eventually("r took 4 of 6", || async {
+        let s = r.node.relay_stats();
+        s.accepted == 4 && s.dropped_rate == 2
+    })
+    .await;
+    // Four more stranger links, 4 envelopes each: 16 per window in all.
+    for (i, stranger) in strangers.iter().enumerate().skip(1) {
+        hub.link(&format!("s{i}"), "r");
+        eventually("linked", || async {
+            r.node.mesh_stats().links_relay == i as u64 + 1
+        })
+        .await;
+        for _ in 0..4 {
+            stranger.node.originate_random_for_test(100, 5);
+        }
+        eventually("r saw them", || async {
+            let s = r.node.relay_stats();
+            s.accepted + s.dropped_rate == 6 + 4 * i as u64
+        })
+        .await;
+    }
+    let s = r.node.relay_stats();
+    assert_eq!(s.accepted, 16, "{s:?}");
+    assert_eq!(s.dropped_rate, 6, "{s:?}");
+}
+
+/// §B14.3: after closing a stranger link (idle here), a phone refuses the
+/// same radio peer as a stranger for a short back-off, whether it would
+/// accept or dial, counted; once the back-off is over, a relay link opens.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_relay_link_backs_off_the_same_peer() {
+    let hub = LoopbackHub::new();
+    let (a, _) = relay_peer(&hub, "a").await;
+    let (b, _) = relay_peer(&hub, "b").await;
+    b.node
+        .set_relay_idle_timeout_for_test(Duration::from_millis(400));
+    b.node.set_relay_backoff_for_test(Duration::from_secs(3));
+    hub.set_strangers("a", "b");
+    hub.link("a", "b");
+    eventually("a relay link", || async {
+        b.node.mesh_stats().links_relay == 1
+    })
+    .await;
+    eventually("b closes the quiet link", || async {
+        !hub.is_linked("a", "b")
+    })
+    .await;
+    assert_eq!(b.node.mesh_stats().relay_links_idle_closed, 1);
+    // a dials, b accepts: refused once the handshake names a relay link.
+    hub.link_as("a", "b", DialIntent::Relay);
+    eventually("b refuses a", || async {
+        b.node.mesh_stats().relay_links_backoff_refused == 1
+    })
+    .await;
+    eventually("closed", || async { !hub.is_linked("a", "b") }).await;
+    // b dials: it skips a.
+    hub.link_as("b", "a", DialIntent::Relay);
+    eventually("b skips a", || async {
+        b.node.mesh_stats().relay_links_backoff_refused == 2
+    })
+    .await;
+    eventually("closed", || async { !hub.is_linked("a", "b") }).await;
+    let stats = b.node.mesh_stats();
+    assert_eq!(
+        (stats.links_relay, stats.handshake_failed),
+        (1, 0),
+        "{stats:?}"
+    );
+    // The back-off is over: a new relay link opens.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    hub.link_as("a", "b", DialIntent::Relay);
+    eventually("relinked", || async {
+        b.node.mesh_stats().links_relay == 2 && a.node.mesh_stats().links_relay >= 2
+    })
+    .await;
+    assert_eq!(b.node.mesh_stats().relay_links_backoff_refused, 2);
+}
+
+/// §B14.3: a digest or want whose ids are all malformed is not useful
+/// traffic: it does not keep a stranger link open.
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_digest_ids_do_not_keep_a_relay_link_open() {
+    let hub = LoopbackHub::new();
+    let (_a, b) = relay_strangers(&hub, Duration::from_millis(600), Duration::from_secs(60)).await;
+    let bad = |want: bool| {
+        let ids = vec![vec![9u8; 3], vec![]];
+        frames::encode(if want {
+            Body::SpoolWant(SpoolWant { ids })
+        } else {
+            Body::SpoolDigest(frames::SpoolDigest { ids })
+        })
+    };
+    for n in 0..6 {
+        if !hub.is_linked("a", "b") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        hub.inject("a", "b", bad(n % 2 == 1));
+    }
+    assert!(
+        !hub.is_linked("a", "b"),
+        "closed while the malformed digests kept coming"
+    );
+    let stats = b.node.mesh_stats();
+    assert_eq!(
+        (
+            stats.relay_links_idle_closed,
+            stats.relay_links_force_closed
+        ),
+        (1, 0)
+    );
 }

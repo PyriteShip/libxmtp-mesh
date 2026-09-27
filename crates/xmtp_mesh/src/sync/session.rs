@@ -418,6 +418,17 @@ impl Session {
             return;
         }
         self.handshake_deadline = Some(Instant::now() + self.node.handshake_timeout());
+        // A stranger this phone just closed a relay link to waits out the
+        // back-off (§B14.3): not dialed again yet.
+        if matches!(self.role, LinkRole::Dial(DialIntent::Relay))
+            && self.node.relay_peer_refused(&self.peer)
+        {
+            tracing::info!(peer = %self.peer, "relay peer backing off; not dialing it");
+            if !self.is_cancelled() {
+                self.transport.disconnect(&self.peer);
+            }
+            return;
+        }
         if let Err(e) = self.start_link() {
             tracing::warn!(peer = %self.peer, error = %e, "mesh link not started");
             self.node.link_counters().count_handshake_failed();
@@ -449,6 +460,7 @@ impl Session {
                         self.node.link_counters().count_handshake_failed();
                     }
                     if self.state == State::RelayOnly {
+                        self.node.back_off_relay_peer(&self.peer);
                         if self.relay_ends_at.is_some_and(|end| Instant::now() >= end) {
                             self.node.link_counters().count_relay_force_closed();
                             tracing::info!(peer = %self.peer, "relay link at its lifetime cap; closing it");
@@ -644,6 +656,11 @@ impl Session {
             self.node.link_counters().count_handshake_failed();
             return Err(MeshError::LinkAuthFailed(
                 "relay link while relay is off".into(),
+            ));
+        }
+        if open.kind == LinkKind::Relay && self.node.relay_peer_refused(&self.peer) {
+            return Err(MeshError::LinkAuthFailed(
+                "relay link from a peer still backing off".into(),
             ));
         }
         if open.kind == LinkKind::Contact {

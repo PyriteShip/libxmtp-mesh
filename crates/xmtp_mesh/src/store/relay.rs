@@ -5,6 +5,7 @@ use diesel::sql_types::{BigInt, Binary, Bool, Integer};
 
 use super::{GROUP_COLUMNS, I64Row, MeshStore, NewGroupMessage, PendingRow, StoredGroupMessage};
 use crate::MeshError;
+use crate::relay::STRANGER_SOURCE_LEN;
 
 /// One envelope held for others.
 #[derive(Debug, Clone, PartialEq, QueryableByName)]
@@ -195,6 +196,26 @@ impl MeshStore {
                 .bind::<Binary, _>(installation)
                 .load(&mut self.conn)?;
         Ok(rows[0].v)
+    }
+
+    /// Spool entries that arrived over stranger links.
+    pub fn spool_count_strangers(&mut self) -> Result<i64, MeshError> {
+        let rows: Vec<I64Row> = sql_query(format!(
+            "SELECT COUNT(*) AS v FROM relay_spool WHERE length(from_installation) = {STRANGER_SOURCE_LEN}"
+        ))
+        .load(&mut self.conn)?;
+        Ok(rows[0].v)
+    }
+
+    /// Drop the stranger entry soonest to expire (newest wins, §R5.4).
+    pub fn spool_evict_soonest_stranger(&mut self) -> Result<bool, MeshError> {
+        let n = sql_query(format!(
+            "DELETE FROM relay_spool WHERE hash = \
+             (SELECT hash FROM relay_spool WHERE length(from_installation) = {STRANGER_SOURCE_LEN} \
+              ORDER BY drop_at ASC LIMIT 1)"
+        ))
+        .execute(&mut self.conn)?;
+        Ok(n > 0)
     }
 
     pub fn spool_evict_soonest(&mut self) -> Result<bool, MeshError> {

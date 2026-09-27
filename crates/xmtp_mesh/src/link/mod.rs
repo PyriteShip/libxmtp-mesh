@@ -118,6 +118,7 @@ pub(crate) struct LinkCounters {
     discovery_resets: AtomicU64,
     relay_idle_closed: AtomicU64,
     relay_force_closed: AtomicU64,
+    relay_backoff_refused: AtomicU64,
     pairing_exhausted: AtomicU64,
 }
 
@@ -147,6 +148,10 @@ impl LinkCounters {
         self.relay_force_closed.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn count_relay_backoff_refused(&self) {
+        self.relay_backoff_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn count_pairing_exhausted(&self) {
         self.pairing_exhausted.fetch_add(1, Ordering::Relaxed);
     }
@@ -165,6 +170,7 @@ impl LinkCounters {
         stats.discovery_resets = get(&self.discovery_resets);
         stats.relay_links_idle_closed = get(&self.relay_idle_closed);
         stats.relay_links_force_closed = get(&self.relay_force_closed);
+        stats.relay_links_backoff_refused = get(&self.relay_backoff_refused);
         stats.pairing_attempts_exhausted = get(&self.pairing_exhausted);
     }
 }

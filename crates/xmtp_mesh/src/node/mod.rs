@@ -61,6 +61,11 @@ pub(crate) struct NodeInner {
     pub(crate) relay_idle_timeout: Mutex<Duration>,
     /// How long a relay link may stay open at all.
     pub(crate) relay_link_lifetime: Mutex<Duration>,
+    /// How long a radio peer is refused as a stranger after its relay link
+    /// was closed idle or at a cap (§B14.3).
+    pub(crate) relay_backoff: Mutex<Duration>,
+    /// Radio peers refused as strangers until the given instant.
+    pub(crate) relay_backoffs: Mutex<HashMap<PeerId, std::time::Instant>>,
     /// How long an open pairing link waits for both people to confirm.
     pub(crate) pairing_timeout: Mutex<Duration>,
     /// Test only: never send our identity log to peers.
@@ -125,6 +130,15 @@ pub(crate) const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Longest a relay (stranger) link stays open, busy or not (§B14.3).
 pub(crate) const RELAY_LINK_LIFETIME: Duration = Duration::from_secs(600);
+
+/// How long a phone refuses a radio peer as a stranger (accepting or
+/// dialing a relay link) after it closed that peer's relay link for
+/// idleness, at the lifetime cap or because relay went off (§B14.3).
+/// Half the idle bound: a stranger that keeps reconnecting to hold a slot
+/// costs at most one handshake per 30 s, while a stranger with real
+/// traffic waits less than the first DM retry (2 min) and far less than
+/// an envelope's hold (10 min).
+pub(crate) const RELAY_BACKOFF: Duration = Duration::from_secs(30);
 
 /// How long an open pairing link waits for both people to compare and
 /// confirm the code before it closes (§B14.4).
@@ -224,6 +238,8 @@ impl MeshNode {
                 handshake_timeout: Mutex::new(HANDSHAKE_TIMEOUT),
                 relay_idle_timeout: Mutex::new(RELAY_IDLE_TIMEOUT),
                 relay_link_lifetime: Mutex::new(RELAY_LINK_LIFETIME),
+                relay_backoff: Mutex::new(RELAY_BACKOFF),
+                relay_backoffs: Mutex::new(HashMap::new()),
                 pairing_timeout: Mutex::new(PAIRING_TIMEOUT),
                 suppress_identity_log: AtomicBool::new(false),
                 suppress_group_push: AtomicBool::new(false),

@@ -78,6 +78,14 @@ pub(crate) fn accept(
                 share_evicted += 1;
             }
         }
+        // All strangers together hold at most their joint share (§R5.4).
+        if crate::relay::is_stranger(from) {
+            while s.spool_count_strangers()? >= cfg.stranger_share_cap() as i64
+                && s.spool_evict_soonest_stranger()?
+            {
+                share_evicted += 1;
+            }
+        }
         loop {
             let (n, bytes) = s.spool_totals()?;
             if (n as usize) < cfg.max_entries && bytes as usize + sealed.len() <= cfg.max_bytes {
@@ -444,5 +452,40 @@ mod tests {
         );
         let mins: Vec<u64> = c.retry_after.iter().map(|d| d.as_secs() / 60).collect();
         assert_eq!(mins, vec![2, 5, 15, 60]);
+    }
+
+    /// §R5.4: stranger links share one spool cap between them; a contact's
+    /// share is its own.
+    #[test]
+    fn strangers_together_keep_to_their_spool_cap() {
+        let cfg = RelayConfig {
+            max_entries: 16,
+            max_bytes: 16 * 512,
+            stranger_window_factor: 2,
+            ..RelayConfig::default()
+        };
+        assert_eq!(cfg.stranger_share_cap(), 8);
+        let mut s = MeshStore::open_in_memory().unwrap();
+        let sources: Vec<Vec<u8>> = (0..3).map(|_| crate::relay::stranger_source()).collect();
+        for src in &sources {
+            for _ in 0..4 {
+                accept(&mut s, &cfg, 3, &sealed(10, (NOW + M) as u64), src, NOW).unwrap();
+            }
+        }
+        assert_eq!(s.spool_count_strangers().unwrap(), 8);
+        let contact = vec![9u8; 32];
+        for _ in 0..4 {
+            accept(
+                &mut s,
+                &cfg,
+                3,
+                &sealed(10, (NOW + M) as u64),
+                &contact,
+                NOW,
+            )
+            .unwrap();
+        }
+        assert_eq!(s.spool_count_from(&contact).unwrap(), 4);
+        assert_eq!(s.spool_count_strangers().unwrap(), 8);
     }
 }

@@ -264,6 +264,13 @@ impl MeshNode {
         *self.inner.relay_link_lifetime.lock() = lifetime;
     }
 
+    /// Applies to relay links closed from now on.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn set_relay_backoff_for_test(&self, backoff: Duration) {
+        *self.inner.relay_backoff.lock() = backoff;
+    }
+
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn suppress_identity_log_for_test(&self) {

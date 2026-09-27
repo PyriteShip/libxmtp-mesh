@@ -66,6 +66,34 @@ impl Neighbour {
     }
 }
 
+/// What all stranger links together pushed in the current discovery
+/// window (§R5.4, D31). Counters, not a bucket: they reset at the boundary.
+#[derive(Debug, Default)]
+pub(crate) struct StrangerWindow {
+    window: u64,
+    envelopes: u64,
+    bytes: u64,
+}
+
+impl StrangerWindow {
+    pub(crate) fn fits(&mut self, window: u64, len: u64, cfg: &RelayConfig) -> bool {
+        if window != self.window {
+            *self = Self {
+                window,
+                envelopes: 0,
+                bytes: 0,
+            };
+        }
+        self.envelopes < cfg.stranger_window_envelopes()
+            && self.bytes.saturating_add(len) <= cfg.stranger_window_bytes()
+    }
+
+    pub(crate) fn take(&mut self, len: u64) {
+        self.envelopes += 1;
+        self.bytes = self.bytes.saturating_add(len);
+    }
+}
+
 /// Most neighbour budgets kept; beyond it the fullest unlinked one goes.
 const MAX_NEIGHBOURS: usize = 256;
 
@@ -75,6 +103,8 @@ pub(crate) struct EngineState {
     neighbours: HashMap<Vec<u8>, Neighbour>,
     global_envelopes: TokenBucket,
     global_bytes: TokenBucket,
+    /// All stranger links together, this discovery window (§R5.4).
+    strangers: StrangerWindow,
     pub(crate) stats: RelayStats,
     /// Per relayed DM: its send/retry schedule (§R6.1).
     pub(crate) dm: HashMap<Vec<u8>, super::dm::Schedule>,
@@ -102,6 +132,7 @@ impl EngineState {
                 cfg.global_bytes_per_min as f64,
                 now,
             ),
+            strangers: StrangerWindow::default(),
             stats: RelayStats::default(),
             dm: HashMap::new(),
             quarantine: super::dm::Quarantine::new(cfg.quarantine_max, cfg.quarantine_for),
@@ -314,7 +345,14 @@ impl RelayEngine {
     /// The phone's rate budget stays (pruned on tick once refilled), so a
     /// reconnect does not reset it (D18).
     fn link_down(&self, peer: &str) {
-        self.state.lock().links.remove(peer);
+        let mut st = self.state.lock();
+        if let Some(link) = st.links.remove(peer)
+            && crate::relay::is_stranger(&link.installation)
+        {
+            // A stranger link's id is never used again: its budget goes
+            // with it (the per-window cap still counts what it pushed).
+            st.neighbours.remove(&link.installation);
+        }
     }
 
     // ---- frames ----
@@ -326,11 +364,11 @@ impl RelayEngine {
         let mut useful = false;
         let result = match body {
             Body::SpoolDigest(d) => {
-                useful = !d.ids.is_empty();
+                useful = self.names_an_id(&d.ids);
                 self.on_digest(peer, d)
             }
             Body::SpoolWant(w) => {
-                useful = !w.ids.is_empty();
+                useful = self.names_an_id(&w.ids);
                 self.on_want(peer, w)
             }
             Body::Relay(env) => self.on_relay(peer, env).await.map(|new| useful = new),
@@ -351,6 +389,14 @@ impl RelayEngine {
                 false
             }
         }
+    }
+
+    /// Whether a digest or want names at least one id this engine would
+    /// read (8 bytes, within the first `max_entries`).
+    fn names_an_id(&self, ids: &[Vec<u8>]) -> bool {
+        ids.iter()
+            .take(self.cfg.max_entries)
+            .any(|id| id.len() == 8)
     }
 
     fn on_digest(&self, peer: &str, d: SpoolDigest) -> Result<(), MeshError> {
@@ -446,6 +492,10 @@ impl RelayEngine {
     async fn on_relay(self: &Arc<Self>, peer: &str, env: RelayEnvelope) -> Result<bool, MeshError> {
         let hash = envelope::hash(&env.sealed);
         let len = env.sealed.len() as f64;
+        let window = self
+            .node()
+            .map(|n| crate::link::window_at(n.unix_now()))
+            .unwrap_or(0);
         let within_rate = {
             let now = Instant::now();
             let mut st = self.state.lock();
@@ -454,6 +504,7 @@ impl RelayEngine {
                 neighbours,
                 global_envelopes,
                 global_bytes,
+                strangers,
                 stats,
                 ..
             } = &mut *st;
@@ -469,15 +520,22 @@ impl RelayEngine {
             let Some(nb) = neighbours.get_mut(&installation) else {
                 return Ok(false);
             };
+            // Each stranger link has its own budget (its id is per link);
+            // all of them together also keep to the window cap (§R5.4).
+            let stranger = crate::relay::is_stranger(&installation);
             let ok = nb.envelopes.allows(1.0, now)
                 && nb.bytes.allows(len, now)
                 && global_envelopes.allows(1.0, now)
-                && global_bytes.allows(len, now);
+                && global_bytes.allows(len, now)
+                && (!stranger || strangers.fits(window, len as u64, &self.cfg));
             if ok {
                 nb.envelopes.take(1.0);
                 nb.bytes.take(len);
                 global_envelopes.take(1.0);
                 global_bytes.take(len);
+                if stranger {
+                    strangers.take(len as u64);
+                }
             } else {
                 stats.dropped_rate += 1;
             }
@@ -678,6 +736,9 @@ impl RelayEngine {
             link.next_offer = now + self.cfg.key_reoffer;
             (link.inbox.clone(), link.installation.clone())
         };
+        if crate::relay::is_stranger(&installation) {
+            return; // relay keys travel only on direct contact links (§R4.5)
+        }
         let Ok(Some(local)) = node.local_installation() else {
             return;
         };
@@ -964,6 +1025,7 @@ impl MeshNode {
             old.push(sessions.remove(peer));
             self.forget_peer(peer);
             self.inner.link.counters.count_relay_force_closed();
+            self.back_off_relay_peer(peer);
         }
         drop(sessions);
         drop(old); // cancels those sessions
@@ -1571,5 +1633,58 @@ mod tests {
             .expect("the engine task stops once the engine is dropped")
             .unwrap();
         drop(events_tx);
+    }
+
+    /// Window boundary: all stranger links together get
+    /// `factor × share_cap` envelopes per window; a new window starts empty.
+    #[test]
+    fn the_stranger_window_caps_all_stranger_links_and_resets_at_the_boundary() {
+        let cfg = RelayConfig {
+            max_entries: 16,
+            stranger_window_factor: 4,
+            ..RelayConfig::default()
+        };
+        assert_eq!(cfg.stranger_window_envelopes(), 16);
+        let mut w = StrangerWindow::default();
+        for _ in 0..16 {
+            assert!(w.fits(7, 100, &cfg));
+            w.take(100);
+        }
+        assert!(!w.fits(7, 100, &cfg), "16 envelopes per window");
+        assert!(w.fits(8, 100, &cfg), "the next window starts empty");
+        assert!(
+            !w.fits(8, cfg.stranger_window_bytes() + 1, &cfg),
+            "bytes are capped too"
+        );
+    }
+
+    /// §R4.5: relay keys travel only on direct contact links. A stranger
+    /// link gets no offer, even when the engine would otherwise make one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stranger_link_is_never_offered_a_relay_key() {
+        let (node, sent) = relay_node(quiet());
+        node.relay_link_up("stranger", crate::relay::stranger_source(), "them".into());
+        node.relay_link_up("contact", vec![2; 32], "them".into());
+        let offers_to = |peer: &str| {
+            sent.0
+                .lock()
+                .iter()
+                .filter(|(p, f)| {
+                    p == peer
+                        && matches!(
+                            frames::decode(f),
+                            Ok(Body::RelayKeyOffer(_) | Body::RelayKeyAck(_))
+                        )
+                })
+                .count()
+        };
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while offers_to("contact") == 0 {
+            assert!(Instant::now() < deadline, "the contact link gets an offer");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(offers_to("stranger"), 0);
+        node.disable_relay();
     }
 }

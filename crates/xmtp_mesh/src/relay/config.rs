@@ -16,6 +16,10 @@ pub struct RelayConfig {
     pub neighbour_bytes_per_min: u32,
     pub global_envelopes_per_min: u32,
     pub global_bytes_per_min: u32,
+    /// All stranger (relay-only) links together, per 15-minute discovery
+    /// window: at most this many times one link's share cap in envelopes,
+    /// bytes and spool entries (§R5.4, D31).
+    pub stranger_window_factor: u32,
     /// Random wait before pushing a new envelope on, for timing privacy.
     pub push_delay_ms: (u64, u64),
     /// Random wait before a DM answer that a delivery triggered (an ack, or
@@ -46,6 +50,7 @@ impl Default for RelayConfig {
             neighbour_bytes_per_min: 256 * 1024,
             global_envelopes_per_min: 2000,
             global_bytes_per_min: 2560 * 1024,
+            stranger_window_factor: 4,
             push_delay_ms: (100, 500),
             answer_delay_ms: (2_000, 10_000),
             retry_after: [2, 5, 15, 60]
@@ -70,5 +75,18 @@ impl RelayConfig {
 
     pub fn share_cap_bytes(&self) -> usize {
         self.max_bytes / 4
+    }
+
+    pub fn stranger_window_envelopes(&self) -> u64 {
+        u64::from(self.stranger_window_factor) * self.share_cap() as u64
+    }
+
+    pub fn stranger_window_bytes(&self) -> u64 {
+        u64::from(self.stranger_window_factor) * self.share_cap_bytes() as u64
+    }
+
+    /// Most spool entries all strangers together may hold.
+    pub fn stranger_share_cap(&self) -> usize {
+        self.stranger_window_factor as usize * self.share_cap()
     }
 }
