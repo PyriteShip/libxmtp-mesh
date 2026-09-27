@@ -1022,7 +1022,11 @@ mod tests {
             .start_sync(client.clone(), Arc::new(NullTransport))
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("mesh:"), "{err}");
+        assert!(
+            err.to_string()
+                .contains(&xmtp_mesh::MeshError::NoAccountKey.to_string()),
+            "{err}"
+        );
         let info = node
             .set_account_key(xmtp_mesh::store::sha256(&client.installation_id()))
             .unwrap();

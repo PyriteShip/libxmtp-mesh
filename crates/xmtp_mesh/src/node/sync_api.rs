@@ -242,6 +242,17 @@ impl MeshNode {
         *self.inner.relay_idle_timeout.lock() = timeout;
     }
 
+    pub(crate) fn relay_link_lifetime(&self) -> Duration {
+        *self.inner.relay_link_lifetime.lock()
+    }
+
+    /// Applies to relay links opened from now on.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn set_relay_link_lifetime_for_test(&self, lifetime: Duration) {
+        *self.inner.relay_link_lifetime.lock() = lifetime;
+    }
+
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn suppress_identity_log_for_test(&self) {

@@ -116,6 +116,7 @@ pub(crate) struct LinkCounters {
     frame_rejected: AtomicU64,
     discovery_resets: AtomicU64,
     relay_idle_closed: AtomicU64,
+    relay_force_closed: AtomicU64,
 }
 
 impl LinkCounters {
@@ -140,6 +141,10 @@ impl LinkCounters {
         self.relay_idle_closed.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn count_relay_force_closed(&self) {
+        self.relay_force_closed.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn count_discovery_reset(&self) {
         self.discovery_resets.fetch_add(1, Ordering::Relaxed);
     }
@@ -153,6 +158,7 @@ impl LinkCounters {
         stats.link_frame_rejected = get(&self.frame_rejected);
         stats.discovery_resets = get(&self.discovery_resets);
         stats.relay_links_idle_closed = get(&self.relay_idle_closed);
+        stats.relay_links_force_closed = get(&self.relay_force_closed);
     }
 }
 

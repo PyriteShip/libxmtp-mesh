@@ -69,6 +69,11 @@ impl LinkTx {
         *self.state.lock() = TxState::Open(records, kind);
     }
 
+    /// An open relay (stranger) link.
+    pub(crate) fn is_relay_only(&self) -> bool {
+        matches!(&*self.state.lock(), TxState::Open(_, LinkKind::Relay))
+    }
+
     /// Send one frame. Returns whether it went out: not when the session
     /// was replaced, the frame is over [`MAX_FRAME_LEN`], the link is not
     /// open yet, the link kind may not carry it (a relay link carries relay
@@ -77,7 +82,10 @@ impl LinkTx {
         if self.is_cancelled() {
             return false;
         }
-        if let TxState::Open(_, kind) = &*self.state.lock()
+        // One lock for the whole send: the tap sees frames under it, so
+        // its order is the wire order.
+        let state = self.state.lock();
+        if let TxState::Open(_, kind) = &*state
             && !allowed_on(*kind, &body)
         {
             tracing::debug!(peer = %self.peer, ?kind, "frame not allowed on this link: dropped");
@@ -88,9 +96,6 @@ impl LinkTx {
             tracing::error!(peer = %self.peer, len = frame.len(), "refusing to send oversized mesh frame");
             return false;
         }
-        // The tap sees frames under the same lock, so its order is the
-        // wire order.
-        let state = self.state.lock();
         match &*state {
             TxState::Pending => {
                 tracing::debug!(peer = %self.peer, "frame before the link opened: dropped");

@@ -91,8 +91,16 @@ async fn a_carrier_walks_the_message_over() {
     hub.unlink("a", "d");
     hub.link("a", "b");
     send(&a_dm, b"carried").await;
-    eventually("b carries something", || async {
-        b.node.relay_stats().accepted >= 1
+    // A send may publish more than one row, each its own envelope: b must
+    // hold every envelope a originated (and a stop originating) before the
+    // carrier walks away.
+    eventually("b carries all a originated", || async {
+        let originated = a.node.relay_stats().originated;
+        if originated == 0 || b.node.relay_stats().accepted < originated {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        a.node.relay_stats().originated == originated
     })
     .await;
     hub.unlink("a", "b");

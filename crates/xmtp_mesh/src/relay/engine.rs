@@ -319,23 +319,37 @@ impl RelayEngine {
 
     // ---- frames ----
 
-    pub(crate) async fn on_frame(self: &Arc<Self>, peer: &str, body: Body) {
+    /// Handle one relay frame. Returns whether it was useful traffic: a
+    /// digest or want naming at least one id, or an envelope newly
+    /// accepted into the spool (what keeps a stranger link open, §B14.3).
+    pub(crate) async fn on_frame(self: &Arc<Self>, peer: &str, body: Body) -> bool {
+        let mut useful = false;
         let result = match body {
-            Body::SpoolDigest(d) => self.on_digest(peer, d),
-            Body::SpoolWant(w) => self.on_want(peer, w),
-            Body::Relay(env) => self.on_relay(peer, env).await,
+            Body::SpoolDigest(d) => {
+                useful = !d.ids.is_empty();
+                self.on_digest(peer, d)
+            }
+            Body::SpoolWant(w) => {
+                useful = !w.ids.is_empty();
+                self.on_want(peer, w)
+            }
+            Body::Relay(env) => self.on_relay(peer, env).await.map(|new| useful = new),
             Body::RelayKeyOffer(o) => self.on_key_offer(peer, o).await,
             Body::RelayKeyAck(a) => self.on_key_ack(peer, a).await,
             _ => Ok(()),
         };
         match result {
-            Ok(()) => {}
+            Ok(()) => useful,
             // Peer-caused (bad envelope, key, seal, signature).
             Err(e @ MeshError::Relay(_)) => {
-                tracing::debug!(peer, error = %e, "relay frame not used")
+                tracing::debug!(peer, error = %e, "relay frame not used");
+                false
             }
             // Ours (store, membership, ...): worth seeing.
-            Err(e) => tracing::warn!(peer, error = %e, "relay frame failed"),
+            Err(e) => {
+                tracing::warn!(peer, error = %e, "relay frame failed");
+                false
+            }
         }
     }
 
@@ -428,7 +442,8 @@ impl RelayEngine {
         Ok(())
     }
 
-    async fn on_relay(self: &Arc<Self>, peer: &str, env: RelayEnvelope) -> Result<(), MeshError> {
+    /// Returns whether the envelope was new to the spool.
+    async fn on_relay(self: &Arc<Self>, peer: &str, env: RelayEnvelope) -> Result<bool, MeshError> {
         let hash = envelope::hash(&env.sealed);
         let len = env.sealed.len() as f64;
         let within_rate = {
@@ -443,7 +458,7 @@ impl RelayEngine {
                 ..
             } = &mut *st;
             let Some(installation) = links.get(peer).map(|l| l.installation.clone()) else {
-                return Ok(());
+                return Ok(false);
             };
             let short = short_id(&hash);
             for l in links.values_mut() {
@@ -452,7 +467,7 @@ impl RelayEngine {
                 }
             }
             let Some(nb) = neighbours.get_mut(&installation) else {
-                return Ok(());
+                return Ok(false);
             };
             let ok = nb.envelopes.allows(1.0, now)
                 && nb.bytes.allows(len, now)
@@ -472,11 +487,11 @@ impl RelayEngine {
             // Not stored or pushed, but a recipient never misses its own
             // message to relay limits.
             self.deliver_unspooled(&hash, &env.sealed).await;
-            return Ok(());
+            return Ok(false);
         }
         let from = match self.state.lock().links.get(peer) {
             Some(l) => l.installation.clone(),
-            None => return Ok(()),
+            None => return Ok(false),
         };
         let node = self
             .node()
@@ -508,11 +523,14 @@ impl RelayEngine {
             Accept::New { hash, .. } => {
                 self.try_deliver(&env.sealed).await;
                 self.schedule_push(hash, peer.to_string());
+                Ok(true)
             }
-            Accept::Dropped(_) => self.deliver_unspooled(&hash, &env.sealed).await,
-            Accept::Duplicate => {}
+            Accept::Dropped(_) => {
+                self.deliver_unspooled(&hash, &env.sealed).await;
+                Ok(false)
+            }
+            Accept::Duplicate => Ok(false),
         }
-        Ok(())
     }
 
     /// Try to deliver a live envelope the limits kept out of the spool,
@@ -928,6 +946,32 @@ impl MeshNode {
     pub(crate) fn disable_relay_locked(&self) {
         let old = self.inner.relay.lock().take();
         drop(old); // dropping `_stop` ends the engine task
+        self.close_relay_only_links();
+    }
+
+    /// Relay is off: a stranger link has nothing left to carry, so close
+    /// every relay-only link (§B14.3), counted.
+    fn close_relay_only_links(&self) {
+        let transport = self.inner.sync.lock().as_ref().map(|c| c.transport.clone());
+        let mut sessions = self.inner.sessions.lock();
+        let peers: Vec<String> = sessions
+            .iter()
+            .filter(|(_, h)| h.link.is_relay_only())
+            .map(|(p, _)| p.clone())
+            .collect();
+        let mut old = Vec::with_capacity(peers.len());
+        for peer in &peers {
+            old.push(sessions.remove(peer));
+            self.forget_peer(peer);
+            self.inner.link.counters.count_relay_force_closed();
+        }
+        drop(sessions);
+        drop(old); // cancels those sessions
+        if let Some(transport) = transport {
+            for peer in &peers {
+                transport.disconnect(peer);
+            }
+        }
     }
 
     pub fn relay_enabled(&self) -> bool {
@@ -977,9 +1021,12 @@ impl MeshNode {
         }
     }
 
-    pub(crate) async fn on_relay_frame(&self, peer: &str, body: Body) {
-        if let Some(e) = self.relay_engine() {
-            e.on_frame(peer, body).await;
+    /// Returns whether the frame was useful relay traffic (see
+    /// `RelayEngine::on_frame`); never while relay is off.
+    pub(crate) async fn on_relay_frame(&self, peer: &str, body: Body) -> bool {
+        match self.relay_engine() {
+            Some(e) => e.on_frame(peer, body).await,
+            None => false,
         }
     }
 

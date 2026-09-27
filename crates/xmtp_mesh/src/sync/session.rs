@@ -228,6 +228,9 @@ pub(crate) struct Session {
     early_plain: Vec<Vec<u8>>,
     /// An open relay link closes when no relay frame arrived by then.
     relay_idle_at: Option<Instant>,
+    /// An open relay link closes then however busy it is, so a stranger
+    /// cannot hold a radio slot forever (§B14.3).
+    relay_ends_at: Option<Instant>,
     pub(crate) signer: Arc<dyn HelloSigner>,
     pub(crate) membership: Arc<dyn GroupMembership>,
     pub(crate) challenge: [u8; 32],
@@ -300,6 +303,7 @@ pub(crate) fn spawn(
         peer_spoke: setup.plain,
         early_plain: Vec::new(),
         relay_idle_at: None,
+        relay_ends_at: None,
         signer,
         membership,
         challenge: rand::random(),
@@ -375,7 +379,10 @@ impl Session {
             let deadline = match self.state {
                 State::Authenticated if self.verified => None,
                 State::Authenticated => self.verify_deadline,
-                State::RelayOnly => self.relay_idle_at,
+                State::RelayOnly => match (self.relay_idle_at, self.relay_ends_at) {
+                    (Some(idle), Some(end)) => Some(idle.min(end)),
+                    (idle, end) => idle.or(end),
+                },
                 State::Handshake | State::AwaitHello | State::AwaitAuth => self.handshake_deadline,
             };
             let retry_at = self.retry_at;
@@ -390,8 +397,13 @@ impl Session {
                         self.node.link_counters().count_handshake_failed();
                     }
                     if self.state == State::RelayOnly {
-                        self.node.link_counters().count_relay_idle_closed();
-                        tracing::info!(peer = %self.peer, "relay link idle; closing it");
+                        if self.relay_ends_at.is_some_and(|end| Instant::now() >= end) {
+                            self.node.link_counters().count_relay_force_closed();
+                            tracing::info!(peer = %self.peer, "relay link at its lifetime cap; closing it");
+                        } else {
+                            self.node.link_counters().count_relay_idle_closed();
+                            tracing::info!(peer = %self.peer, "relay link idle; closing it");
+                        }
                     } else if self.state == State::Authenticated {
                         tracing::warn!(peer = %self.peer, "peer did not prove inbox membership in time");
                     } else {
@@ -447,6 +459,8 @@ impl Session {
                 if self.state == State::Handshake || !self.peer_spoke {
                     if self.early_plain.len() < MAX_EARLY_PLAIN {
                         self.early_plain.push(frame);
+                    } else {
+                        tracing::debug!(peer = %self.peer, "too many early test frames; one dropped");
                     }
                     return Ok(());
                 }
@@ -578,7 +592,9 @@ impl Session {
             LinkKind::Relay => {
                 self.state = State::RelayOnly;
                 self.handshake_deadline = None;
-                self.relay_idle_at = Some(Instant::now() + self.node.relay_idle_timeout());
+                let now = Instant::now();
+                self.relay_idle_at = Some(now + self.node.relay_idle_timeout());
+                self.relay_ends_at = Some(now + self.node.relay_link_lifetime());
             }
             LinkKind::Contact | LinkKind::Pairing => self.state = State::AwaitHello,
         }
@@ -626,8 +642,11 @@ impl Session {
         }
         match (self.state, body) {
             (State::RelayOnly, body) => {
-                self.relay_idle_at = Some(Instant::now() + self.node.relay_idle_timeout());
-                self.node.on_relay_frame(&self.peer, body).await;
+                // Only useful traffic keeps a stranger link open: empty
+                // digests, duplicates or frames while relay is off do not.
+                if self.node.on_relay_frame(&self.peer, body).await {
+                    self.relay_idle_at = Some(Instant::now() + self.node.relay_idle_timeout());
+                }
                 Ok(())
             }
             (State::Handshake, _) => Ok(()),

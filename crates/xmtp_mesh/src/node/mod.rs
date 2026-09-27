@@ -59,6 +59,8 @@ pub(crate) struct NodeInner {
     pub(crate) handshake_timeout: Mutex<Duration>,
     /// How long an open relay link may go without a relay frame.
     pub(crate) relay_idle_timeout: Mutex<Duration>,
+    /// How long a relay link may stay open at all.
+    pub(crate) relay_link_lifetime: Mutex<Duration>,
     /// Test only: never send our identity log to peers.
     pub(crate) suppress_identity_log: AtomicBool,
     /// Test only: sessions drop live GroupSequenced pushes (simulates a lagged stream).
@@ -118,6 +120,9 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// relay frame before the node closes it, so a stranger cannot hold one of
 /// the radio's few connections forever (§B14.3).
 pub(crate) const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Longest a relay (stranger) link stays open, busy or not (§B14.3).
+pub(crate) const RELAY_LINK_LIFETIME: Duration = Duration::from_secs(600);
 
 pub(crate) struct SyncConfig {
     pub(crate) signer: Arc<dyn HelloSigner>,
@@ -212,6 +217,7 @@ impl MeshNode {
                 peer_verify_timeout: Mutex::new(PEER_VERIFY_TIMEOUT),
                 handshake_timeout: Mutex::new(HANDSHAKE_TIMEOUT),
                 relay_idle_timeout: Mutex::new(RELAY_IDLE_TIMEOUT),
+                relay_link_lifetime: Mutex::new(RELAY_LINK_LIFETIME),
                 suppress_identity_log: AtomicBool::new(false),
                 suppress_group_push: AtomicBool::new(false),
                 replaced_at: Mutex::new(HashMap::new()),
@@ -541,7 +547,7 @@ impl MeshNode {
 
     /// Clear `peer`'s authentication and presence, emitting `PeerLost` if it
     /// was verified. Callers hold `sessions`.
-    fn forget_peer(&self, peer: &str) {
+    pub(crate) fn forget_peer(&self, peer: &str) {
         self.relay_link_down(peer);
         self.inner.authenticated.lock().remove(peer);
         if self.inner.verified.lock().remove(peer).is_some() {

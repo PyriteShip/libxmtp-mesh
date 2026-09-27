@@ -574,3 +574,89 @@ async fn an_undecodable_frame_closes_a_relay_link() {
     .await;
     assert_eq!(b.node.mesh_stats().link_frame_rejected, 1);
 }
+
+/// Two strangers on a relay link, with `b`'s bounds shortened.
+async fn relay_strangers(
+    hub: &LoopbackHub,
+    idle: Duration,
+    lifetime: Duration,
+) -> (TestPeer, TestPeer) {
+    let (a, _) = relay_peer(hub, "a").await;
+    let (b, _) = relay_peer(hub, "b").await;
+    b.node.set_relay_idle_timeout_for_test(idle);
+    b.node.set_relay_link_lifetime_for_test(lifetime);
+    hub.set_strangers("a", "b");
+    hub.link("a", "b");
+    eventually("a relay link", || async {
+        a.node.mesh_stats().links_relay == 1 && b.node.mesh_stats().links_relay == 1
+    })
+    .await;
+    (a, b)
+}
+
+fn digest(ids: usize) -> Vec<u8> {
+    frames::encode(Body::SpoolDigest(frames::SpoolDigest {
+        ids: vec![vec![9u8; 8]; ids],
+    }))
+}
+
+/// §B14.3: empty digests trickled in just under the idle bound do not keep
+/// a stranger link open; only useful relay traffic does.
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_digests_do_not_keep_a_relay_link_open() {
+    let hub = LoopbackHub::new();
+    let (_a, b) = relay_strangers(&hub, Duration::from_millis(600), Duration::from_secs(60)).await;
+    for _ in 0..6 {
+        if !hub.is_linked("a", "b") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        hub.inject("a", "b", digest(0));
+    }
+    eventually("b closes the link", || async { !hub.is_linked("a", "b") }).await;
+    let stats = b.node.mesh_stats();
+    assert_eq!(
+        (
+            stats.relay_links_idle_closed,
+            stats.relay_links_force_closed
+        ),
+        (1, 0)
+    );
+}
+
+/// §B14.3: a busy stranger link still closes at the lifetime cap.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_busy_relay_link_closes_at_its_lifetime_cap() {
+    let hub = LoopbackHub::new();
+    let (_a, b) = relay_strangers(
+        &hub,
+        Duration::from_millis(500),
+        Duration::from_millis(1500),
+    )
+    .await;
+    let start = std::time::Instant::now();
+    while hub.is_linked("a", "b") && start.elapsed() < Duration::from_secs(10) {
+        hub.inject("a", "b", digest(1));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    assert!(!hub.is_linked("a", "b"));
+    assert!(start.elapsed() >= Duration::from_millis(1000), "not idle");
+    let stats = b.node.mesh_stats();
+    assert_eq!(
+        (
+            stats.relay_links_idle_closed,
+            stats.relay_links_force_closed
+        ),
+        (0, 1)
+    );
+}
+
+/// §B14.3: switching relay off closes the stranger links it carried.
+#[tokio::test(flavor = "multi_thread")]
+async fn disable_relay_closes_open_relay_links() {
+    let hub = LoopbackHub::new();
+    let (_a, b) = relay_strangers(&hub, Duration::from_secs(60), Duration::from_secs(600)).await;
+    b.node.disable_relay();
+    eventually("b closes the link", || async { !hub.is_linked("a", "b") }).await;
+    assert_eq!(b.node.mesh_stats().relay_links_force_closed, 1);
+}
