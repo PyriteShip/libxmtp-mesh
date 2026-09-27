@@ -13,9 +13,9 @@ use parking_lot::Mutex;
 use tokio::sync::broadcast::error::RecvError;
 use xmtp_api_d14n::ClientBundle;
 use xmtp_mesh::{
-    ClientGroupMembership, ClientHelloSigner, ClientRelayExporter, DialIntent, LinkRole,
-    MAX_FRAME_LEN, MeshError, MeshNode, MeshStats, MeshTransport, NodeEvent, PeerId, RelayStats,
-    ResyncOutcome, VerifiedPeer,
+    AdvertMatch, AdvertState, ClientGroupMembership, ClientHelloSigner, ClientRelayExporter,
+    Contact, DialIntent, LinkRole, MAX_FRAME_LEN, MeshError, MeshNode, MeshStats, MeshTransport,
+    NodeEvent, PeerId, RelayStats, ResyncOutcome, VerifiedPeer,
 };
 use xmtp_mls::client::ClientError;
 use xmtp_mls::identity::IdentityError;
@@ -365,6 +365,111 @@ pub struct FfiLinkKeyInfo {
     pub generation: u32,
 }
 
+/// A contact's token for one window around now (DESIGN.md §B14.2).
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FfiContactToken {
+    pub token: Vec<u8>,
+    pub inbox_id: String,
+}
+
+/// What the radio advertises and matches for one window (DESIGN.md §B14.2).
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FfiAdvertState {
+    pub window: u64,
+    /// Advertise exactly this as the service data: `2 ‖ flags ‖ token`.
+    pub service_data: Vec<u8>,
+    /// Goes in the link-layer Hello in place of the old short id.
+    pub own_token: Vec<u8>,
+    /// Every contact's tokens for the previous, current and next window.
+    pub contact_tokens: Vec<FfiContactToken>,
+    /// Unix second of the next window: restart advertising then.
+    pub next_window_at: u64,
+    /// Changes whenever the tokens change: re-read the state then.
+    pub contacts_version: u64,
+}
+
+impl From<AdvertState> for FfiAdvertState {
+    fn from(s: AdvertState) -> Self {
+        Self {
+            window: s.window,
+            service_data: s.service_data.to_vec(),
+            own_token: s.own_token.to_vec(),
+            contact_tokens: s
+                .contact_tokens
+                .into_iter()
+                .map(|(token, inbox_id)| FfiContactToken {
+                    token: token.to_vec(),
+                    inbox_id,
+                })
+                .collect(),
+            next_window_at: s.next_window_at,
+            contacts_version: s.contacts_version,
+        }
+    }
+}
+
+/// What a seen advert is. `dial_first`: our token is lower, so dial now;
+/// otherwise dial only as the §B7.2 fallback.
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum FfiAdvertMatch {
+    Invalid,
+    Own,
+    Contact {
+        inbox_id: String,
+        dial_first: bool,
+    },
+    Stranger {
+        relay_offered: bool,
+        dial_first: bool,
+    },
+    Pairing {
+        dial_first: bool,
+    },
+}
+
+impl From<AdvertMatch> for FfiAdvertMatch {
+    fn from(m: AdvertMatch) -> Self {
+        match m {
+            AdvertMatch::Invalid => Self::Invalid,
+            AdvertMatch::Own => Self::Own,
+            AdvertMatch::Contact {
+                inbox_id,
+                dial_first,
+            } => Self::Contact {
+                inbox_id,
+                dial_first,
+            },
+            AdvertMatch::Stranger {
+                relay_offered,
+                dial_first,
+            } => Self::Stranger {
+                relay_offered,
+                dial_first,
+            },
+            AdvertMatch::Pairing { dial_first } => Self::Pairing { dial_first },
+        }
+    }
+}
+
+/// A stored contact (DESIGN.md §B14.1). Never carries the shared discovery
+/// key: the radio and the app need only the token map from `advert_state`.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FfiContact {
+    pub inbox_id: String,
+    pub generation: u32,
+    pub updated_ns: i64,
+}
+
+impl From<Contact> for FfiContact {
+    fn from(c: Contact) -> Self {
+        Self {
+            inbox_id: c.inbox_id,
+            generation: c.generation,
+            updated_ns: c.updated_ns,
+        }
+    }
+}
+
 /// Relay counters since the relay engine started (DESIGN.md §R5.4). A snapshot, not a stream.
 #[derive(uniffi::Record, Clone, Debug, Default, PartialEq, Eq)]
 pub struct FfiRelayStats {
@@ -374,6 +479,9 @@ pub struct FfiRelayStats {
     pub dropped_expired: u64,
     pub dropped_share: u64,
     pub dropped_rate: u64,
+    /// Stranger envelopes refused because only contacts' entries were left
+    /// to displace (DESIGN.md §R5.4).
+    pub dropped_full: u64,
     pub pushed: u64,
     pub originated: u64,
     pub delivered: u64,
@@ -390,6 +498,7 @@ impl From<RelayStats> for FfiRelayStats {
             dropped_expired: s.dropped_expired,
             dropped_share: s.dropped_share,
             dropped_rate: s.dropped_rate,
+            dropped_full: s.dropped_full,
             pushed: s.pushed,
             originated: s.originated,
             delivered: s.delivered,
@@ -399,8 +508,9 @@ impl From<RelayStats> for FfiRelayStats {
     }
 }
 
-/// Signed-sequencing counters (DESIGN.md §B13) and peers refused for an
-/// older protocol version, since the node was opened. A snapshot.
+/// Signed-sequencing counters (DESIGN.md §B13), private-discovery link
+/// counters (§B14.3), and peers refused for an older protocol version,
+/// since the node was opened. A snapshot.
 #[derive(uniffi::Record, Clone, Debug, Default, PartialEq, Eq)]
 pub struct FfiMeshStats {
     pub seq_rows_signed: u64,
@@ -410,6 +520,28 @@ pub struct FfiMeshStats {
     pub seq_rejected_wrong_signer: u64,
     pub seq_equivocations: u64,
     pub peers_rejected_version: u64,
+    /// Links opened, by kind.
+    pub links_contact: u64,
+    pub links_relay: u64,
+    pub links_pairing: u64,
+    /// Noise handshakes that failed or timed out.
+    pub handshake_failed: u64,
+    /// Links closed for a record that failed authentication, a frame not
+    /// allowed on the link type, or a card or Hello that does not match it.
+    pub link_frame_rejected: u64,
+    pub discovery_resets: u64,
+    /// Relay links closed after carrying no useful relay traffic for the
+    /// idle bound.
+    pub relay_links_idle_closed: u64,
+    /// Relay links closed while still in use: at the lifetime cap, or when
+    /// relay was switched off.
+    pub relay_links_force_closed: u64,
+    /// Relay links refused or not dialed because this phone closed the same
+    /// radio peer's relay link moments ago (the back-off).
+    pub relay_links_backoff_refused: u64,
+    /// Times the phone left pairing mode after too many unfinished pairing
+    /// handshakes.
+    pub pairing_attempts_exhausted: u64,
 }
 
 impl From<MeshStats> for FfiMeshStats {
@@ -422,6 +554,16 @@ impl From<MeshStats> for FfiMeshStats {
             seq_rejected_wrong_signer: s.seq_rejected_wrong_signer,
             seq_equivocations: s.seq_equivocations,
             peers_rejected_version: s.peers_rejected_version,
+            links_contact: s.links_contact,
+            links_relay: s.links_relay,
+            links_pairing: s.links_pairing,
+            handshake_failed: s.handshake_failed,
+            link_frame_rejected: s.link_frame_rejected,
+            discovery_resets: s.discovery_resets,
+            relay_links_idle_closed: s.relay_links_idle_closed,
+            relay_links_force_closed: s.relay_links_force_closed,
+            relay_links_backoff_refused: s.relay_links_backoff_refused,
+            pairing_attempts_exhausted: s.pairing_attempts_exhausted,
         }
     }
 }
@@ -634,6 +776,56 @@ impl FfiMeshNode {
     /// The codes differ, or the person declined: close the pairing link.
     pub fn reject_pairing(&self, peer_id: String) {
         self.node.reject_pairing(&peer_id);
+    }
+
+    /// Advert and token map for the window of `now_unix_secs` (DESIGN.md
+    /// §B14.2). Advertise `service_data`; stop and restart advertising at
+    /// `next_window_at`, or sooner if `contacts_version` changes.
+    pub fn advert_state(&self, now_unix_secs: u64) -> Result<FfiAdvertState, FfiError> {
+        Ok(self
+            .node
+            .advert_state(now_unix_secs)
+            .map_err(mesh_error)?
+            .into())
+    }
+
+    /// Classify a seen advert's service data (DESIGN.md §B14.2): the dial
+    /// decision for one sighting.
+    pub fn classify_advert(
+        &self,
+        service_data: Vec<u8>,
+        now_unix_secs: u64,
+    ) -> Result<FfiAdvertMatch, FfiError> {
+        Ok(self
+            .node
+            .classify_advert(&service_data, now_unix_secs)
+            .map_err(mesh_error)?
+            .into())
+    }
+
+    /// Advertise under a new discovery key from the next `advert_state`
+    /// (DESIGN.md §B14.4): the Settings "Reset discovery key" button.
+    /// Returns the new generation.
+    pub fn reset_discovery_key(&self) -> Result<u32, FfiError> {
+        self.node.reset_discovery_key().map_err(mesh_error)
+    }
+
+    /// Live contacts, by inbox id.
+    pub fn contacts(&self) -> Result<Vec<FfiContact>, FfiError> {
+        Ok(self
+            .node
+            .contacts()
+            .map_err(mesh_error)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Stop recognising and accepting `inbox_id` (DESIGN.md §B14.4). The app
+    /// should offer `reset_discovery_key` right after, so the removed
+    /// contact stops recognising this phone too.
+    pub fn remove_contact(&self, inbox_id: String) -> Result<bool, FfiError> {
+        self.node.remove_contact(&inbox_id).map_err(mesh_error)
     }
 
     /// Start syncing with peers. `client` must be the registered client whose
@@ -1785,5 +1977,103 @@ mod tests {
             .unwrap();
         assert_eq!(node.mesh_stats(), FfiMeshStats::default());
         node.stop_sync();
+    }
+
+    /// The radio's and the app's surface (DESIGN.md §B14): pair over FFI,
+    /// confirm, classify each other's adverts, reset, remove.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn contacts_adverts_and_pairing_over_ffi() {
+        let (a, node_a) = registered_mesh_client().await;
+        let (b, node_b) = registered_mesh_client().await;
+        ready_to_pair(&a, &node_a);
+        ready_to_pair(&b, &node_b);
+        let (to_b, rx_b) = unbounded_channel();
+        let (to_a, rx_a) = unbounded_channel();
+        node_a
+            .start_sync(
+                a.clone(),
+                Arc::new(ChannelTransport {
+                    me: "a#1".into(),
+                    tx: to_b,
+                }),
+            )
+            .await
+            .unwrap();
+        node_b
+            .start_sync(
+                b.clone(),
+                Arc::new(ChannelTransport {
+                    me: "b#1".into(),
+                    tx: to_a,
+                }),
+            )
+            .await
+            .unwrap();
+        pump(node_b.clone(), rx_b);
+        pump(node_a.clone(), rx_a);
+        let (na, nb) = (node_a.clone(), node_b.clone());
+        std::thread::spawn(move || {
+            nb.on_peer_connected("a#1".into(), FfiLinkRole::Accept);
+            na.on_peer_connected("b#1".into(), FfiLinkRole::DialPairing);
+        })
+        .join()
+        .unwrap();
+        confirm_pairings(&node_a, "b#1", &node_b, "a#1").await;
+
+        eventually("both hold the other's card", || async {
+            node_a
+                .contacts()
+                .unwrap()
+                .iter()
+                .any(|c| c.inbox_id == b.inbox_id())
+                && node_b
+                    .contacts()
+                    .unwrap()
+                    .iter()
+                    .any(|c| c.inbox_id == a.inbox_id())
+        })
+        .await;
+        assert_eq!(
+            node_a
+                .contacts()
+                .unwrap()
+                .into_iter()
+                .map(|c| c.inbox_id)
+                .collect::<Vec<_>>(),
+            vec![b.inbox_id()]
+        );
+        // A successful pairing leaves pairing mode by itself.
+        assert!(!node_a.pairing_mode());
+        assert!(!node_b.pairing_mode());
+
+        let now = 1_769_400_010;
+        let advert = node_b.advert_state(now).unwrap();
+        assert_eq!((advert.service_data.len(), advert.service_data[0]), (10, 2));
+        assert_eq!(advert.service_data[1] & 0x01, 0x00, "b left pairing mode");
+        assert_eq!(advert.next_window_at, 1_769_400_900);
+        assert!(
+            advert
+                .contact_tokens
+                .iter()
+                .any(|t| t.inbox_id == a.inbox_id())
+        );
+        assert!(matches!(
+            node_a.classify_advert(advert.service_data.clone(), now).unwrap(),
+            FfiAdvertMatch::Contact { inbox_id, .. } if inbox_id == b.inbox_id()
+        ));
+        assert_eq!(node_b.reset_discovery_key().unwrap(), 1);
+        let reset = node_b.advert_state(now).unwrap();
+        assert_ne!(reset.own_token, advert.own_token);
+        assert!(matches!(
+            node_a.classify_advert(reset.service_data, now).unwrap(),
+            FfiAdvertMatch::Stranger { .. }
+        ));
+        assert!(node_a.remove_contact(b.inbox_id()).unwrap());
+        assert!(node_a.contacts().unwrap().is_empty());
+        assert_eq!(node_a.mesh_stats().links_pairing, 1);
+        assert_eq!(node_b.mesh_stats().discovery_resets, 1);
+
+        node_a.stop_sync();
+        node_b.stop_sync();
     }
 }
