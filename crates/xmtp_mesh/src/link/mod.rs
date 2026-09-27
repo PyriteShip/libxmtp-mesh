@@ -6,7 +6,7 @@ pub(crate) mod noise;
 pub(crate) mod records;
 pub(crate) mod tx;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
@@ -18,6 +18,7 @@ pub use keys::{
 };
 pub use noise::short_code;
 
+use crate::sync::PeerId;
 use crate::sync::frames::frame::Body;
 use crate::sync::seq::MeshStats;
 
@@ -172,6 +173,15 @@ pub(crate) struct AllowedDialers {
     pub(crate) no_contacts: bool,
 }
 
+/// A verified contact link, for resolving two links to one phone
+/// (§B14.3).
+pub(crate) struct ContactLinkEntry {
+    /// The session that verified it.
+    pub(crate) session_id: u64,
+    pub(crate) installation: Vec<u8>,
+    pub(crate) dialer_static: [u8; 32],
+}
+
 /// The node's link state (§B14). Keys live in memory only and are zeroized
 /// on drop. Lock order: `prk`, then the store, then `keys`, then
 /// `dialers`.
@@ -187,6 +197,9 @@ pub(crate) struct LinkState {
     /// The node's one IK replay cache, shared by all its responders.
     pub(crate) replay: noise::ReplayCache,
     pub(crate) dialers: RwLock<AllowedDialers>,
+    /// Verified contact links by peer. Lock order: the node's `sessions`,
+    /// then this.
+    pub(crate) contact_links: Mutex<HashMap<PeerId, ContactLinkEntry>>,
 }
 
 impl LinkState {

@@ -15,9 +15,9 @@ use alloy::signers::local::PrivateKeySigner;
 use std::sync::Arc;
 
 use common::{
-    Recording, TestPeer, association_state, client_log, dm_both_ways, eventually, eventually_for,
-    has_key_package, next_resync, node_log, peer, peer_on, rebase, recorded_peer,
-    revoke_all_other_installations, see, send_and_see,
+    Recording, TestPeer, account_key, association_state, build_client, client_log, dm_both_ways,
+    eventually, eventually_for, has_key_package, next_resync, node_log, peer, peer_on, rebase,
+    recorded_peer, revoke_all_other_installations, see, send_and_see,
 };
 use xmtp_cryptography::utils::generate_local_wallet;
 use xmtp_db::group::GroupQueryArgs;
@@ -486,14 +486,27 @@ async fn a_failed_claimed_inbox_proof_disconnects_immediately_like_an_unheld_inb
     // every authenticated peer it meets, via send_own_identity).
     let losing = losing_fork(&hub, &wallet, &inbox).await;
 
-    // A stranger whose Hello lies about claiming I, but whose real,
-    // authenticated installation (from its own unrelated client) is not
-    // among the fork's installations. `suppress_identity_log_for_test`
+    // A stranger whose Hello claims I, but whose real, authenticated
+    // installation (from its own unrelated client) is not among the fork's
+    // installations. A contact link must reach the inbox its static key
+    // belongs to (§B14.4), so the stranger's link keys are I's (derived
+    // from I's account key under I): its Hello gets past that check and
+    // only the identity-log proof stops it. `suppress_identity_log_for_test`
     // stops its own (empty) log for I from going out automatically on
     // connect, so the test can inject the exact frame under test.
-    let stranger = peer(&hub, "stranger").await;
-    stranger.node.set_local_inbox_for_test(&inbox);
-    stranger.node.suppress_identity_log_for_test();
+    let stranger_node = MeshNode::in_memory().unwrap();
+    hub.register("stranger", &stranger_node);
+    let stranger_client = build_client(&stranger_node).await;
+    stranger_node.set_local_inbox_for_test(&inbox);
+    stranger_node
+        .set_account_key(&account_key(&wallet))
+        .unwrap();
+    stranger_node.suppress_identity_log_for_test();
+    common::start_sync(
+        &stranger_node,
+        &stranger_client,
+        hub.transport_for("stranger"),
+    );
     hub.link("b", "stranger");
     eventually("b authenticates the stranger", || async {
         b.node

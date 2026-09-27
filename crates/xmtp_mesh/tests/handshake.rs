@@ -163,13 +163,15 @@ impl Recorder {
     }
 }
 
-/// The wire format of the signed hello text, pinned independently of the crate.
+/// The wire format of the signed hello text, pinned independently of the
+/// crate. Test cleartext links bind 32 zero bytes (no handshake hash).
 fn hello_text(challenge: &[u8], signer: &[u8], verifier: &[u8]) -> String {
     format!(
-        "xmtp-mesh-hello-v1:{}:{}:{}",
+        "xmtp-mesh-hello-v2:{}:{}:{}:{}",
         hex::encode(challenge),
         hex::encode(signer),
-        hex::encode(verifier)
+        hex::encode(verifier),
+        hex::encode([0u8; 32])
     )
 }
 
@@ -191,6 +193,7 @@ fn hello(installation_key: Vec<u8>, challenge: [u8; 32]) -> Vec<u8> {
         challenge: challenge.to_vec(),
         relay: 0,
         seq: frames::SEQ_V1,
+        link: frames::LINK_V1,
     }))
 }
 
@@ -397,6 +400,7 @@ async fn a_hello_without_signed_sequencing_is_refused() {
             challenge: vec![7; 32],
             relay: 0,
             seq: 0,
+            link: frames::LINK_V1,
         })),
     );
     eventually("a disconnects the mesh.9 peer", || async {
@@ -410,5 +414,37 @@ async fn a_hello_without_signed_sequencing_is_refused() {
             .iter()
             .any(|b| matches!(b, Body::Auth(_))),
         "no Auth answers a mesh.9 Hello"
+    );
+}
+
+/// §B14 hard cut: a Hello below link version 1 (a mesh.10 phone) ends the
+/// session before any Auth, and is counted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hello_below_the_link_version_is_refused() {
+    let hub = LoopbackHub::new();
+    let (a, _a_key, recorder) = recorded_node(&hub).await;
+    let old = ClientHelloSigner(build_client(&MeshNode::in_memory().unwrap()).await);
+    hub.inject(
+        "old",
+        "a",
+        frames::encode(Body::Hello(Hello {
+            installation_key: old.installation_key(),
+            inbox_id: String::new(),
+            challenge: vec![7; 32],
+            relay: 0,
+            seq: frames::SEQ_V1,
+            link: 0,
+        })),
+    );
+    eventually("a disconnects the mesh.10 peer", || async {
+        recorder.disconnected("old")
+    })
+    .await;
+    assert_eq!(a.mesh_stats().peers_rejected_version, 1);
+    assert!(
+        !recorder
+            .sent_to("old")
+            .iter()
+            .any(|b| matches!(b, Body::Auth(_)))
     );
 }

@@ -8,14 +8,15 @@ use crate::link::LinkRole;
 use crate::link::keys::{AccountPrk, MeshKeys};
 use crate::link::noise::{ReplayCache, ResponderContext};
 use crate::link::{
-    AdvertMatch, AdvertState, AllowedDialers, FLAG_PAIRING, FLAG_RELAY, LinkCounters, LinkKeyInfo,
-    Token, WINDOW_SECS, advert_token, parse_service_data, service_data, window_at,
+    AdvertMatch, AdvertState, AllowedDialers, ContactLinkEntry, FLAG_PAIRING, FLAG_RELAY,
+    LinkCounters, LinkKeyInfo, Token, WINDOW_SECS, advert_token, parse_service_data, service_data,
+    window_at,
 };
 use crate::store::{Contact, ContactUpdate};
-use crate::sync::MeshTransport;
 use crate::sync::frames::ContactCard;
 use crate::sync::frames::frame::Body;
 use crate::sync::session::{Inbound, LinkSetup};
+use crate::sync::{MeshTransport, PeerId};
 
 impl MeshNode {
     /// Derive this phone's link keys from the account key (the secp256k1
@@ -134,7 +135,12 @@ impl MeshNode {
         let keys = self.mesh_keys().ok_or(MeshError::NoAccountKey)?;
         let window = window_at(now);
         let own = keys.own_token(window);
-        if token == own {
+        // Our own advert (or another installation of our inbox, which
+        // shares the keys) from a neighbouring window.
+        if [window.saturating_sub(1), window, window + 1]
+            .into_iter()
+            .any(|w| keys.own_token(w) == token)
+        {
             return Ok(AdvertMatch::Own);
         }
         let dial_first = own < token;
@@ -234,6 +240,14 @@ impl MeshNode {
         card: &ContactCard,
         force: bool,
     ) -> Result<ContactUpdate, MeshError> {
+        if let Some(keys) = self.mesh_keys()
+            && (card.inbox_id == keys.inbox_id
+                || card.noise_static_pub.as_slice() == keys.noise_public.as_slice())
+        {
+            return Err(MeshError::InvalidRequest(
+                "a contact card for this phone itself".into(),
+            ));
+        }
         let mut store = self.inner.store.lock();
         let outcome = store.upsert_contact(card, Self::now_ns(), force)?;
         if matches!(outcome, ContactUpdate::Inserted | ContactUpdate::Updated) {
@@ -241,6 +255,45 @@ impl MeshNode {
             self.inner.link.bump_contacts_version();
         }
         Ok(outcome)
+    }
+
+    /// Contact link `peer` (session `session_id`) verified `installation`.
+    /// If another live contact link reaches the same installation (both
+    /// phones dialed), both phones keep the one dialed by the lower static
+    /// key (§B14.3): returns the peer to close, if any.
+    pub(crate) fn contact_link_verified(
+        &self,
+        peer: &str,
+        session_id: u64,
+        installation: &[u8],
+        dialer_static: [u8; 32],
+    ) -> Option<PeerId> {
+        let sessions = self.inner.sessions.lock();
+        let current = |p: &str, id: u64| sessions.get(p).is_some_and(|h| h.id == id);
+        if !current(peer, session_id) {
+            return None;
+        }
+        let mut links = self.inner.link.contact_links.lock();
+        links.retain(|p, l| current(p, l.session_id));
+        let rival = links
+            .iter()
+            .find(|(p, l)| p.as_str() != peer && l.installation == installation)
+            .map(|(p, l)| (p.clone(), l.dialer_static));
+        links.insert(
+            peer.to_string(),
+            ContactLinkEntry {
+                session_id,
+                installation: installation.to_vec(),
+                dialer_static,
+            },
+        );
+        let (rival_peer, rival_dialer) = rival?;
+        match dialer_static.cmp(&rival_dialer) {
+            std::cmp::Ordering::Less => Some(rival_peer),
+            std::cmp::Ordering::Greater => Some(peer.to_string()),
+            // The same phone dialed both: leave it to the radio (§B7.3).
+            std::cmp::Ordering::Equal => None,
+        }
     }
 
     /// This phone's own card, or `None` before `set_account_key`.
@@ -449,6 +502,38 @@ mod tests {
             node.mesh_keys().unwrap().noise_public
         );
         assert!(node.has_account_key());
+    }
+
+    /// Our own token from a neighbouring window (skew, or another
+    /// installation of our inbox) is ours, not a stranger's.
+    #[test]
+    fn our_own_token_one_window_either_side_is_own() {
+        let a = keyed(A, 1);
+        for (offset, own) in [(-2i64, false), (-1, true), (0, true), (1, true), (2, false)] {
+            let window = (1_966_000 + offset) as u64;
+            let m = a
+                .classify_advert(&service_data(0, &token_of(&a, window)), NOW)
+                .unwrap();
+            assert_eq!(m == AdvertMatch::Own, own, "window offset {offset}: {m:?}");
+        }
+    }
+
+    /// A card naming our own inbox or our own static key is never stored.
+    #[test]
+    fn a_card_for_this_phone_itself_is_refused() {
+        let (a, b) = (keyed(A, 1), keyed(B, 2));
+        let own = a.own_contact_card().unwrap();
+        let mut foreign_static = own.clone();
+        foreign_static.noise_static_pub = b.own_contact_card().unwrap().noise_static_pub;
+        let mut foreign_inbox = own.clone();
+        foreign_inbox.inbox_id = C.to_string();
+        for card in [own, foreign_static, foreign_inbox] {
+            assert!(matches!(
+                a.store_contact_card(&card, true),
+                Err(MeshError::InvalidRequest(_))
+            ));
+        }
+        assert!(a.contacts().unwrap().is_empty());
     }
 
     /// §B14.2: a contact matches one window either side (skew up to 15 min),

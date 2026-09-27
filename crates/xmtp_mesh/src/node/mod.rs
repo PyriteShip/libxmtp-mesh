@@ -548,6 +548,7 @@ impl MeshNode {
     /// Clear `peer`'s authentication and presence, emitting `PeerLost` if it
     /// was verified. Callers hold `sessions`.
     pub(crate) fn forget_peer(&self, peer: &str) {
+        self.inner.link.contact_links.lock().remove(peer);
         self.relay_link_down(peer);
         self.inner.authenticated.lock().remove(peer);
         if self.inner.verified.lock().remove(peer).is_some() {

@@ -16,6 +16,10 @@ pub const RELAY_V1: u32 = 1;
 /// refused: mesh.10 syncs only with mesh.10.
 pub const SEQ_V1: u32 = 1;
 
+/// Link version (§B14). A peer whose Hello says less is refused: mesh.11
+/// talks only to mesh.11.
+pub const LINK_V1: u32 = 1;
+
 /// Largest encoded frame a node sends or accepts.
 pub const MAX_FRAME_LEN: usize = 1024 * 1024;
 
@@ -177,6 +181,9 @@ pub struct Hello {
     /// Signed-sequencing version the sender speaks (0: none; [`SEQ_V1`]).
     #[prost(uint32, tag = "5")]
     pub seq: u32,
+    /// Link version the sender speaks (0: none; [`LINK_V1`]).
+    #[prost(uint32, tag = "6")]
+    pub link: u32,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]

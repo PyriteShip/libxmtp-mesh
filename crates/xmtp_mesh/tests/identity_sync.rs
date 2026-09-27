@@ -4,10 +4,12 @@ mod common;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::{TestPeer, eventually, peer};
+use common::{TestPeer, account_key, eventually, peer, peer_on};
 use http::{request, uri::PathAndQuery};
 use prost::Message;
+use xmtp_cryptography::utils::generate_local_wallet;
 use xmtp_mesh::LoopbackHub;
+use xmtp_mesh::MeshNode;
 use xmtp_mesh::frames::{self, KeyPackage, frame::Body};
 use xmtp_proto::api::Client;
 use xmtp_proto::mls_v1::{FetchKeyPackagesRequest, FetchKeyPackagesResponse};
@@ -63,10 +65,18 @@ async fn linked_nodes_learn_each_others_identity_and_key_package() {
 async fn impostor_installation_is_disconnected() {
     let hub = LoopbackHub::new();
     let a = peer(&hub, "a").await;
-    let b = peer(&hub, "b").await;
+    let b_wallet = generate_local_wallet();
+    let b = peer_on(&hub, "b", MeshNode::in_memory().unwrap(), &b_wallet).await;
     let mallory = peer(&hub, "mallory").await;
-    // mallory claims to be b's inbox but signs with its own installation key
+    // mallory claims to be b's inbox but signs with its own installation key.
+    // A contact link must reach the inbox its static key belongs to
+    // (§B14.4), so mallory holds b's link keys: only the identity log can
+    // tell it apart.
     mallory.node.set_local_inbox_for_test(b.client.inbox_id());
+    mallory
+        .node
+        .set_account_key(&account_key(&b_wallet))
+        .unwrap();
     hub.link("a", "b"); // a learns b's real log
     eventually("a knows b", || async {
         a.node.has_key_package(&b.installation()).unwrap()
@@ -86,12 +96,18 @@ async fn impostor_installation_is_disconnected() {
 async fn silent_impostor_is_disconnected_at_the_deadline() {
     let hub = LoopbackHub::new();
     let a = peer(&hub, "a").await;
-    let b = peer(&hub, "b").await;
+    let b_wallet = generate_local_wallet();
+    let b = peer_on(&hub, "b", MeshNode::in_memory().unwrap(), &b_wallet).await;
     let mallory = peer(&hub, "mallory").await;
     a.node
         .set_peer_verify_timeout_for_test(Duration::from_millis(500));
-    // mallory claims b's inbox and never sends an identity log to disprove it.
+    // mallory claims b's inbox and never sends an identity log to disprove
+    // it; it holds b's link keys, as a contact link requires (§B14.4).
     mallory.node.set_local_inbox_for_test(b.client.inbox_id());
+    mallory
+        .node
+        .set_account_key(&account_key(&b_wallet))
+        .unwrap();
     mallory.node.suppress_identity_log_for_test();
     hub.link("a", "b");
     eventually("a knows b", || async {

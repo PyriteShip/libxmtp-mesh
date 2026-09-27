@@ -30,19 +30,22 @@ where
     }
 }
 
-/// Text the responder signs: binds the challenger's nonce to both parties'
-/// installation keys, so a signature made for one verifier (or reflected back
-/// at its own signer) never verifies for another.
+/// Text the responder signs: binds the challenger's nonce, both parties'
+/// installation keys and the link's Noise handshake hash (§B14.4), so a
+/// signature made for one verifier, reflected back at its own signer, or
+/// relayed from another link never verifies.
 pub(crate) fn hello_text(
     challenge: &[u8],
     signer_installation: &[u8],
     verifier_installation: &[u8],
+    binding: &[u8; 32],
 ) -> String {
     format!(
-        "xmtp-mesh-hello-v1:{}:{}:{}",
+        "xmtp-mesh-hello-v2:{}:{}:{}:{}",
         hex::encode(challenge),
         hex::encode(signer_installation),
-        hex::encode(verifier_installation)
+        hex::encode(verifier_installation),
+        hex::encode(binding)
     )
 }
 
@@ -55,4 +58,21 @@ pub(crate) fn verify(text: &str, signature: &[u8], installation: &[u8]) -> Resul
         .map_err(|_| MeshError::AuthFailed("installation key must be 32 bytes".into()))?;
     verify_signed_with_public_context(text, signature, key)
         .map_err(|e| MeshError::AuthFailed(e.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// §B14.4: the Auth signature covers the Noise handshake hash, so an
+    /// Auth made on one link never verifies on another.
+    #[test]
+    fn the_hello_text_binds_the_link() {
+        let text = hello_text(&[1; 2], &[2; 2], &[3; 2], &[4; 32]);
+        assert_eq!(
+            text,
+            format!("xmtp-mesh-hello-v2:0101:0202:0303:{}", "04".repeat(32))
+        );
+        assert_ne!(text, hello_text(&[1; 2], &[2; 2], &[3; 2], &[5; 32]));
+    }
 }

@@ -9,8 +9,8 @@ use xmtp_proto::mls_v1::{GroupMessage, GroupMessageInput, group_message, group_m
 
 use super::auth::{self, HelloSigner};
 use super::frames::{
-    self, Auth, Hello, IdentityLog, Interest, MAX_MESSAGES_PER_FRAME, Pending, Sequenced,
-    WelcomeAck, frame::Body,
+    self, Auth, ContactCard, Hello, IdentityLog, Interest, MAX_MESSAGES_PER_FRAME, Pending,
+    Sequenced, WelcomeAck, frame::Body,
 };
 use super::membership::GroupMembership;
 use super::transport::{MeshTransport, PeerId};
@@ -22,6 +22,7 @@ use crate::link::{DialIntent, LinkKind, LinkRole, window_at};
 use crate::node::{
     MAX_PEER_IDENTITY_LOG, MAX_RELAYED_IDENTITY_LOGS, MeshNode, NodeEvent, Resolution,
 };
+use crate::store::ContactUpdate;
 
 /// What the radio delivered to a session.
 pub(crate) enum Inbound {
@@ -116,12 +117,12 @@ impl Drop for SessionHandle {
 ///
 /// Hello/Auth: each side sends `Hello{its key, a fresh challenge}` and answers
 /// the other's Hello with `Auth{signature, echoed challenge}`, the signature
-/// over `hello_text(their challenge, own key, their key)`. A Hello carrying our
-/// own key is rejected (reflection). Every Hello from the same key is answered,
-/// in any state, and an Auth echoing another challenge is ignored: when a
-/// `PeerId` reconnects, one frame from the previous connection's session may
-/// still arrive (it passed its cancel check just before the relink) and must
-/// not break the new handshake.
+/// over `hello_text(their challenge, own key, their key, handshake hash)`.
+/// A Hello carrying our own key is rejected (reflection). Every Hello from
+/// the same key is answered, in any state, and an Auth echoing another
+/// challenge is ignored: when a `PeerId` reconnects, one frame from the
+/// previous connection's session may still arrive (it passed its cancel
+/// check just before the relink) and must not break the new handshake.
 ///
 /// A Hello received before we are authenticated also makes us send our own
 /// Hello again (at most [`MAX_HELLO_RESENDS`] times per session), so the two
@@ -129,9 +130,12 @@ impl Drop for SessionHandle {
 /// before the radio reported the connection). A session not authenticated
 /// within the node's handshake timeout disconnects the peer.
 ///
-/// Authenticated means a live holder of installation key K answered through
-/// this pipe; it does not bind the PeerId to K against a relaying
-/// man-in-the-middle (channel binding arrives with the planned Noise upgrade).
+/// Authenticated means a live holder of installation key K answered on this
+/// Noise link: the signed text binds the link's handshake hash (§B14.4), so
+/// an Auth relayed from another link never verifies. On a contact link the
+/// Hello must also name the inbox the peer's static key belongs to; our
+/// contact card goes once the peer authenticated, and the peer's card is
+/// stored only once it is verified.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum State {
     /// The Noise handshake is running (§B14.3).
@@ -226,6 +230,16 @@ pub(crate) struct Session {
     /// Test-injected frames waiting for the link to open and the peer to
     /// speak.
     early_plain: Vec<Vec<u8>>,
+    /// The inbox this link must belong to (the contact dialed, or the
+    /// contact whose static key dialed us), checked against the Hello.
+    expected_inbox: Option<String>,
+    /// The dialer's static key on a contact link: decides which of two
+    /// links to one phone stays (§B14.3).
+    dialer_static: Option<[u8; 32]>,
+    /// We sent our contact card on this link.
+    card_sent: bool,
+    /// A card received before the peer was verified.
+    pending_card: Option<ContactCard>,
     /// An open relay link closes when no relay frame arrived by then.
     relay_idle_at: Option<Instant>,
     /// An open relay link closes then however busy it is, so a stranger
@@ -302,6 +316,10 @@ pub(crate) fn spawn(
         binding: [0; 32],
         peer_spoke: setup.plain,
         early_plain: Vec::new(),
+        expected_inbox: None,
+        dialer_static: None,
+        card_sent: false,
+        pending_card: None,
         relay_idle_at: None,
         relay_ends_at: None,
         signer,
@@ -489,6 +507,7 @@ impl Session {
             LinkRole::Dial(intent) => {
                 let target = match intent {
                     DialIntent::Contact { inbox_id } => {
+                        self.expected_inbox = Some(inbox_id.clone());
                         let contact = self
                             .node
                             .contact(&inbox_id)?
@@ -581,6 +600,9 @@ impl Session {
                 "relay link while relay is off".into(),
             ));
         }
+        if open.kind == LinkKind::Contact {
+            self.contact_link_opened(&open)?;
+        }
         let records = Arc::new(Records::new(open.transport));
         self.link.open(records.clone(), open.kind);
         self.records = Some(records);
@@ -601,6 +623,92 @@ impl Session {
         if open.initiator {
             self.peer_spoke = true;
             self.link_started().await?;
+        }
+        Ok(())
+    }
+
+    /// A contact link: note who dialed, and, when accepting, which contact
+    /// the dialer's static key belongs to. An unknown key (this phone was
+    /// restored and has no contacts) is decided by Hello/Auth and the
+    /// identity log, as on any link; its card then makes it a contact
+    /// (§B14.4). A removed contact never gets here (it is answered as a
+    /// stranger), but is refused should one slip through.
+    fn contact_link_opened(&mut self, open: &LinkOpen) -> Result<(), MeshError> {
+        let Some(remote) = open.remote_static else {
+            self.node.link_counters().count_handshake_failed();
+            return Err(MeshError::LinkAuthFailed(
+                "contact link without a static key".into(),
+            ));
+        };
+        if open.initiator {
+            self.dialer_static = self.node.mesh_keys().map(|k| k.noise_public);
+            return Ok(());
+        }
+        self.dialer_static = Some(remote);
+        match self.node.contact_by_static(&remote)? {
+            Some(c) if c.removed => {
+                self.node.link_counters().count_handshake_failed();
+                Err(MeshError::LinkAuthFailed(
+                    "a removed contact dialed in".into(),
+                ))
+            }
+            Some(c) => {
+                self.expected_inbox = Some(c.inbox_id);
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    /// Send our contact card once on this contact link.
+    fn send_own_card(&mut self) {
+        if self.card_sent {
+            return;
+        }
+        if let Some(card) = self.node.own_contact_card() {
+            self.card_sent = self.try_send(Body::ContactCard(card));
+        }
+    }
+
+    /// A card must name this link's static key; it is applied once the
+    /// peer is verified (§B14.4).
+    async fn on_contact_card(&mut self, card: ContactCard) -> Result<(), MeshError> {
+        let Some(remote) = self.remote_static else {
+            return Ok(()); // a test cleartext link has no static key
+        };
+        if card.noise_static_pub.as_slice() != remote.as_slice() {
+            self.node.link_counters().count_frame_rejected();
+            return Err(MeshError::LinkAuthFailed(
+                "contact card for another static key".into(),
+            ));
+        }
+        if !self.verified {
+            self.pending_card = Some(card);
+            return Ok(());
+        }
+        self.apply_contact_card(card).await
+    }
+
+    /// Store a verified peer's card (contact links only; a pairing card
+    /// waits for the user). An older card, or one for a removed contact,
+    /// is ignored; a new contact (this phone was restored) gets our card
+    /// back.
+    async fn apply_contact_card(&mut self, card: ContactCard) -> Result<(), MeshError> {
+        if self.peer_inbox.as_deref() != Some(card.inbox_id.as_str()) {
+            self.node.link_counters().count_frame_rejected();
+            return Err(MeshError::LinkAuthFailed(
+                "contact card for another inbox".into(),
+            ));
+        }
+        if self.link_kind != Some(LinkKind::Contact) {
+            return Ok(());
+        }
+        match self.node.store_contact_card(&card, false)? {
+            ContactUpdate::Inserted => self.send_own_card(),
+            ContactUpdate::Stale => {
+                tracing::debug!(peer = %self.peer, "an older contact card; kept ours");
+            }
+            ContactUpdate::Updated | ContactUpdate::Unchanged | ContactUpdate::Removed => {}
         }
         Ok(())
     }
@@ -651,6 +759,7 @@ impl Session {
             }
             (State::Handshake, _) => Ok(()),
             (_, Body::Hello(hello)) => self.on_hello(hello),
+            (_, Body::ContactCard(card)) => self.on_contact_card(card).await,
             (State::AwaitAuth, Body::Auth(auth)) => self.on_auth(auth).await,
             (State::Authenticated, Body::Auth(_)) => Ok(()),
             (State::Authenticated, body) => self.on_authenticated_frame(body).await,
@@ -667,6 +776,7 @@ impl Session {
             challenge: self.challenge.to_vec(),
             relay: if self.self_relay { frames::RELAY_V1 } else { 0 },
             seq: frames::SEQ_V1,
+            link: frames::LINK_V1,
         }));
     }
 
@@ -680,6 +790,23 @@ impl Session {
                 "peer speaks signed sequencing {} (this node needs {})",
                 hello.seq,
                 frames::SEQ_V1
+            )));
+        }
+        if hello.link < frames::LINK_V1 {
+            self.node.seq_counters().count_rejected_version();
+            return Err(MeshError::IncompatibleVersion(format!(
+                "peer speaks link version {} (this node needs {})",
+                hello.link,
+                frames::LINK_V1
+            )));
+        }
+        if let Some(expected) = &self.expected_inbox
+            && hello.inbox_id != *expected
+        {
+            self.node.link_counters().count_frame_rejected();
+            return Err(MeshError::LinkAuthFailed(format!(
+                "contact link: the Hello names inbox {}, the static key belongs to {expected}",
+                hello.inbox_id
             )));
         }
         let own_key = self.signer.installation_key();
@@ -697,7 +824,12 @@ impl Session {
                 "peer changed installation key".into(),
             ));
         }
-        let text = auth::hello_text(&hello.challenge, &own_key, &hello.installation_key);
+        let text = auth::hello_text(
+            &hello.challenge,
+            &own_key,
+            &hello.installation_key,
+            &self.binding,
+        );
         let signature = self.signer.sign(&text)?;
         let handshaking = self.state != State::Authenticated;
         if self.state == State::AwaitHello {
@@ -723,11 +855,23 @@ impl Session {
             return Ok(()); // answers some other (stale) Hello of ours
         }
         let peer_key = self.peer_installation.clone().expect("set by hello");
-        let text = auth::hello_text(&self.challenge, &peer_key, &self.signer.installation_key());
+        let text = auth::hello_text(
+            &self.challenge,
+            &peer_key,
+            &self.signer.installation_key(),
+            &self.binding,
+        );
         auth::verify(&text, &auth_frame.signature, &peer_key)?;
         self.state = State::Authenticated;
         self.handshake_deadline = None;
         self.node.session_authenticated(&self.peer, self.id);
+        // Both sides are authenticated on this link (Noise, then this Auth
+        // bound to it) and the Hello named the contact the static key
+        // belongs to: our card may go (§B14.4). A peer whose static key we
+        // do not know gets it once its own card made it a contact.
+        if self.link_kind == Some(LinkKind::Contact) && self.expected_inbox.is_some() {
+            self.send_own_card();
+        }
         self.on_authenticated().await
     }
 
@@ -768,13 +912,35 @@ impl Session {
             .contains(claimed))
     }
 
+    /// The peer proved its inbox. On a contact link: of two links to one
+    /// phone keep one (§B14.3); then store a card the peer sent (§B14.4).
     async fn mark_verified(&mut self) -> Result<(), MeshError> {
         self.verified = true;
         self.verify_deadline = None;
         let inbox_id = self.peer_inbox.clone().unwrap_or_default();
+        let installation = self.peer_installation();
         self.node
-            .session_verified(&self.peer, self.id, inbox_id, self.peer_installation());
-        self.on_verified().await
+            .session_verified(&self.peer, self.id, inbox_id, installation.clone());
+        if self.link_kind == Some(LinkKind::Contact)
+            && let Some(dialer) = self.dialer_static
+            && let Some(loser) =
+                self.node
+                    .contact_link_verified(&self.peer, self.id, &installation, dialer)
+            && !self.is_cancelled()
+        {
+            tracing::info!(peer = %self.peer, closing = %loser, "two contact links to one phone: keeping one");
+            self.transport.disconnect(&loser);
+            if loser == self.peer {
+                // This link is closing: no sync and no cards on it. Not a
+                // failure, so nothing is counted.
+                return Ok(());
+            }
+        }
+        let verified = self.on_verified().await;
+        if let Some(card) = self.pending_card.take() {
+            self.apply_contact_card(card).await?;
+        }
+        verified
     }
 
     /// The peer's identity log for `log.inbox_id`. The log of the inbox the

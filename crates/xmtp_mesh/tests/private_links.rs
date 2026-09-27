@@ -4,15 +4,20 @@
 mod common;
 
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
+use common::peer_on;
 use common::{
     ClientGroupMembership, ClientHelloSigner, TestPeer, build_client, eventually, pair_dm, peer,
     relay_peer, send_and_see,
 };
+use xmtp_cryptography::utils::generate_local_wallet;
+use xmtp_db::group::GroupQueryArgs;
 use xmtp_mesh::frames::{self, Hello, Interest, KeyPackage, SpoolWant, frame::Body};
 use xmtp_mesh::link::{WINDOW_SECS, service_data};
 use xmtp_mesh::{AdvertMatch, DialIntent, LoopbackHub, MAX_FRAME_LEN, MeshError, MeshNode};
+use xmtp_mesh::{LinkRole, MeshTransport, PeerId};
 
 fn inbox(p: &TestPeer) -> String {
     p.client.inbox_id().to_string()
@@ -659,4 +664,286 @@ async fn disable_relay_closes_open_relay_links() {
     b.node.disable_relay();
     eventually("b closes the link", || async { !hub.is_linked("a", "b") }).await;
     assert_eq!(b.node.mesh_stats().relay_links_force_closed, 1);
+}
+
+/// A contact link must reach the inbox its static key belongs to: `a`
+/// holds a card naming inbox `c` with `b`'s static key, dials "c", reaches
+/// `b`, and closes on `b`'s Hello.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_contact_link_whose_hello_names_another_inbox_is_closed() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    let c = peer(&hub, "c").await;
+    let mut card = b.node.own_contact_card_for_test().unwrap();
+    card.inbox_id = inbox(&c);
+    a.node.add_contact_for_test(card);
+    hub.link_as(
+        "a",
+        "b",
+        DialIntent::Contact {
+            inbox_id: inbox(&c),
+        },
+    );
+    eventually("a closes the link", || async { !hub.is_linked("a", "b") }).await;
+    assert_eq!(a.node.mesh_stats().link_frame_rejected, 1);
+    assert!(a.node.verified_peers().is_empty());
+}
+
+/// §B14.4 IK to a restored phone that lost its contacts: the restored
+/// phone (same wallet, empty node, no contacts, no groups) accepts, verifies
+/// the dialer by Auth and identity log, and stores it from its card.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_phone_accepts_a_contact_and_stores_it() {
+    let hub = LoopbackHub::new();
+    let wallet = generate_local_wallet();
+    let a = peer(&hub, "a").await;
+    let b = peer_on(&hub, "b", MeshNode::in_memory().unwrap(), &wallet).await;
+    hub.link("a", "b");
+    verified_pair(&a, &b).await;
+    hub.unlink("a", "b");
+    b.node.stop_sync();
+    // Whole-second gap: `b` stays the older origin of the inbox (D24).
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let b2 = peer_on(&hub, "b2", MeshNode::in_memory().unwrap(), &wallet).await;
+    assert!(b2.node.contacts().unwrap().is_empty());
+    assert_eq!(
+        b2.node
+            .own_contact_card_for_test()
+            .unwrap()
+            .noise_static_pub,
+        b.node.own_contact_card_for_test().unwrap().noise_static_pub,
+        "the recovery phrase restores the static key"
+    );
+    hub.link_as(
+        "a",
+        "b2",
+        DialIntent::Contact {
+            inbox_id: inbox(&b),
+        },
+    );
+    eventually("b2 verifies a and stores it as a contact", || async {
+        b2.node
+            .verified_peers()
+            .iter()
+            .any(|p| p.installation == a.installation())
+            && b2.node.contact(&inbox(&a)).unwrap().is_some()
+    })
+    .await;
+    assert_eq!(b2.node.mesh_stats().links_contact, 1);
+    assert!(
+        b2.client
+            .find_groups(GroupQueryArgs::default())
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        b2.node
+            .contact(&inbox(&a))
+            .unwrap()
+            .unwrap()
+            .noise_static_pub
+            .to_vec(),
+        a.node.own_contact_card_for_test().unwrap().noise_static_pub
+    );
+}
+
+/// §B14.4 discovery reset: the old token is gone; the contact does not
+/// recognise the new one until the resetting phone, which still recognises
+/// it, dials it and hands over the new card.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_reaches_contacts_on_the_next_contact_link() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    hub.link("a", "b");
+    verified_pair(&a, &b).await;
+    hub.unlink("a", "b");
+    let now = a.node.unix_now();
+    let old = b.node.own_advert_token(now).unwrap();
+    assert_eq!(b.node.reset_discovery_key().unwrap(), 1);
+    let new = b.node.own_advert_token(now).unwrap();
+    assert_ne!(new, old, "the old token is no longer advertised");
+    assert!(matches!(
+        a.node.classify_advert(&service_data(0, &new), now).unwrap(),
+        AdvertMatch::Stranger { .. }
+    ));
+    let a_token = a.node.own_advert_token(now).unwrap();
+    assert!(matches!(
+        b.node
+            .classify_advert(&service_data(0, &a_token), now)
+            .unwrap(),
+        AdvertMatch::Contact { .. }
+    ));
+    hub.link_as(
+        "b",
+        "a",
+        DialIntent::Contact {
+            inbox_id: inbox(&a),
+        },
+    );
+    eventually("a holds b's new card", || async {
+        a.node
+            .contact(&inbox(&b))
+            .unwrap()
+            .is_some_and(|c| c.generation == 1)
+    })
+    .await;
+    assert!(matches!(
+        a.node.classify_advert(&service_data(0, &new), now).unwrap(),
+        AdvertMatch::Contact { .. }
+    ));
+    assert_eq!(b.node.mesh_stats().discovery_resets, 1);
+}
+
+/// A phone that re-derived generation 0 (restored after a reset) sends an
+/// older card; the contact keeps the newer one and the link stays up.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_older_card_never_replaces_a_newer_one() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    hub.link("a", "b");
+    verified_pair(&a, &b).await;
+    hub.unlink("a", "b");
+    b.node.reset_discovery_key().unwrap();
+    hub.link_as(
+        "b",
+        "a",
+        DialIntent::Contact {
+            inbox_id: inbox(&a),
+        },
+    );
+    eventually("a holds generation 1", || async {
+        a.node
+            .contact(&inbox(&b))
+            .unwrap()
+            .is_some_and(|c| c.generation == 1)
+    })
+    .await;
+    hub.unlink("a", "b");
+    b.node.set_discovery_generation_for_test(0).unwrap();
+    hub.link_as(
+        "b",
+        "a",
+        DialIntent::Contact {
+            inbox_id: inbox(&a),
+        },
+    );
+    verified_pair(&a, &b).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(a.node.contact(&inbox(&b)).unwrap().unwrap().generation, 1);
+    assert!(hub.is_linked("a", "b"), "a stale card is not an error");
+}
+
+/// An ex-contact still holds our static key (a reset does not change it).
+/// After `remove_contact` and a reset, its IK link is refused and it learns
+/// no new card.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_contact_cannot_dial_back_in() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    hub.link("a", "b");
+    verified_pair(&a, &b).await;
+    hub.unlink("a", "b");
+    assert!(b.node.remove_contact(&inbox(&a)).unwrap());
+    b.node.reset_discovery_key().unwrap();
+    hub.link_as(
+        "a",
+        "b",
+        DialIntent::Contact {
+            inbox_id: inbox(&b),
+        },
+    );
+    eventually("b refuses the link", || async { !hub.is_linked("a", "b") }).await;
+    assert_eq!(b.node.mesh_stats().handshake_failed, 1);
+    assert!(b.node.contact(&inbox(&a)).unwrap().unwrap().removed);
+    assert_eq!(a.node.contact(&inbox(&b)).unwrap().unwrap().generation, 0);
+}
+
+/// Two parallel connections between two nodes: `a` knows them as
+/// "b#1"/"b#2", `b` as "a#1"/"a#2". Disconnects are only recorded.
+struct Cross {
+    from_prefix: &'static str,
+    to: MeshNode,
+    closed: Mutex<Vec<String>>,
+}
+
+impl MeshTransport for Cross {
+    fn send(&self, peer: &PeerId, frame: Vec<u8>) {
+        let from = format!("{}{}", self.from_prefix, &peer[2..]);
+        self.to.on_frame(&from, frame);
+    }
+    fn disconnect(&self, peer: &PeerId) {
+        self.closed.lock().unwrap().push(peer.clone());
+    }
+}
+
+/// Both contacts dial at once; each phone ends up with two verified links
+/// to the other. Both keep the link dialed by the lower static key and
+/// close the other one.
+#[tokio::test(flavor = "multi_thread")]
+async fn simultaneous_contact_dials_keep_the_same_link_on_both_phones() {
+    let (na, nb) = (
+        MeshNode::in_memory().unwrap(),
+        MeshNode::in_memory().unwrap(),
+    );
+    let (ca, cb) = (build_client(&na).await, build_client(&nb).await);
+    let ta = Arc::new(Cross {
+        from_prefix: "a#",
+        to: nb.clone(),
+        closed: Mutex::new(Vec::new()),
+    });
+    let tb = Arc::new(Cross {
+        from_prefix: "b#",
+        to: na.clone(),
+        closed: Mutex::new(Vec::new()),
+    });
+    common::start_sync(&na, &ca, ta.clone());
+    common::start_sync(&nb, &cb, tb.clone());
+    let (card_a, card_b) = (
+        na.own_contact_card_for_test().unwrap(),
+        nb.own_contact_card_for_test().unwrap(),
+    );
+    na.add_contact_for_test(card_b.clone());
+    nb.add_contact_for_test(card_a.clone());
+    // Link 1: a dials. Link 2: b dials. Each accepting side is reported first.
+    nb.on_peer_connected("a#1", LinkRole::Accept);
+    na.on_peer_connected(
+        "b#1",
+        LinkRole::Dial(DialIntent::Contact {
+            inbox_id: cb.inbox_id().to_string(),
+        }),
+    );
+    na.on_peer_connected("b#2", LinkRole::Accept);
+    nb.on_peer_connected(
+        "a#2",
+        LinkRole::Dial(DialIntent::Contact {
+            inbox_id: ca.inbox_id().to_string(),
+        }),
+    );
+    let lose = if card_a.noise_static_pub < card_b.noise_static_pub {
+        2
+    } else {
+        1
+    };
+    eventually("each phone closes one link", || async {
+        !ta.closed.lock().unwrap().is_empty() && !tb.closed.lock().unwrap().is_empty()
+    })
+    .await;
+    assert!(
+        ta.closed
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|p| *p == format!("b#{lose}"))
+    );
+    assert!(
+        tb.closed
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|p| *p == format!("a#{lose}"))
+    );
 }
