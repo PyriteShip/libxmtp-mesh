@@ -62,6 +62,9 @@ struct HubInner {
     sim: Option<Sim>,
     /// Pairs that never exchange contact cards (strangers, §B14.3).
     strangers: HashSet<(PeerId, PeerId)>,
+    /// Pairs that already exchanged contact cards: later links and re-links
+    /// do not repeat it, so removals and resets stay in effect.
+    introduced: HashSet<(PeerId, PeerId)>,
 }
 
 struct Sim {
@@ -134,9 +137,9 @@ impl LoopbackHub {
         })
     }
 
-    /// Link `a`–`b` as the radio would (§B14.2): unless the pair are
-    /// strangers, both first learn each other's contact card (as after
-    /// pairing); then the phone with the lower advert token dials, as a
+    /// Link `a`–`b` as the radio would (§B14.2): the first time the pair is
+    /// linked, unless they are strangers or either removed the other, both
+    /// learn each other's contact card (as after pairing); then the phone with the lower advert token dials, as a
     /// contact if it recognises the other's token, else as a relay stranger.
     pub fn link(&self, a: &str, b: &str) {
         {
@@ -165,7 +168,8 @@ impl LoopbackHub {
         na.on_peer_connected(b, LinkRole::Dial(intent));
     }
 
-    /// `a` and `b` never learn each other's contact card.
+    /// `a` and `b` never learn each other's contact card from a later
+    /// `link`. Cards they already stored stay stored.
     pub fn set_strangers(&self, a: &str, b: &str) {
         self.inner.lock().strangers.insert(key(a, b));
     }
@@ -178,7 +182,9 @@ impl LoopbackHub {
             let inner = self.inner.lock();
             (inner.nodes[a].clone(), inner.nodes[b].clone())
         };
-        make_contacts(&na, &nb);
+        if make_contacts(&na, &nb) {
+            self.inner.lock().introduced.insert(key(a, b));
+        }
     }
 
     /// Who would dial whom, and how, if `a`–`b` came up now.
@@ -192,17 +198,45 @@ impl LoopbackHub {
         plan(&na, &nb).map(|(a_dials, intent)| (if a_dials { a } else { b }.to_string(), intent))
     }
 
-    fn connect(&self, a: &str, b: &str) {
-        let (na, nb, strangers) = {
+    /// [`Self::planned_link_for_test`] with both nodes' clocks at `now`
+    /// (unix seconds), so a caller can compute tokens at the same instant.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn planned_link_at_for_test(
+        &self,
+        a: &str,
+        b: &str,
+        now: u64,
+    ) -> Option<(String, DialIntent)> {
+        let (na, nb) = {
             let inner = self.inner.lock();
+            (inner.nodes[a].clone(), inner.nodes[b].clone())
+        };
+        plan_at(&na, &nb, now, now)
+            .map(|(a_dials, intent)| (if a_dials { a } else { b }.to_string(), intent))
+    }
+
+    fn connect(&self, a: &str, b: &str) {
+        let (na, nb, introduce) = {
+            let inner = self.inner.lock();
+            let pair = key(a, b);
             (
                 inner.nodes[a].clone(),
                 inner.nodes[b].clone(),
-                inner.strangers.contains(&key(a, b)),
+                !inner.strangers.contains(&pair) && !inner.introduced.contains(&pair),
             )
         };
-        if !strangers {
-            make_contacts(&na, &nb);
+        // Cards are exchanged once per pair, as a first pairing would, and
+        // never over a removal: a removed contact stays removed.
+        if introduce {
+            let introduced = if removed_either_way(&na, &nb) {
+                true
+            } else {
+                make_contacts(&na, &nb)
+            };
+            if introduced {
+                self.inner.lock().introduced.insert(key(a, b));
+            }
         }
         match plan(&na, &nb) {
             Some((true, intent)) => {
@@ -434,14 +468,19 @@ fn notify_lost(nodes: (Option<MeshNode>, Option<MeshNode>), a: &str, b: &str) {
 /// dials, as a contact if it recognises the other's token. `(a dials,
 /// intent)`, or `None` while either node has no keys.
 fn plan(na: &MeshNode, nb: &MeshNode) -> Option<(bool, DialIntent)> {
-    let ta = na.own_advert_token(na.unix_now())?;
-    let tb = nb.own_advert_token(nb.unix_now())?;
-    let (dialer, seen, a_dials) = if ta <= tb {
-        (na, tb, true)
+    plan_at(na, nb, na.unix_now(), nb.unix_now())
+}
+
+/// [`plan`] with each node's clock read once by the caller.
+fn plan_at(na: &MeshNode, nb: &MeshNode, now_a: u64, now_b: u64) -> Option<(bool, DialIntent)> {
+    let ta = na.own_advert_token(now_a)?;
+    let tb = nb.own_advert_token(now_b)?;
+    let (dialer, seen, dialer_now, a_dials) = if ta <= tb {
+        (na, tb, now_a, true)
     } else {
-        (nb, ta, false)
+        (nb, ta, now_b, false)
     };
-    let intent = match dialer.contact_for_token(&seen, window_at(dialer.unix_now())) {
+    let intent = match dialer.contact_for_token(&seen, window_at(dialer_now)) {
         Ok(Some(inbox_id)) => DialIntent::Contact { inbox_id },
         _ => DialIntent::Relay,
     };
@@ -449,11 +488,27 @@ fn plan(na: &MeshNode, nb: &MeshNode) -> Option<(bool, DialIntent)> {
 }
 
 /// Store each node's card in the other, as a confirmed pairing does.
-fn make_contacts(na: &MeshNode, nb: &MeshNode) {
-    if let (Some(ca), Some(cb)) = (na.own_contact_card(), nb.own_contact_card()) {
-        let _ = na.store_contact_card(&cb, true);
-        let _ = nb.store_contact_card(&ca, true);
-    }
+/// `false` while either node has no keys yet (nothing stored).
+fn make_contacts(na: &MeshNode, nb: &MeshNode) -> bool {
+    let (Some(ca), Some(cb)) = (na.own_contact_card(), nb.own_contact_card()) else {
+        return false;
+    };
+    let _ = na.store_contact_card(&cb, true);
+    let _ = nb.store_contact_card(&ca, true);
+    true
+}
+
+/// Whether either node keeps the other as a removed contact.
+fn removed_either_way(na: &MeshNode, nb: &MeshNode) -> bool {
+    let removed = |n: &MeshNode, other: &MeshNode| {
+        other
+            .local_inbox()
+            .ok()
+            .flatten()
+            .and_then(|inbox| n.contact(&inbox).ok().flatten())
+            .is_some_and(|c| c.removed)
+    };
+    removed(na, nb) || removed(nb, na)
 }
 
 /// One step of a scripted topology change (§R10.1).

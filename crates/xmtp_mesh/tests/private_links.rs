@@ -32,6 +32,7 @@ async fn the_lower_token_dials_and_linked_pairs_are_contacts_by_default() {
     let hub = LoopbackHub::new();
     let a = peer(&hub, "a").await;
     let b = peer(&hub, "b").await;
+    // One clock reading for the tokens and both plans (no window-edge flake).
     let now = a.node.unix_now();
     let (ta, tb) = (
         a.node.own_advert_token(now).unwrap(),
@@ -43,7 +44,7 @@ async fn the_lower_token_dials_and_linked_pairs_are_contacts_by_default() {
         ("b", inbox(&a))
     };
     assert_eq!(
-        hub.planned_link_for_test("a", "b"),
+        hub.planned_link_at_for_test("a", "b", now),
         Some((dialer.to_string(), DialIntent::Relay)),
         "strangers before any card"
     );
@@ -57,7 +58,7 @@ async fn the_lower_token_dials_and_linked_pairs_are_contacts_by_default() {
         Some(inbox(&a))
     );
     assert_eq!(
-        hub.planned_link_for_test("a", "b"),
+        hub.planned_link_at_for_test("a", "b", now),
         Some((
             dialer.to_string(),
             DialIntent::Contact {
@@ -81,4 +82,37 @@ async fn strangers_never_learn_each_others_cards() {
         hub.planned_link_for_test("c", "d"),
         Some((_, DialIntent::Relay))
     ));
+}
+
+/// Cards are exchanged once per pair: a removal survives later links and
+/// simulated re-links (§B14.4).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_contact_stays_removed_across_re_links() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    hub.link("a", "b");
+    assert!(
+        a.node
+            .contact(&inbox(&b))
+            .unwrap()
+            .is_some_and(|c| !c.removed)
+    );
+    assert!(a.node.remove_contact(&inbox(&b)).unwrap());
+    hub.unlink("a", "b");
+    hub.link("a", "b");
+    assert!(
+        a.node
+            .contact(&inbox(&b))
+            .unwrap()
+            .is_some_and(|c| c.removed),
+        "still removed"
+    );
+    assert!(a.node.contacts().unwrap().is_empty());
+    // a no longer recognises b: if a dials, it dials as a stranger.
+    if let Some((dialer, intent)) = hub.planned_link_for_test("a", "b") {
+        if dialer == "a" {
+            assert_eq!(intent, DialIntent::Relay);
+        }
+    }
 }

@@ -80,29 +80,35 @@ impl LinkTx {
             tracing::error!(peer = %self.peer, len = frame.len(), "refusing to send oversized mesh frame");
             return false;
         }
-        {
-            let state = self.state.lock();
-            match &*state {
-                TxState::Pending => {
-                    tracing::debug!(peer = %self.peer, "frame before the link opened: dropped");
+        // The tap sees frames under the same lock, so its order is the
+        // wire order.
+        let state = self.state.lock();
+        match &*state {
+            TxState::Pending => {
+                tracing::debug!(peer = %self.peer, "frame before the link opened: dropped");
+                return false;
+            }
+            TxState::Open(records) => match records.seal(&frame) {
+                Ok(sealed) => {
+                    for record in sealed {
+                        self.transport.send(&self.peer, record);
+                    }
+                    if let Some(tap) = &self.tap {
+                        tap.send(&self.peer, frame);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(peer = %self.peer, error = %e, "could not seal a frame");
                     return false;
                 }
-                TxState::Open(records) => match records.seal(&frame) {
-                    Ok(sealed) => {
-                        for record in sealed {
-                            self.transport.send(&self.peer, record);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(peer = %self.peer, error = %e, "could not seal a frame");
-                        return false;
-                    }
-                },
-                TxState::Plain => self.transport.send(&self.peer, frame.clone()),
-            }
-        }
-        if let Some(tap) = &self.tap {
-            tap.send(&self.peer, frame);
+            },
+            TxState::Plain => match &self.tap {
+                Some(tap) => {
+                    self.transport.send(&self.peer, frame.clone());
+                    tap.send(&self.peer, frame);
+                }
+                None => self.transport.send(&self.peer, frame),
+            },
         }
         true
     }
