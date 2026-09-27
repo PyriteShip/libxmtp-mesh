@@ -16,7 +16,7 @@ use super::spool::{self, Accept, DropReason, TokenBucket};
 use crate::MeshError;
 use crate::node::{MeshNode, NodeEvent, NodeInner};
 use crate::sync::frames::{
-    self, RelayEnvelope, RelayKeyAck, RelayKeyOffer, SpoolDigest, SpoolWant, frame::Body,
+    RelayEnvelope, RelayKeyAck, RelayKeyOffer, SpoolDigest, SpoolWant, frame::Body,
 };
 use crate::sync::{GroupMembership, HelloSigner, MeshTransport};
 
@@ -240,8 +240,8 @@ impl RelayEngine {
         if !self.is_current() {
             return;
         }
-        if let Some((_, transport, _)) = self.parts() {
-            transport.send(&peer.to_string(), frames::encode(body));
+        if let Some(node) = self.node() {
+            node.link_send(peer, body);
         }
     }
 
@@ -1078,6 +1078,7 @@ impl MeshNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::frames;
 
     struct NoExporter;
 

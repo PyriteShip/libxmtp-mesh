@@ -205,13 +205,26 @@ pub use xmtp_mesh::{ClientGroupMembership, ClientHelloSigner};
 
 /// Start `node` syncing over `transport`, signing as `client` and scoping
 /// group traffic by `client`'s group membership (the production wiring).
+/// A node without link keys gets a fixed one per installation.
 pub fn start_sync(node: &MeshNode, client: &MeshClient, transport: Arc<dyn MeshTransport>) {
+    if !node.has_account_key() {
+        node.set_account_key(&xmtp_mesh::store::sha256(
+            client.installation_public_key().as_slice(),
+        ))
+        .unwrap();
+    }
     node.start_sync(
         Arc::new(ClientHelloSigner(client.clone())),
         transport,
         Arc::new(ClientGroupMembership(client.clone())),
     )
     .unwrap();
+}
+
+/// A fixed account key per wallet: a restored phone (same wallet, new
+/// node) derives the same link keys, as with the real recovery phrase.
+pub fn account_key(wallet: &PrivateKeySigner) -> Vec<u8> {
+    xmtp_mesh::store::sha256(wallet.address().as_slice())
 }
 
 pub struct TestPeer {
@@ -308,6 +321,7 @@ pub async fn peer_on(
 ) -> TestPeer {
     hub.register(name, &node);
     let client = build_client_for(&node, wallet).await;
+    node.set_account_key(&account_key(wallet)).unwrap();
     start_sync(&node, &client, hub.transport_for(name));
     TestPeer {
         name: name.to_string(),
@@ -326,20 +340,14 @@ use std::sync::Mutex;
 use xmtp_mesh::frames::{self, frame::Body};
 use xmtp_mesh::{MeshTransport, PeerId};
 
-/// Forwards to another transport and records every frame sent through it.
+/// Records every frame a node's sessions send, before sealing. Installed
+/// with `MeshNode::set_frame_tap_for_test`.
+#[derive(Default)]
 pub struct Recording {
-    inner: Arc<dyn MeshTransport>,
     sent: Mutex<Vec<(PeerId, Vec<u8>)>>,
 }
 
 impl Recording {
-    pub fn new(inner: Arc<dyn MeshTransport>) -> Self {
-        Self {
-            inner,
-            sent: Mutex::new(Vec::new()),
-        }
-    }
-
     /// Raw frames sent to `peer`, in order.
     pub fn raw_to(&self, peer: &str) -> Vec<Vec<u8>> {
         self.sent
@@ -362,15 +370,9 @@ impl Recording {
 
 impl MeshTransport for Recording {
     fn send(&self, peer: &PeerId, frame: Vec<u8>) {
-        self.sent
-            .lock()
-            .unwrap()
-            .push((peer.clone(), frame.clone()));
-        self.inner.send(peer, frame);
+        self.sent.lock().unwrap().push((peer.clone(), frame));
     }
-    fn disconnect(&self, peer: &PeerId) {
-        self.inner.disconnect(peer);
-    }
+    fn disconnect(&self, _peer: &PeerId) {}
 }
 
 /// Like [`peer`], but every frame the node sends is also recorded.
@@ -378,8 +380,9 @@ pub async fn recorded_peer(hub: &LoopbackHub, name: &str) -> (TestPeer, Arc<Reco
     let node = MeshNode::in_memory().unwrap();
     hub.register(name, &node);
     let client = build_client(&node).await;
-    let recording = Arc::new(Recording::new(hub.transport_for(name)));
-    start_sync(&node, &client, recording.clone());
+    let recording = Arc::new(Recording::default());
+    node.set_frame_tap_for_test(Some(recording.clone()));
+    start_sync(&node, &client, hub.transport_for(name));
     (
         TestPeer {
             name: name.to_string(),

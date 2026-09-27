@@ -9,11 +9,14 @@ pub type PeerId = String;
 ///   connection-scoped: a transport MUST use a fresh `PeerId` for every new
 ///   connection (for example `"<shortid>#<n>"`), even to the same device, and
 ///   never reuses an id after reporting `on_peer_lost` for it.
-/// - `MeshNode::on_peer_connected(p)` means a new pipe `p` is up; the node
-///   starts a fresh sync session for it (replacing any session it holds for `p`).
-/// - `MeshNode::on_frame(p, ..)` delivers whole frames in order. A frame may
-///   arrive just before `on_peer_connected(p)`; the node then creates the
-///   session on the first frame.
+/// - `MeshNode::on_peer_connected(p, role)` means a new pipe `p` is up; the
+///   node starts a fresh session for it (replacing any session it holds for
+///   `p`). `role` says who dialed and what the dialer believes the other
+///   phone is (`LinkRole`, DESIGN.md §B14.2). Report the accepting side's
+///   `Accept` before the dialer can send on the pipe.
+/// - `MeshNode::on_frame(p, ..)` delivers whole link messages in order. A
+///   message may arrive just before `on_peer_connected(p)`; the node then
+///   creates an accepting session on the first message.
 /// - `MeshNode::on_peer_lost(p)` means the pipe is gone.
 /// - `send` must not block (queue and return); `disconnect` asks the radio to
 ///   drop the pipe and later report `on_peer_lost`.

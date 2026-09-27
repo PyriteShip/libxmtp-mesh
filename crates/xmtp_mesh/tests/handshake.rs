@@ -342,7 +342,7 @@ async fn peer_that_never_completes_the_handshake_is_dropped_at_the_deadline() {
     let hub = LoopbackHub::new();
     let (a, _, recorder) = recorded_node(&hub).await;
     a.set_handshake_timeout_for_test(std::time::Duration::from_millis(300));
-    a.on_peer_connected("silent");
+    a.connect_plain_for_test("silent");
     hub.inject("mute", "a", hello(vec![3; 32], [4; 32]));
     eventually("both dropped", || async {
         recorder.disconnected("silent") && recorder.disconnected("mute")
@@ -364,7 +364,7 @@ async fn hello_is_resent_while_handshaking_and_bounded() {
             .filter(|b| matches!(b, Body::Hello(_)))
             .count()
     };
-    a.on_peer_connected("p");
+    a.connect_plain_for_test("p");
     recorder.challenge_to("p").await;
     for i in 0..5u8 {
         hub.inject("p", "a", hello(vec![3; 32], [i; 32]));

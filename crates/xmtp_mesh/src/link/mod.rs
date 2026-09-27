@@ -4,6 +4,7 @@
 pub mod keys;
 pub(crate) mod noise;
 pub(crate) mod records;
+pub(crate) mod tx;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -26,6 +27,25 @@ pub enum LinkKind {
     /// Noise NN with a stranger: relay frames only.
     Relay,
     /// Noise XX in pairing mode: full sync, cards wait for confirmation.
+    Pairing,
+}
+
+/// How the radio opened a connection (§B14.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkRole {
+    /// We dialed; the intent says what we believe the other phone is.
+    Dial(DialIntent),
+    /// The other phone dialed us.
+    Accept,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DialIntent {
+    /// The other phone advertised a token of this contact.
+    Contact { inbox_id: String },
+    /// A stranger that offers relay; our relay is on.
+    Relay,
+    /// Both phones are in pairing mode.
     Pairing,
 }
 

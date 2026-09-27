@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,6 +8,7 @@ use tokio::sync::mpsc;
 
 use super::transport::{MeshTransport, PeerId};
 use crate::MeshNode;
+use crate::link::{DialIntent, LinkRole, window_at};
 
 /// How long a dropped link stays down before the hub re-links it.
 const RELINK_AFTER: Duration = Duration::from_millis(500);
@@ -59,6 +60,8 @@ struct HubInner {
     links: HashMap<(PeerId, PeerId), u64>,
     next_generation: u64,
     sim: Option<Sim>,
+    /// Pairs that never exchange contact cards (strangers, §B14.3).
+    strangers: HashSet<(PeerId, PeerId)>,
 }
 
 struct Sim {
@@ -131,7 +134,24 @@ impl LoopbackHub {
         })
     }
 
+    /// Link `a`–`b` as the radio would (§B14.2): unless the pair are
+    /// strangers, both first learn each other's contact card (as after
+    /// pairing); then the phone with the lower advert token dials, as a
+    /// contact if it recognises the other's token, else as a relay stranger.
     pub fn link(&self, a: &str, b: &str) {
+        {
+            let mut inner = self.inner.lock();
+            if let Some(sim) = inner.sim.as_mut() {
+                sim.pending_relinks.remove(&key(a, b));
+            }
+            inner.link_up(a, b);
+        }
+        self.connect(a, b);
+    }
+
+    /// Link with explicit roles: `a` dials `b` with `intent`, `b` accepts.
+    /// No cards are exchanged.
+    pub fn link_as(&self, a: &str, b: &str, intent: DialIntent) {
         let (na, nb) = {
             let mut inner = self.inner.lock();
             if let Some(sim) = inner.sim.as_mut() {
@@ -140,8 +160,65 @@ impl LoopbackHub {
             inner.link_up(a, b);
             (inner.nodes[a].clone(), inner.nodes[b].clone())
         };
-        na.on_peer_connected(b);
-        nb.on_peer_connected(a);
+        // The accepting side first, as the radio reports it (MeshTransport).
+        nb.on_peer_connected(a, LinkRole::Accept);
+        na.on_peer_connected(b, LinkRole::Dial(intent));
+    }
+
+    /// `a` and `b` never learn each other's contact card.
+    pub fn set_strangers(&self, a: &str, b: &str) {
+        self.inner.lock().strangers.insert(key(a, b));
+    }
+
+    /// Both learn each other's contact card, as after a confirmed pairing.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn make_contacts(&self, a: &str, b: &str) {
+        let (na, nb) = {
+            let inner = self.inner.lock();
+            (inner.nodes[a].clone(), inner.nodes[b].clone())
+        };
+        make_contacts(&na, &nb);
+    }
+
+    /// Who would dial whom, and how, if `a`–`b` came up now.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn planned_link_for_test(&self, a: &str, b: &str) -> Option<(String, DialIntent)> {
+        let (na, nb) = {
+            let inner = self.inner.lock();
+            (inner.nodes[a].clone(), inner.nodes[b].clone())
+        };
+        plan(&na, &nb).map(|(a_dials, intent)| (if a_dials { a } else { b }.to_string(), intent))
+    }
+
+    fn connect(&self, a: &str, b: &str) {
+        let (na, nb, strangers) = {
+            let inner = self.inner.lock();
+            (
+                inner.nodes[a].clone(),
+                inner.nodes[b].clone(),
+                inner.strangers.contains(&key(a, b)),
+            )
+        };
+        if !strangers {
+            make_contacts(&na, &nb);
+        }
+        match plan(&na, &nb) {
+            Some((true, intent)) => {
+                nb.on_peer_connected(a, LinkRole::Accept);
+                na.on_peer_connected(b, LinkRole::Dial(intent));
+            }
+            Some((false, intent)) => {
+                na.on_peer_connected(b, LinkRole::Accept);
+                nb.on_peer_connected(a, LinkRole::Dial(intent));
+            }
+            // No keys yet (sync not started): as before, the link is inert.
+            None => {
+                na.on_peer_connected(b, LinkRole::Accept);
+                nb.on_peer_connected(a, LinkRole::Accept);
+            }
+        }
     }
 
     pub fn unlink(&self, a: &str, b: &str) {
@@ -176,11 +253,12 @@ impl LoopbackHub {
     }
 
     #[cfg(any(test, feature = "test-utils"))]
-    /// Deliver a raw frame as if `from` sent it, ignoring links (tests only).
+    /// Deliver `frame` to `to` as if `from`'s link had just decrypted it
+    /// (tests only; see `MeshNode::inject_plain_for_test`).
     pub fn inject(&self, from: &str, to: &str, frame: Vec<u8>) {
         let node = self.inner.lock().nodes.get(to).cloned();
         if let Some(node) = node {
-            node.on_frame(from, frame);
+            node.inject_plain_for_test(from, frame);
         }
     }
 
@@ -244,7 +322,7 @@ impl LoopbackHub {
         let (from, to) = (from.to_string(), to.to_string());
         tokio::spawn(async move {
             tokio::time::sleep(RELINK_AFTER).await;
-            let (nf, nt) = {
+            {
                 let mut inner = hub.inner.lock();
                 let pair = key(&from, &to);
                 let sim = inner.sim.as_mut().expect("simulated hub");
@@ -253,11 +331,9 @@ impl LoopbackHub {
                 }
                 sim.pending_relinks.remove(&pair);
                 inner.link_up(&from, &to);
-                (inner.nodes[&from].clone(), inner.nodes[&to].clone())
-            };
+            }
             tracing::debug!(from, to, "loopback: simulated re-link");
-            nf.on_peer_connected(&to);
-            nt.on_peer_connected(&from);
+            hub.connect(&from, &to);
         });
     }
 }
@@ -351,6 +427,32 @@ fn notify_lost(nodes: (Option<MeshNode>, Option<MeshNode>), a: &str, b: &str) {
     }
     if let Some(n) = nodes.1 {
         n.on_peer_lost(a);
+    }
+}
+
+/// Who dials and how, like the radio (§B14.2): the lower advert token
+/// dials, as a contact if it recognises the other's token. `(a dials,
+/// intent)`, or `None` while either node has no keys.
+fn plan(na: &MeshNode, nb: &MeshNode) -> Option<(bool, DialIntent)> {
+    let ta = na.own_advert_token(na.unix_now())?;
+    let tb = nb.own_advert_token(nb.unix_now())?;
+    let (dialer, seen, a_dials) = if ta <= tb {
+        (na, tb, true)
+    } else {
+        (nb, ta, false)
+    };
+    let intent = match dialer.contact_for_token(&seen, window_at(dialer.unix_now())) {
+        Ok(Some(inbox_id)) => DialIntent::Contact { inbox_id },
+        _ => DialIntent::Relay,
+    };
+    Some((a_dials, intent))
+}
+
+/// Store each node's card in the other, as a confirmed pairing does.
+fn make_contacts(na: &MeshNode, nb: &MeshNode) {
+    if let (Some(ca), Some(cb)) = (na.own_contact_card(), nb.own_contact_card()) {
+        let _ = na.store_contact_card(&cb, true);
+        let _ = nb.store_contact_card(&ca, true);
     }
 }
 

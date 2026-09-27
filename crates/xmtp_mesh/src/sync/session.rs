@@ -9,20 +9,40 @@ use xmtp_proto::mls_v1::{GroupMessage, GroupMessageInput, group_message, group_m
 
 use super::auth::{self, HelloSigner};
 use super::frames::{
-    self, Auth, Hello, IdentityLog, Interest, MAX_FRAME_LEN, MAX_MESSAGES_PER_FRAME, Pending,
-    Sequenced, WelcomeAck, frame::Body,
+    self, Auth, Hello, IdentityLog, Interest, MAX_MESSAGES_PER_FRAME, Pending, Sequenced,
+    WelcomeAck, frame::Body,
 };
 use super::membership::GroupMembership;
 use super::transport::{MeshTransport, PeerId};
 use crate::MeshError;
+use crate::link::LinkRole;
+use crate::link::tx::LinkTx;
 use crate::node::{
     MAX_PEER_IDENTITY_LOG, MAX_RELAYED_IDENTITY_LOGS, MeshNode, NodeEvent, Resolution,
 };
 
+/// What the radio delivered to a session.
+pub(crate) enum Inbound {
+    /// Bytes off the air: handshake messages, then sealed records (§B14.3).
+    Wire(Vec<u8>),
+    /// Test only: a frame as if it had just been decrypted on this link.
+    #[cfg(any(test, feature = "test-utils"))]
+    Plain(Vec<u8>),
+}
+
+/// How a session's link was opened.
+pub(crate) struct LinkSetup {
+    pub(crate) role: LinkRole,
+    /// Test-only cleartext link (no Noise); see `MeshNode::inject_plain_for_test`.
+    pub(crate) plain: bool,
+}
+
 pub(crate) struct SessionHandle {
     /// Distinguishes this session from earlier/later ones for the same peer.
     pub(crate) id: u64,
-    pub(crate) tx: mpsc::UnboundedSender<Vec<u8>>,
+    pub(crate) tx: mpsc::UnboundedSender<Inbound>,
+    /// The link's sending half, shared with the relay engine.
+    pub(crate) link: Arc<LinkTx>,
     /// Set (and `_wake` dropped) when this handle leaves the registry, i.e. the
     /// peer was lost or the entry replaced. A tokio mpsc receiver keeps draining
     /// buffered frames after its senders drop, so the session task checks this
@@ -35,21 +55,42 @@ pub(crate) struct SessionHandle {
 impl SessionHandle {
     pub(crate) fn new(
         id: u64,
-        tx: mpsc::UnboundedSender<Vec<u8>>,
-    ) -> (Self, Arc<AtomicBool>, oneshot::Receiver<()>) {
-        let cancelled = Arc::new(AtomicBool::new(false));
+        tx: mpsc::UnboundedSender<Inbound>,
+        link: Arc<LinkTx>,
+        cancelled: Arc<AtomicBool>,
+    ) -> (Self, oneshot::Receiver<()>) {
         let (wake, wake_rx) = oneshot::channel();
         (
             Self {
                 id,
                 tx,
-                cancelled: cancelled.clone(),
+                link,
+                cancelled,
                 _wake: wake,
             },
-            cancelled,
             wake_rx,
         )
     }
+}
+
+/// A registry entry whose session never runs (node registry tests).
+#[cfg(test)]
+pub(crate) fn test_handle(id: u64) -> SessionHandle {
+    struct Nowhere;
+    impl MeshTransport for Nowhere {
+        fn send(&self, _: &PeerId, _: Vec<u8>) {}
+        fn disconnect(&self, _: &PeerId) {}
+    }
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let link = Arc::new(LinkTx::new(
+        "p".into(),
+        Arc::new(Nowhere),
+        cancelled.clone(),
+        true,
+        None,
+    ));
+    SessionHandle::new(id, tx, link, cancelled).0
 }
 
 impl Drop for SessionHandle {
@@ -139,6 +180,12 @@ pub(crate) struct Session {
     pub(crate) node: MeshNode,
     pub(crate) peer: PeerId,
     pub(crate) transport: Arc<dyn MeshTransport>,
+    /// How the radio opened this link (§B14.2).
+    pub(crate) role: LinkRole,
+    /// Test-only cleartext link.
+    pub(crate) plain: bool,
+    /// The link's sending half; every frame goes out through it.
+    pub(crate) link: Arc<LinkTx>,
     pub(crate) signer: Arc<dyn HelloSigner>,
     pub(crate) membership: Arc<dyn GroupMembership>,
     pub(crate) challenge: [u8; 32],
@@ -178,11 +225,21 @@ pub(crate) fn spawn(
     transport: Arc<dyn MeshTransport>,
     signer: Arc<dyn HelloSigner>,
     membership: Arc<dyn GroupMembership>,
+    setup: LinkSetup,
 ) -> SessionHandle {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::unbounded_channel();
-    let (handle, cancelled, wake) = SessionHandle::new(id, tx);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    // Cleartext until the Noise handshake is wired in (§B14.3).
+    let link = Arc::new(LinkTx::new(
+        peer.clone(),
+        transport.clone(),
+        cancelled.clone(),
+        true,
+        node.frame_tap(),
+    ));
+    let (handle, wake) = SessionHandle::new(id, tx, link.clone(), cancelled.clone());
     let events = node.subscribe_events();
     let session = Session {
         id,
@@ -190,6 +247,9 @@ pub(crate) fn spawn(
         node,
         peer,
         transport,
+        role: setup.role,
+        plain: setup.plain,
+        link,
         signer,
         membership,
         challenge: rand::random(),
@@ -220,24 +280,18 @@ impl Session {
         self.try_send(body);
     }
 
-    /// Frames over [`MAX_FRAME_LEN`] are refused (logged), never sent.
+    /// Frames over [`frames::MAX_FRAME_LEN`] are refused (logged), never sent.
     /// Returns whether the frame went out.
     fn try_send(&self, body: Body) -> bool {
         if self.is_cancelled() {
             return false;
         }
-        let frame = frames::encode(body);
-        if frame.len() > MAX_FRAME_LEN {
-            tracing::error!(peer = %self.peer, len = frame.len(), "refusing to send oversized mesh frame");
-            return false;
-        }
-        self.transport.send(&self.peer, frame);
-        true
+        self.link.send(body)
     }
 
     async fn run(
         mut self,
-        mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        mut rx: mpsc::UnboundedReceiver<Inbound>,
         mut events: broadcast::Receiver<NodeEvent>,
         mut wake: oneshot::Receiver<()>,
     ) {
@@ -247,7 +301,7 @@ impl Session {
 
     async fn run_loop(
         &mut self,
-        rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
+        rx: &mut mpsc::UnboundedReceiver<Inbound>,
         events: &mut broadcast::Receiver<NodeEvent>,
         wake: &mut oneshot::Receiver<()>,
     ) {
@@ -278,11 +332,11 @@ impl Session {
                     break;
                 }
                 frame = rx.recv() => {
-                    let Some(bytes) = frame else { break };
+                    let Some(inbound) = frame else { break };
                     if self.is_cancelled() {
                         break;
                     }
-                    if let Err(e) = self.on_frame(&bytes).await {
+                    if let Err(e) = self.on_inbound(inbound).await {
                         tracing::warn!(peer = %self.peer, error = %e, "mesh frame rejected");
                         if e.is_fatal() {
                             if !self.is_cancelled() {
@@ -311,6 +365,14 @@ impl Session {
                     }
                 }
             }
+        }
+    }
+
+    async fn on_inbound(&mut self, inbound: Inbound) -> Result<(), MeshError> {
+        match inbound {
+            Inbound::Wire(bytes) => self.on_frame(&bytes).await,
+            #[cfg(any(test, feature = "test-utils"))]
+            Inbound::Plain(frame) => self.on_frame(&frame).await,
         }
     }
 

@@ -13,8 +13,9 @@ use parking_lot::Mutex;
 use tokio::sync::broadcast::error::RecvError;
 use xmtp_api_d14n::ClientBundle;
 use xmtp_mesh::{
-    ClientGroupMembership, ClientHelloSigner, ClientRelayExporter, MAX_FRAME_LEN, MeshError,
-    MeshNode, MeshStats, MeshTransport, NodeEvent, PeerId, RelayStats, ResyncOutcome, VerifiedPeer,
+    ClientGroupMembership, ClientHelloSigner, ClientRelayExporter, DialIntent, LinkRole,
+    MAX_FRAME_LEN, MeshError, MeshNode, MeshStats, MeshTransport, NodeEvent, PeerId, RelayStats,
+    ResyncOutcome, VerifiedPeer,
 };
 use xmtp_mls::client::ClientError;
 use xmtp_mls::identity::IdentityError;
@@ -308,6 +309,32 @@ impl From<VerifiedPeer> for FfiVerifiedPeer {
     }
 }
 
+/// How the radio opened a connection (DESIGN.md §B14.2).
+#[derive(uniffi::Enum, Clone, Debug, PartialEq, Eq)]
+pub enum FfiLinkRole {
+    /// We dialed a phone whose advert token belongs to this contact.
+    DialContact { inbox_id: String },
+    /// We dialed a stranger that offers relay (our relay is on).
+    DialRelay,
+    /// We dialed a phone in pairing mode (ours is on too).
+    DialPairing,
+    /// The other phone dialed us.
+    Accept,
+}
+
+impl From<FfiLinkRole> for LinkRole {
+    fn from(role: FfiLinkRole) -> Self {
+        match role {
+            FfiLinkRole::DialContact { inbox_id } => {
+                LinkRole::Dial(DialIntent::Contact { inbox_id })
+            }
+            FfiLinkRole::DialRelay => LinkRole::Dial(DialIntent::Relay),
+            FfiLinkRole::DialPairing => LinkRole::Dial(DialIntent::Pairing),
+            FfiLinkRole::Accept => LinkRole::Accept,
+        }
+    }
+}
+
 /// Relay counters since the relay engine started (DESIGN.md §R5.4). A snapshot, not a stream.
 #[derive(uniffi::Record, Clone, Debug, Default, PartialEq, Eq)]
 pub struct FfiRelayStats {
@@ -590,9 +617,10 @@ impl FfiMeshNode {
         self.node.mesh_stats().into()
     }
 
-    /// The radio opened a new connection `peer_id` (fresh, never reused).
-    pub fn on_peer_connected(&self, peer_id: String) {
-        self.node.on_peer_connected(&peer_id);
+    /// The radio opened a new connection `peer_id` (fresh, never reused) as
+    /// `role`. Report the accepting side before the dialer can send.
+    pub fn on_peer_connected(&self, peer_id: String, role: FfiLinkRole) {
+        self.node.on_peer_connected(&peer_id, role.into());
     }
 
     /// One whole frame arrived over `peer_id`. Call in arrival order.
@@ -1013,8 +1041,8 @@ mod tests {
         // The radio calls these from its own thread, never from a tokio worker.
         let (na, nb) = (node_a.clone(), node_b.clone());
         std::thread::spawn(move || {
-            na.on_peer_connected("b#1".into());
-            nb.on_peer_connected("a#1".into());
+            na.on_peer_connected("b#1".into(), FfiLinkRole::Accept);
+            nb.on_peer_connected("a#1".into(), FfiLinkRole::Accept);
         })
         .join()
         .unwrap();
@@ -1099,7 +1127,7 @@ mod tests {
         assert!(node_b.authenticated_peers().is_empty());
         assert!(node_b.verified_peers().is_empty());
         // After stop_sync, callbacks are ignored until the next start_sync.
-        node_b.on_peer_connected("a#2".into());
+        node_b.on_peer_connected("a#2".into(), FfiLinkRole::Accept);
         node_b.on_frame("a#2".into(), vec![1, 2, 3]);
         assert!(node_b.authenticated_peers().is_empty());
     }
@@ -1259,7 +1287,7 @@ mod tests {
         // A connection whose every send and disconnect throws.
         let na = node_a.clone();
         std::thread::spawn(move || {
-            na.on_peer_connected("x#1".into());
+            na.on_peer_connected("x#1".into(), FfiLinkRole::Accept);
             na.on_frame("x#1".into(), vec![0xde, 0xad]);
         })
         .join()
@@ -1269,8 +1297,8 @@ mod tests {
         // though the callback throws on every event.
         let (na, nb) = (node_a.clone(), node_b.clone());
         std::thread::spawn(move || {
-            na.on_peer_connected("b#1".into());
-            nb.on_peer_connected("a#1".into());
+            na.on_peer_connected("b#1".into(), FfiLinkRole::Accept);
+            nb.on_peer_connected("a#1".into(), FfiLinkRole::Accept);
         })
         .join()
         .unwrap();

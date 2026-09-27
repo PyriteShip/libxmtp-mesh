@@ -4,13 +4,17 @@ use std::sync::atomic::Ordering;
 
 use super::MeshNode;
 use crate::MeshError;
+use crate::link::LinkRole;
 use crate::link::keys::{AccountPrk, MeshKeys};
 use crate::link::{
     AdvertMatch, AdvertState, FLAG_PAIRING, FLAG_RELAY, LinkCounters, LinkKeyInfo, Token,
     WINDOW_SECS, advert_token, parse_service_data, service_data, window_at,
 };
 use crate::store::{Contact, ContactUpdate};
+use crate::sync::MeshTransport;
 use crate::sync::frames::ContactCard;
+use crate::sync::frames::frame::Body;
+use crate::sync::session::{Inbound, LinkSetup};
 
 impl MeshNode {
     /// Derive this phone's link keys from the account key (the secp256k1
@@ -264,6 +268,95 @@ impl MeshNode {
         *self.inner.link.keys.lock() = Some(Arc::new(MeshKeys::derive(prk, &inbox_id, generation)));
         self.inner.link.bump_contacts_version();
         Ok(())
+    }
+
+    pub(crate) fn frame_tap(&self) -> Option<Arc<dyn MeshTransport>> {
+        self.inner.frame_tap.lock().clone()
+    }
+
+    /// Send `body` on `peer`'s link (sealed once the link is open).
+    /// Returns whether it went out.
+    pub(crate) fn link_send(&self, peer: &str, body: Body) -> bool {
+        let link = self.inner.sessions.lock().get(peer).map(|h| h.link.clone());
+        match link {
+            Some(link) => link.send(body),
+            None => {
+                // The relay engine's unit tests link peers without sessions.
+                #[cfg(test)]
+                if let Some(transport) =
+                    self.inner.sync.lock().as_ref().map(|c| c.transport.clone())
+                {
+                    transport.send(&peer.to_string(), crate::sync::frames::encode(body));
+                    return true;
+                }
+                false
+            }
+        }
+    }
+
+    /// Deliver `frame` to `peer`'s session as if it had just been decrypted
+    /// there. Before the link opens it waits for the handshake; with no
+    /// session, a test-only cleartext session is started for it.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn inject_plain_for_test(&self, peer: &str, frame: Vec<u8>) {
+        let tx = {
+            let sync = self.inner.sync.lock();
+            let Some(config) = sync.as_ref() else { return };
+            let mut sessions = self.inner.sessions.lock();
+            sessions
+                .entry(peer.to_string())
+                .or_insert_with(|| {
+                    config.spawn_session(
+                        self,
+                        peer,
+                        LinkSetup {
+                            role: LinkRole::Accept,
+                            plain: true,
+                        },
+                    )
+                })
+                .tx
+                .clone()
+        };
+        let _ = tx.send(Inbound::Plain(frame));
+    }
+
+    /// Like `on_peer_connected`, but a test-only cleartext link: the
+    /// session says Hello at once, as sessions did before Noise.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn connect_plain_for_test(&self, peer: &str) {
+        let sync = self.inner.sync.lock();
+        let Some(config) = sync.as_ref() else { return };
+        let handle = config.spawn_session(
+            self,
+            peer,
+            LinkSetup {
+                role: LinkRole::Accept,
+                plain: true,
+            },
+        );
+        let mut sessions = self.inner.sessions.lock();
+        let old = sessions.insert(peer.to_string(), handle);
+        self.forget_peer(peer);
+        drop(sessions);
+        drop(sync);
+        drop(old);
+    }
+
+    /// Every frame sessions started from now on send also goes to `tap`,
+    /// before sealing.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn set_frame_tap_for_test(&self, tap: Option<Arc<dyn MeshTransport>>) {
+        *self.inner.frame_tap.lock() = tap;
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn send_frame_for_test(&self, peer: &str, body: Body) -> bool {
+        self.link_send(peer, body)
     }
 }
 

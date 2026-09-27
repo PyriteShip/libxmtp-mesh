@@ -33,7 +33,9 @@ use xmtp_api_grpc::error::GrpcError;
 use xmtp_proto::api::{ApiClientError, Client, IsConnectedCheck};
 
 use crate::MeshError;
+use crate::link::LinkRole;
 use crate::store::{MeshStore, StoredGroupMessage, StoredWelcome};
+use crate::sync::session::{Inbound, LinkSetup};
 use crate::sync::{GroupMembership, HelloSigner, MeshTransport, PeerId, session};
 
 pub type MeshStream = Pin<Box<dyn Stream<Item = Result<Bytes, GrpcError>> + Send>>;
@@ -93,6 +95,8 @@ pub(crate) struct NodeInner {
     pub(crate) relay_links: Mutex<HashMap<PeerId, (Vec<u8>, String)>>,
     /// Link keys, pairing mode, counters (DESIGN.md §B14).
     pub(crate) link: crate::link::LinkState,
+    /// Test only: receives every frame the sessions send, before sealing.
+    pub(crate) frame_tap: Mutex<Option<Arc<dyn MeshTransport>>>,
     /// Signed-sequencing counters, shared with the store (§B13).
     pub(crate) seq: Arc<crate::sync::seq::SeqCounters>,
     /// Test only: the order `stop_sync`'s teardown steps ran in.
@@ -119,7 +123,12 @@ pub(crate) struct SyncConfig {
 }
 
 impl SyncConfig {
-    fn spawn_session(&self, node: &MeshNode, peer: &str) -> session::SessionHandle {
+    fn spawn_session(
+        &self,
+        node: &MeshNode,
+        peer: &str,
+        setup: LinkSetup,
+    ) -> session::SessionHandle {
         session::spawn(
             &self.runtime,
             node.clone(),
@@ -127,6 +136,7 @@ impl SyncConfig {
             self.transport.clone(),
             self.signer.clone(),
             self.membership.clone(),
+            setup,
         )
     }
 }
@@ -207,6 +217,7 @@ impl MeshNode {
                 relay: Mutex::new(None),
                 relay_links: Mutex::new(HashMap::new()),
                 link: Default::default(),
+                frame_tap: Mutex::new(None),
                 seq,
                 #[cfg(test)]
                 stop_sync_order: Mutex::new(Vec::new()),
@@ -394,24 +405,31 @@ impl MeshNode {
         Ok(())
     }
 
-    fn session_for(&self, peer: &str) -> Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>> {
+    fn session_for(&self, peer: &str) -> Option<tokio::sync::mpsc::UnboundedSender<Inbound>> {
         let sync = self.inner.sync.lock();
         let config = sync.as_ref()?;
         let mut sessions = self.inner.sessions.lock();
-        let handle = sessions
-            .entry(peer.to_string())
-            .or_insert_with(|| config.spawn_session(self, peer));
+        let handle = sessions.entry(peer.to_string()).or_insert_with(|| {
+            config.spawn_session(
+                self,
+                peer,
+                LinkSetup {
+                    role: LinkRole::Accept,
+                    plain: false,
+                },
+            )
+        });
         Some(handle.tx.clone())
     }
 
-    /// The radio connected a new pipe `peer` (see [`MeshTransport`]): start a
-    /// fresh session, replacing (and cancelling) any session held for `peer`,
-    /// e.g. one a stray frame created. Frames also create a session implicitly
-    /// when they arrive before this call.
-    pub fn on_peer_connected(&self, peer: &str) {
+    /// The radio connected a new pipe `peer` (see [`MeshTransport`]) as
+    /// `role`: start a fresh session, replacing (and cancelling) any session
+    /// held for `peer`, e.g. one a stray frame created. Frames also create an
+    /// accepting session implicitly when they arrive before this call.
+    pub fn on_peer_connected(&self, peer: &str, role: LinkRole) {
         let sync = self.inner.sync.lock();
         let Some(config) = sync.as_ref() else { return };
-        let handle = config.spawn_session(self, peer);
+        let handle = config.spawn_session(self, peer, LinkSetup { role, plain: false });
         let mut sessions = self.inner.sessions.lock();
         let old = sessions.insert(peer.to_string(), handle);
         self.forget_peer(peer);
@@ -422,7 +440,7 @@ impl MeshNode {
 
     pub fn on_frame(&self, peer: &str, frame: Vec<u8>) {
         if let Some(tx) = self.session_for(peer) {
-            let _ = tx.send(frame);
+            let _ = tx.send(Inbound::Wire(frame));
         }
     }
 
@@ -627,8 +645,7 @@ mod session_registry_tests {
     use super::*;
 
     fn handle(id: u64) -> session::SessionHandle {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        session::SessionHandle::new(id, tx).0
+        session::test_handle(id)
     }
 
     #[test]
