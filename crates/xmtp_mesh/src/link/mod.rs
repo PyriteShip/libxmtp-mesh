@@ -6,10 +6,11 @@ pub(crate) mod noise;
 pub(crate) mod records;
 pub(crate) mod tx;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 
 pub use keys::{
     ADVERT_LEN, ADVERT_VERSION, FLAG_PAIRING, FLAG_RELAY, TOKEN_LEN, Token, WINDOW_SECS,
@@ -17,6 +18,7 @@ pub use keys::{
 };
 pub use noise::short_code;
 
+use crate::sync::frames::frame::Body;
 use crate::sync::seq::MeshStats;
 
 /// The kind of an open link (§B14.3).
@@ -47,6 +49,18 @@ pub enum DialIntent {
     Relay,
     /// Both phones are in pairing mode.
     Pairing,
+}
+
+/// Frames a link of `kind` may carry (§B14.3). A relay link carries relay
+/// traffic only: nothing that names a phone or a group.
+pub(crate) fn allowed_on(kind: LinkKind, body: &Body) -> bool {
+    match kind {
+        LinkKind::Relay => matches!(
+            body,
+            Body::Relay(_) | Body::SpoolDigest(_) | Body::SpoolWant(_)
+        ),
+        LinkKind::Contact | LinkKind::Pairing => true,
+    }
 }
 
 /// Public facts about the keys `set_account_key` derived.
@@ -101,6 +115,7 @@ pub(crate) struct LinkCounters {
     handshake_failed: AtomicU64,
     frame_rejected: AtomicU64,
     discovery_resets: AtomicU64,
+    relay_idle_closed: AtomicU64,
 }
 
 impl LinkCounters {
@@ -121,6 +136,10 @@ impl LinkCounters {
         self.frame_rejected.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn count_relay_idle_closed(&self) {
+        self.relay_idle_closed.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn count_discovery_reset(&self) {
         self.discovery_resets.fetch_add(1, Ordering::Relaxed);
     }
@@ -133,11 +152,23 @@ impl LinkCounters {
         stats.handshake_failed = get(&self.handshake_failed);
         stats.link_frame_rejected = get(&self.frame_rejected);
         stats.discovery_resets = get(&self.discovery_resets);
+        stats.relay_links_idle_closed = get(&self.relay_idle_closed);
     }
 }
 
+/// Which IK dialers get a contact link (§B14.2): the live contacts' static
+/// keys, or anyone while the phone has no contact at all (not even a
+/// removed one: a restored phone). An in-memory copy of the store, so a
+/// responder answers without database I/O.
+#[derive(Default)]
+pub(crate) struct AllowedDialers {
+    pub(crate) live: HashSet<[u8; 32]>,
+    pub(crate) no_contacts: bool,
+}
+
 /// The node's link state (§B14). Keys live in memory only and are zeroized
-/// on drop. Lock order: `prk`, then the store, then `keys`.
+/// on drop. Lock order: `prk`, then the store, then `keys`, then
+/// `dialers`.
 #[derive(Default)]
 pub(crate) struct LinkState {
     pub(crate) prk: Mutex<Option<keys::AccountPrk>>,
@@ -147,6 +178,9 @@ pub(crate) struct LinkState {
     contacts_version: AtomicU64,
     /// Test only: seconds added to the wall clock.
     pub(crate) clock_offset_secs: AtomicI64,
+    /// The node's one IK replay cache, shared by all its responders.
+    pub(crate) replay: noise::ReplayCache,
+    pub(crate) dialers: RwLock<AllowedDialers>,
 }
 
 impl LinkState {

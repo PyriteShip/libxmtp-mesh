@@ -2,7 +2,9 @@
 pub type PeerId = String;
 
 /// The radio, as the node sees it (BLE in sub-project 2). The radio does
-/// chunking and reassembly; the node always sends whole frames.
+/// chunking and reassembly; the node always sends whole link messages: a
+/// 128-byte handshake message 1, the other handshake messages, then sealed
+/// records of at most 65 535 bytes (DESIGN.md §B14.3).
 ///
 /// Contract a transport must keep:
 /// - Each `PeerId` names ONE reliable, ordered byte pipe. Ids are
@@ -16,14 +18,17 @@ pub type PeerId = String;
 ///   `Accept` before the dialer can send on the pipe.
 /// - `MeshNode::on_frame(p, ..)` delivers whole link messages in order. A
 ///   message may arrive just before `on_peer_connected(p)`; the node then
-///   creates an accepting session on the first message.
+///   creates an accepting session on the first message, and a later
+///   `on_peer_connected(p, Accept)` keeps it.
 /// - `MeshNode::on_peer_lost(p)` means the pipe is gone.
 /// - `send` must not block (queue and return); `disconnect` asks the radio to
 ///   drop the pipe and later report `on_peer_lost`.
 ///
 /// A session that does not authenticate its peer within the handshake
-/// deadline (15 s) is disconnected, so stray frames and devices that never
-/// speak the protocol cannot hold a session (or a radio slot) forever.
+/// deadline (15 s) is disconnected, and so is a relay link that carries no
+/// relay frame for a minute, so stray frames, devices that never speak the
+/// protocol and idle strangers cannot hold a session (or a radio slot)
+/// forever.
 ///
 /// [`LoopbackHub`](super::LoopbackHub) reuses node names as `PeerId`s across
 /// re-links for test readability; the node tolerates that (a re-link starts a

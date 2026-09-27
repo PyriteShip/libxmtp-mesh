@@ -6,9 +6,10 @@ use super::MeshNode;
 use crate::MeshError;
 use crate::link::LinkRole;
 use crate::link::keys::{AccountPrk, MeshKeys};
+use crate::link::noise::{ReplayCache, ResponderContext};
 use crate::link::{
-    AdvertMatch, AdvertState, FLAG_PAIRING, FLAG_RELAY, LinkCounters, LinkKeyInfo, Token,
-    WINDOW_SECS, advert_token, parse_service_data, service_data, window_at,
+    AdvertMatch, AdvertState, AllowedDialers, FLAG_PAIRING, FLAG_RELAY, LinkCounters, LinkKeyInfo,
+    Token, WINDOW_SECS, advert_token, parse_service_data, service_data, window_at,
 };
 use crate::store::{Contact, ContactUpdate};
 use crate::sync::MeshTransport;
@@ -192,15 +193,40 @@ impl MeshNode {
     /// stays on file, so an IK link from it is refused. Follow with
     /// `reset_discovery_key` so it can no longer recognise this phone.
     pub fn remove_contact(&self, inbox_id: &str) -> Result<bool, MeshError> {
-        let removed = self
-            .inner
-            .store
-            .lock()
-            .remove_contact(inbox_id, Self::now_ns())?;
+        let mut store = self.inner.store.lock();
+        let removed = store.remove_contact(inbox_id, Self::now_ns())?;
         if removed {
+            self.refresh_allowed_dialers(&mut store);
             self.inner.link.bump_contacts_version();
         }
         Ok(removed)
+    }
+
+    /// Re-read which IK dialers get a contact link (§B14.2) after the
+    /// contacts changed. Callers hold the store. On a store error nobody
+    /// is allowed (fails closed: dialers get the stranger fallback).
+    pub(crate) fn refresh_allowed_dialers(&self, store: &mut crate::store::MeshStore) {
+        let dialers = match store.contact_statics() {
+            Ok((live, any)) => AllowedDialers {
+                live: live.into_iter().collect(),
+                no_contacts: !any,
+            },
+            Err(e) => {
+                tracing::warn!(error = %e, "contacts unavailable; no IK dialer allowed");
+                AllowedDialers::default()
+            }
+        };
+        *self.inner.link.dialers.write() = dialers;
+    }
+
+    /// A stranger relay link opened on session `session_id` (§B14.5).
+    pub(crate) fn relay_stranger_link_up(&self, peer: &str, session_id: u64) {
+        self.relay_session_link_up(
+            peer,
+            session_id,
+            crate::relay::stranger_source(),
+            String::new(),
+        );
     }
 
     pub(crate) fn store_contact_card(
@@ -208,12 +234,10 @@ impl MeshNode {
         card: &ContactCard,
         force: bool,
     ) -> Result<ContactUpdate, MeshError> {
-        let outcome = self
-            .inner
-            .store
-            .lock()
-            .upsert_contact(card, Self::now_ns(), force)?;
+        let mut store = self.inner.store.lock();
+        let outcome = store.upsert_contact(card, Self::now_ns(), force)?;
         if matches!(outcome, ContactUpdate::Inserted | ContactUpdate::Updated) {
+            self.refresh_allowed_dialers(&mut store);
             self.inner.link.bump_contacts_version();
         }
         Ok(outcome)
@@ -313,6 +337,7 @@ impl MeshNode {
                         LinkSetup {
                             role: LinkRole::Accept,
                             plain: true,
+                            implicit: false,
                         },
                     )
                 })
@@ -335,6 +360,7 @@ impl MeshNode {
             LinkSetup {
                 role: LinkRole::Accept,
                 plain: true,
+                implicit: false,
             },
         );
         let mut sessions = self.inner.sessions.lock();
@@ -357,6 +383,23 @@ impl MeshNode {
     #[doc(hidden)]
     pub fn send_frame_for_test(&self, peer: &str, body: Body) -> bool {
         self.link_send(peer, body)
+    }
+}
+
+/// The node answers for its accepting handshakes (§B14.2): from memory,
+/// without the store, so every dialer is answered alike and quickly.
+impl ResponderContext for MeshNode {
+    fn window(&self) -> u64 {
+        window_at(self.unix_now())
+    }
+
+    fn is_allowed_dialer(&self, dialer_static: &[u8; 32]) -> bool {
+        let dialers = self.inner.link.dialers.read();
+        dialers.no_contacts || dialers.live.contains(dialer_static)
+    }
+
+    fn replay_cache(&self) -> &ReplayCache {
+        &self.inner.link.replay
     }
 }
 

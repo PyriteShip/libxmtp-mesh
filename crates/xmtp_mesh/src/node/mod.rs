@@ -55,8 +55,10 @@ pub(crate) struct NodeInner {
     pub(crate) verified: Mutex<HashMap<PeerId, VerifiedPeer>>,
     /// How long an authenticated peer has to prove inbox membership.
     pub(crate) peer_verify_timeout: Mutex<Duration>,
-    /// How long a session has to complete Hello/Auth.
+    /// How long a session has to complete its Noise handshake and Hello/Auth.
     pub(crate) handshake_timeout: Mutex<Duration>,
+    /// How long an open relay link may go without a relay frame.
+    pub(crate) relay_idle_timeout: Mutex<Duration>,
     /// Test only: never send our identity log to peers.
     pub(crate) suppress_identity_log: AtomicBool,
     /// Test only: sessions drop live GroupSequenced pushes (simulates a lagged stream).
@@ -111,6 +113,11 @@ pub(crate) const PEER_VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
 /// the node disconnects it. Bounds sessions created by stray frames and
 /// devices that never speak the protocol.
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Default time an open relay (stranger) link may go without receiving a
+/// relay frame before the node closes it, so a stranger cannot hold one of
+/// the radio's few connections forever (§B14.3).
+pub(crate) const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub(crate) struct SyncConfig {
     pub(crate) signer: Arc<dyn HelloSigner>,
@@ -194,7 +201,7 @@ impl MeshNode {
     pub fn new(store: MeshStore) -> Self {
         let (events, _) = broadcast::channel(1024);
         let seq = store.seq_counters();
-        Self {
+        let node = Self {
             inner: Arc::new(NodeInner {
                 store: Mutex::new(store),
                 events,
@@ -204,6 +211,7 @@ impl MeshNode {
                 verified: Default::default(),
                 peer_verify_timeout: Mutex::new(PEER_VERIFY_TIMEOUT),
                 handshake_timeout: Mutex::new(HANDSHAKE_TIMEOUT),
+                relay_idle_timeout: Mutex::new(RELAY_IDLE_TIMEOUT),
                 suppress_identity_log: AtomicBool::new(false),
                 suppress_group_push: AtomicBool::new(false),
                 replaced_at: Mutex::new(HashMap::new()),
@@ -222,7 +230,9 @@ impl MeshNode {
                 #[cfg(test)]
                 stop_sync_order: Mutex::new(Vec::new()),
             }),
-        }
+        };
+        node.refresh_allowed_dialers(&mut node.inner.store.lock());
+        node
     }
 
     pub fn in_memory() -> Result<Self, MeshError> {
@@ -335,6 +345,8 @@ impl MeshNode {
     /// runtime's handle and runs every sync session on it, so the transport
     /// callbacks (`on_peer_connected`, `on_frame`, `on_peer_lost`) may then be
     /// called from any thread.
+    ///
+    /// Call `set_account_key` first (DESIGN.md §B14.1).
     pub fn start_sync(
         &self,
         signer: Arc<dyn HelloSigner>,
@@ -347,6 +359,9 @@ impl MeshNode {
             return Err(MeshError::InvalidRequest(
                 "signer is not this node's installation".into(),
             ));
+        }
+        if !self.has_account_key() {
+            return Err(MeshError::NoAccountKey);
         }
         // Held for the whole critical section, so a
         // concurrent `stop_sync` can't interleave between the identity task
@@ -416,6 +431,7 @@ impl MeshNode {
                 LinkSetup {
                     role: LinkRole::Accept,
                     plain: false,
+                    implicit: true,
                 },
             )
         });
@@ -429,8 +445,25 @@ impl MeshNode {
     pub fn on_peer_connected(&self, peer: &str, role: LinkRole) {
         let sync = self.inner.sync.lock();
         let Some(config) = sync.as_ref() else { return };
-        let handle = config.spawn_session(self, peer, LinkSetup { role, plain: false });
         let mut sessions = self.inner.sessions.lock();
+        // A frame of this connection arrived first and started the accepting
+        // session (MeshTransport): it already holds the handshake. Keep it.
+        if role == LinkRole::Accept
+            && let Some(handle) = sessions.get_mut(peer)
+            && handle.implicit
+        {
+            handle.implicit = false;
+            return;
+        }
+        let handle = config.spawn_session(
+            self,
+            peer,
+            LinkSetup {
+                role,
+                plain: false,
+                implicit: false,
+            },
+        );
         let old = sessions.insert(peer.to_string(), handle);
         self.forget_peer(peer);
         drop(sessions);
@@ -730,6 +763,9 @@ mod sync_lifecycle_tests {
             .lock()
             .set_local_installation(&key)
             .unwrap();
+        // Link keys, so start_sync gets as far as the backfill.
+        node.inner.store.lock().set_local_inbox("inbox").unwrap();
+        node.set_account_key(&[1; 32]).unwrap();
         // An unsigned row already stored, so the backfill actually reaches
         // the signer instead of returning early with nothing to sign.
         node.inner

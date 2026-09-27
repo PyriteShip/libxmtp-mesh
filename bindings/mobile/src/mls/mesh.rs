@@ -335,6 +335,13 @@ impl From<FfiLinkRole> for LinkRole {
     }
 }
 
+/// Public facts about the link keys derived from the account key.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FfiLinkKeyInfo {
+    pub noise_static_pub: Vec<u8>,
+    pub generation: u32,
+}
+
 /// Relay counters since the relay engine started (DESIGN.md §R5.4). A snapshot, not a stream.
 #[derive(uniffi::Record, Clone, Debug, Default, PartialEq, Eq)]
 pub struct FfiRelayStats {
@@ -560,6 +567,26 @@ impl FfiXmtpClient {
 
 #[uniffi::export(async_runtime = "tokio")]
 impl FfiMeshNode {
+    /// Derive the link keys (DESIGN.md §B14.1) from the account's
+    /// secp256k1 private key (32 bytes, the key the recovery phrase
+    /// restores). Call after registration and before `start_sync`, once per
+    /// process start. The node keeps only derived keys, in memory.
+    pub fn set_account_key(&self, account_key: Vec<u8>) -> Result<FfiLinkKeyInfo, FfiError> {
+        let info = self
+            .node
+            .set_account_key(&account_key)
+            .map_err(mesh_error)?;
+        Ok(FfiLinkKeyInfo {
+            noise_static_pub: info.noise_static_pub.to_vec(),
+            generation: info.generation,
+        })
+    }
+
+    /// Accept (and advertise) pairing links (DESIGN.md §B14.4).
+    pub fn set_pairing_mode(&self, on: bool) {
+        self.node.set_pairing_mode(on);
+    }
+
     /// Start syncing with peers. `client` must be the registered client whose
     /// API is this node: hellos are signed with its installation key
     /// (`ClientHelloSigner`) and group traffic is scoped by its group
@@ -568,6 +595,8 @@ impl FfiMeshNode {
     /// Async so that it runs inside uniffi's tokio runtime: the node captures
     /// that runtime for all sessions (`MeshError::NoRuntime` otherwise). The
     /// other methods are then callable from any thread.
+    ///
+    /// Call `set_account_key` first.
     pub async fn start_sync(
         &self,
         client: Arc<FfiXmtpClient>,
@@ -978,6 +1007,33 @@ mod tests {
         }
     }
 
+    /// Link keys plus pairing mode: two test nodes with no contact cards can
+    /// link over a pairing (Noise XX) link, which syncs like a contact link.
+    fn ready_to_pair(client: &FfiXmtpClient, node: &FfiMeshNode) {
+        node.set_account_key(xmtp_mesh::store::sha256(&client.installation_id()))
+            .unwrap();
+        node.set_pairing_mode(true);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn start_sync_needs_the_account_key() {
+        let (client, node) = registered_mesh_client().await;
+        let err = node
+            .start_sync(client.clone(), Arc::new(NullTransport))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("mesh:"), "{err}");
+        let info = node
+            .set_account_key(xmtp_mesh::store::sha256(&client.installation_id()))
+            .unwrap();
+        assert_eq!((info.noise_static_pub.len(), info.generation), (32, 0));
+        assert!(node.set_account_key(vec![1; 31]).is_err());
+        node.start_sync(client, Arc::new(NullTransport))
+            .await
+            .unwrap();
+        node.stop_sync();
+    }
+
     #[test]
     fn max_frame_len_is_the_core_limit() {
         assert_eq!(mesh_max_frame_len() as usize, xmtp_mesh::MAX_FRAME_LEN);
@@ -1010,6 +1066,8 @@ mod tests {
     async fn dm_round_trip_over_ffi_transport() {
         let (a, node_a) = registered_mesh_client().await;
         let (b, node_b) = registered_mesh_client().await;
+        ready_to_pair(&a, &node_a);
+        ready_to_pair(&b, &node_b);
         // Connection-scoped ids, as the radio allocates them: node_a knows b's
         // pipe as "b#1", node_b knows a's as "a#1".
         let (to_b, rx_b) = unbounded_channel();
@@ -1041,8 +1099,8 @@ mod tests {
         // The radio calls these from its own thread, never from a tokio worker.
         let (na, nb) = (node_a.clone(), node_b.clone());
         std::thread::spawn(move || {
-            na.on_peer_connected("b#1".into(), FfiLinkRole::Accept);
             nb.on_peer_connected("a#1".into(), FfiLinkRole::Accept);
+            na.on_peer_connected("b#1".into(), FfiLinkRole::DialPairing);
         })
         .join()
         .unwrap();
@@ -1254,6 +1312,8 @@ mod tests {
     async fn throwing_callbacks_do_not_break_the_node() {
         let (a, node_a) = registered_mesh_client().await;
         let (b, node_b) = registered_mesh_client().await;
+        ready_to_pair(&a, &node_a);
+        ready_to_pair(&b, &node_b);
         let (to_b, rx_b) = unbounded_channel();
         let (to_a, rx_a) = unbounded_channel();
         node_a
@@ -1297,8 +1357,8 @@ mod tests {
         // though the callback throws on every event.
         let (na, nb) = (node_a.clone(), node_b.clone());
         std::thread::spawn(move || {
-            na.on_peer_connected("b#1".into(), FfiLinkRole::Accept);
             nb.on_peer_connected("a#1".into(), FfiLinkRole::Accept);
+            na.on_peer_connected("b#1".into(), FfiLinkRole::DialPairing);
         })
         .join()
         .unwrap();
@@ -1563,6 +1623,7 @@ mod tests {
         let inbox = a.inbox_id();
         assert_eq!(a2.inbox_id(), inbox);
 
+        ready_to_pair(&a2, &a2_node);
         a2_node
             .start_sync(a2.clone(), Arc::new(NullTransport))
             .await
@@ -1624,6 +1685,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn relay_enables_reports_zero_stats_and_disables() {
         let (client, node) = registered_mesh_client().await;
+        ready_to_pair(&client, &node);
         node.start_sync(client.clone(), Arc::new(NullTransport))
             .await
             .unwrap();
@@ -1639,6 +1701,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn mesh_stats_start_at_zero() {
         let (client, node) = registered_mesh_client().await;
+        ready_to_pair(&client, &node);
         node.start_sync(client, Arc::new(NullTransport))
             .await
             .unwrap();

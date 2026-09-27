@@ -7,14 +7,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::Mutex;
 
 use super::records::Records;
+use super::{LinkKind, allowed_on};
 use crate::sync::frames::{self, MAX_FRAME_LEN, frame::Body};
 use crate::sync::{MeshTransport, PeerId};
 
 enum TxState {
     /// The Noise handshake is running: frames are refused.
     Pending,
-    /// The link is open: frames are sealed into records.
-    Open(Arc<Records>),
+    /// The link is open: frames it may carry are sealed into records.
+    Open(Arc<Records>, LinkKind),
     /// Test-only cleartext link: frames go out as they are.
     Plain,
 }
@@ -63,16 +64,23 @@ impl LinkTx {
         self.transport.send(&self.peer, message);
     }
 
-    /// The handshake finished: seal from now on.
-    pub(crate) fn open(&self, records: Arc<Records>) {
-        *self.state.lock() = TxState::Open(records);
+    /// The handshake opened a `kind` link: seal from now on.
+    pub(crate) fn open(&self, records: Arc<Records>, kind: LinkKind) {
+        *self.state.lock() = TxState::Open(records, kind);
     }
 
     /// Send one frame. Returns whether it went out: not when the session
     /// was replaced, the frame is over [`MAX_FRAME_LEN`], the link is not
-    /// open yet, or sealing failed.
+    /// open yet, the link kind may not carry it (a relay link carries relay
+    /// frames only, §B14.3), or sealing failed.
     pub(crate) fn send(&self, body: Body) -> bool {
         if self.is_cancelled() {
+            return false;
+        }
+        if let TxState::Open(_, kind) = &*self.state.lock()
+            && !allowed_on(*kind, &body)
+        {
+            tracing::debug!(peer = %self.peer, ?kind, "frame not allowed on this link: dropped");
             return false;
         }
         let frame = frames::encode(body);
@@ -88,7 +96,7 @@ impl LinkTx {
                 tracing::debug!(peer = %self.peer, "frame before the link opened: dropped");
                 return false;
             }
-            TxState::Open(records) => match records.seal(&frame) {
+            TxState::Open(records, _) => match records.seal(&frame) {
                 Ok(sealed) => {
                     for record in sealed {
                         self.transport.send(&self.peer, record);

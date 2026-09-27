@@ -65,6 +65,10 @@ struct HubInner {
     /// Pairs that already exchanged contact cards: later links and re-links
     /// do not repeat it, so removals and resets stay in effect.
     introduced: HashSet<(PeerId, PeerId)>,
+    /// Directed pairs whose messages are held instead of delivered (tests).
+    held: HashMap<(PeerId, PeerId), Vec<Vec<u8>>>,
+    /// Every message sent on a link, when recording (tests).
+    wire: Option<Vec<(PeerId, PeerId, Vec<u8>)>>,
 }
 
 struct Sim {
@@ -296,12 +300,92 @@ impl LoopbackHub {
         }
     }
 
+    /// Hold every message `from` sends `to` until `take_held_for_test`.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn hold_for_test(&self, from: &str, to: &str) {
+        self.inner
+            .lock()
+            .held
+            .entry((from.into(), to.into()))
+            .or_default();
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn held_count_for_test(&self, from: &str, to: &str) -> usize {
+        self.inner
+            .lock()
+            .held
+            .get(&(from.to_string(), to.to_string()))
+            .map_or(0, Vec::len)
+    }
+
+    /// End the hold and return what it caught, undelivered.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn take_held_for_test(&self, from: &str, to: &str) -> Vec<Vec<u8>> {
+        self.inner
+            .lock()
+            .held
+            .remove(&(from.to_string(), to.to_string()))
+            .unwrap_or_default()
+    }
+
+    /// Deliver raw bytes to `to` as if `from`'s radio sent them.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn inject_wire_for_test(&self, from: &str, to: &str, bytes: Vec<u8>) {
+        let node = self.inner.lock().nodes.get(to).cloned();
+        if let Some(node) = node {
+            node.on_frame(from, bytes);
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn record_wire_for_test(&self) {
+        self.inner.lock().wire = Some(Vec::new());
+    }
+
+    /// Every `(from, to, message)` sent on a link since recording started.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn wire_for_test(&self) -> Vec<(String, String, Vec<u8>)> {
+        self.inner.lock().wire.clone().unwrap_or_default()
+    }
+
+    /// Like `link_as`, but the dialer is reported first, so its message 1
+    /// can reach `b` before `b`'s `Accept` (a radio free to do so).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub async fn link_as_dialer_first(&self, a: &str, b: &str, intent: DialIntent) {
+        let (na, nb) = {
+            let mut inner = self.inner.lock();
+            if let Some(sim) = inner.sim.as_mut() {
+                sim.pending_relinks.remove(&key(a, b));
+            }
+            inner.link_up(a, b);
+            (inner.nodes[a].clone(), inner.nodes[b].clone())
+        };
+        na.on_peer_connected(b, LinkRole::Dial(intent));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        nb.on_peer_connected(a, LinkRole::Accept);
+    }
+
     fn send(&self, from: &str, to: &str, frame: Vec<u8>) {
         let node = {
             let mut inner = self.inner.lock();
             let Some(&generation) = inner.links.get(&key(from, to)) else {
                 return;
             };
+            if let Some(wire) = inner.wire.as_mut() {
+                wire.push((from.into(), to.into(), frame.clone()));
+            }
+            if let Some(held) = inner.held.get_mut(&(from.to_string(), to.to_string())) {
+                held.push(frame);
+                return;
+            }
             match inner.sim.as_mut() {
                 Some(sim) => {
                     sim.enqueue(self, from, to, generation, frame);

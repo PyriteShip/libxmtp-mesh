@@ -15,8 +15,10 @@ use super::frames::{
 use super::membership::GroupMembership;
 use super::transport::{MeshTransport, PeerId};
 use crate::MeshError;
-use crate::link::LinkRole;
+use crate::link::noise::{DialTarget, Handshake, LinkOpen};
+use crate::link::records::Records;
 use crate::link::tx::LinkTx;
+use crate::link::{DialIntent, LinkKind, LinkRole, window_at};
 use crate::node::{
     MAX_PEER_IDENTITY_LOG, MAX_RELAYED_IDENTITY_LOGS, MeshNode, NodeEvent, Resolution,
 };
@@ -35,6 +37,8 @@ pub(crate) struct LinkSetup {
     pub(crate) role: LinkRole,
     /// Test-only cleartext link (no Noise); see `MeshNode::inject_plain_for_test`.
     pub(crate) plain: bool,
+    /// Started by a frame that arrived before `on_peer_connected`.
+    pub(crate) implicit: bool,
 }
 
 pub(crate) struct SessionHandle {
@@ -43,6 +47,9 @@ pub(crate) struct SessionHandle {
     pub(crate) tx: mpsc::UnboundedSender<Inbound>,
     /// The link's sending half, shared with the relay engine.
     pub(crate) link: Arc<LinkTx>,
+    /// An accepting session a frame started before `on_peer_connected`;
+    /// that call keeps it (its handshake already began).
+    pub(crate) implicit: bool,
     /// Set (and `_wake` dropped) when this handle leaves the registry, i.e. the
     /// peer was lost or the entry replaced. A tokio mpsc receiver keeps draining
     /// buffered frames after its senders drop, so the session task checks this
@@ -58,6 +65,7 @@ impl SessionHandle {
         tx: mpsc::UnboundedSender<Inbound>,
         link: Arc<LinkTx>,
         cancelled: Arc<AtomicBool>,
+        implicit: bool,
     ) -> (Self, oneshot::Receiver<()>) {
         let (wake, wake_rx) = oneshot::channel();
         (
@@ -65,6 +73,7 @@ impl SessionHandle {
                 id,
                 tx,
                 link,
+                implicit,
                 cancelled,
                 _wake: wake,
             },
@@ -90,7 +99,7 @@ pub(crate) fn test_handle(id: u64) -> SessionHandle {
         true,
         None,
     ));
-    SessionHandle::new(id, tx, link, cancelled).0
+    SessionHandle::new(id, tx, link, cancelled, false).0
 }
 
 impl Drop for SessionHandle {
@@ -99,7 +108,13 @@ impl Drop for SessionHandle {
     }
 }
 
-/// Handshake: each side sends `Hello{its key, a fresh challenge}` and answers
+/// First the Noise handshake (§B14.3): the dialer sends message 1, and
+/// nothing but handshake messages and then sealed records travel. The
+/// dialer speaks first on every link kind; an accepting side sends no frame
+/// until the dialer's first record authenticates. A relay link then carries
+/// relay frames only; a contact or pairing link runs Hello/Auth inside it.
+///
+/// Hello/Auth: each side sends `Hello{its key, a fresh challenge}` and answers
 /// the other's Hello with `Auth{signature, echoed challenge}`, the signature
 /// over `hello_text(their challenge, own key, their key)`. A Hello carrying our
 /// own key is rejected (reflection). Every Hello from the same key is answered,
@@ -119,9 +134,13 @@ impl Drop for SessionHandle {
 /// man-in-the-middle (channel binding arrives with the planned Noise upgrade).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum State {
+    /// The Noise handshake is running (§B14.3).
+    Handshake,
     AwaitHello,
     AwaitAuth,
     Authenticated,
+    /// An open relay (NN) link: relay frames only, no Hello.
+    RelayOnly,
 }
 
 /// How many times a session re-sends its Hello in answer to the peer's.
@@ -134,6 +153,9 @@ pub(crate) const MEMBERSHIP_RETRY_INTERVAL: Duration = Duration::from_millis(500
 pub(crate) const MEMBERSHIP_RETRY_WINDOW: Duration = Duration::from_secs(60);
 /// Most groups one session keeps deferred at a time.
 pub(crate) const MAX_DEFERRED_GROUPS: usize = 64;
+
+/// Most test-injected frames held while the handshake runs.
+const MAX_EARLY_PLAIN: usize = 64;
 
 /// Whether the verified peer's inbox is a member of a group, per the local
 /// libxmtp client.
@@ -186,6 +208,26 @@ pub(crate) struct Session {
     pub(crate) plain: bool,
     /// The link's sending half; every frame goes out through it.
     pub(crate) link: Arc<LinkTx>,
+    /// The handshake while it runs.
+    handshake: Option<Handshake>,
+    /// The open link's records (the receiving side of `link`).
+    records: Option<Arc<Records>>,
+    /// What the handshake opened; `None` while handshaking and on a test
+    /// cleartext link.
+    pub(crate) link_kind: Option<LinkKind>,
+    /// The peer's Noise static key (IK, XX). On an accepting side, not
+    /// key-confirmed until `peer_spoke`.
+    pub(crate) remote_static: Option<[u8; 32]>,
+    /// The Noise handshake hash (zeros on a test cleartext link).
+    pub(crate) binding: [u8; 32],
+    /// An open link on which the peer's first record authenticated (always
+    /// true for the dialer). Until then an accepting side sends nothing.
+    peer_spoke: bool,
+    /// Test-injected frames waiting for the link to open and the peer to
+    /// speak.
+    early_plain: Vec<Vec<u8>>,
+    /// An open relay link closes when no relay frame arrived by then.
+    relay_idle_at: Option<Instant>,
     pub(crate) signer: Arc<dyn HelloSigner>,
     pub(crate) membership: Arc<dyn GroupMembership>,
     pub(crate) challenge: [u8; 32],
@@ -231,15 +273,15 @@ pub(crate) fn spawn(
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::unbounded_channel();
     let cancelled = Arc::new(AtomicBool::new(false));
-    // Cleartext until the Noise handshake is wired in (§B14.3).
     let link = Arc::new(LinkTx::new(
         peer.clone(),
         transport.clone(),
         cancelled.clone(),
-        true,
+        setup.plain,
         node.frame_tap(),
     ));
-    let (handle, wake) = SessionHandle::new(id, tx, link.clone(), cancelled.clone());
+    let (handle, wake) =
+        SessionHandle::new(id, tx, link.clone(), cancelled.clone(), setup.implicit);
     let events = node.subscribe_events();
     let session = Session {
         id,
@@ -250,10 +292,22 @@ pub(crate) fn spawn(
         role: setup.role,
         plain: setup.plain,
         link,
+        handshake: None,
+        records: None,
+        link_kind: None,
+        remote_static: None,
+        binding: [0; 32],
+        peer_spoke: setup.plain,
+        early_plain: Vec::new(),
+        relay_idle_at: None,
         signer,
         membership,
         challenge: rand::random(),
-        state: State::AwaitHello,
+        state: if setup.plain {
+            State::AwaitHello
+        } else {
+            State::Handshake
+        },
         peer_installation: None,
         peer_inbox: None,
         verified: false,
@@ -309,19 +363,36 @@ impl Session {
             return;
         }
         self.handshake_deadline = Some(Instant::now() + self.node.handshake_timeout());
-        self.send_hello();
+        if let Err(e) = self.start_link() {
+            tracing::warn!(peer = %self.peer, error = %e, "mesh link not started");
+            self.node.link_counters().count_handshake_failed();
+            if !self.is_cancelled() {
+                self.transport.disconnect(&self.peer);
+            }
+            return;
+        }
         loop {
             let deadline = match self.state {
                 State::Authenticated if self.verified => None,
                 State::Authenticated => self.verify_deadline,
-                State::AwaitHello | State::AwaitAuth => self.handshake_deadline,
+                State::RelayOnly => self.relay_idle_at,
+                State::Handshake | State::AwaitHello | State::AwaitAuth => self.handshake_deadline,
             };
             let retry_at = self.retry_at;
             tokio::select! {
                 biased;
                 _ = &mut *wake => break,
                 _ = until(deadline) => {
-                    if self.state == State::Authenticated {
+                    if self.is_cancelled() {
+                        break;
+                    }
+                    if self.state == State::Handshake {
+                        self.node.link_counters().count_handshake_failed();
+                    }
+                    if self.state == State::RelayOnly {
+                        self.node.link_counters().count_relay_idle_closed();
+                        tracing::info!(peer = %self.peer, "relay link idle; closing it");
+                    } else if self.state == State::Authenticated {
                         tracing::warn!(peer = %self.peer, "peer did not prove inbox membership in time");
                     } else {
                         tracing::warn!(peer = %self.peer, "peer did not complete the handshake in time");
@@ -370,15 +441,196 @@ impl Session {
 
     async fn on_inbound(&mut self, inbound: Inbound) -> Result<(), MeshError> {
         match inbound {
-            Inbound::Wire(bytes) => self.on_frame(&bytes).await,
+            Inbound::Wire(bytes) => self.on_wire(&bytes).await,
             #[cfg(any(test, feature = "test-utils"))]
-            Inbound::Plain(frame) => self.on_frame(&frame).await,
+            Inbound::Plain(frame) => {
+                if self.state == State::Handshake || !self.peer_spoke {
+                    if self.early_plain.len() < MAX_EARLY_PLAIN {
+                        self.early_plain.push(frame);
+                    }
+                    return Ok(());
+                }
+                self.on_frame(&frame).await
+            }
         }
     }
 
+    /// Start this link (§B14.3): a dialer sends message 1; an accepting
+    /// side waits for it. A test cleartext link says Hello at once.
+    fn start_link(&mut self) -> Result<(), MeshError> {
+        if self.plain {
+            self.send_hello();
+            return Ok(());
+        }
+        let keys = self.node.mesh_keys().ok_or(MeshError::NoAccountKey)?;
+        match self.role.clone() {
+            LinkRole::Accept => {
+                self.handshake = Some(Handshake::accept(
+                    &keys.noise_secret,
+                    self.node.pairing_mode(),
+                    self.node.relay_enabled(),
+                    Arc::new(self.node.clone()),
+                ));
+            }
+            LinkRole::Dial(intent) => {
+                let target = match intent {
+                    DialIntent::Contact { inbox_id } => {
+                        let contact = self
+                            .node
+                            .contact(&inbox_id)?
+                            .filter(|c| !c.removed)
+                            .ok_or_else(|| {
+                                MeshError::LinkAuthFailed(format!("no contact card for {inbox_id}"))
+                            })?;
+                        DialTarget::Contact {
+                            remote_static: contact.noise_static_pub,
+                        }
+                    }
+                    DialIntent::Relay if self.node.relay_enabled() => DialTarget::Relay,
+                    DialIntent::Relay => {
+                        return Err(MeshError::LinkAuthFailed("relay is off".into()));
+                    }
+                    DialIntent::Pairing if self.node.pairing_mode() => DialTarget::Pairing,
+                    DialIntent::Pairing => {
+                        return Err(MeshError::LinkAuthFailed("not in pairing mode".into()));
+                    }
+                };
+                let window = window_at(self.node.unix_now());
+                let (handshake, first) = Handshake::dial(&target, &keys.noise_secret, window)?;
+                self.handshake = Some(handshake);
+                self.link.send_raw(first);
+            }
+        }
+        Ok(())
+    }
+
+    /// Bytes off the air: handshake messages, then sealed records. Any
+    /// record that fails ends the link (the records fail closed).
+    async fn on_wire(&mut self, bytes: &[u8]) -> Result<(), MeshError> {
+        if self.state == State::Handshake {
+            return self.on_handshake_message(bytes).await;
+        }
+        if self.plain {
+            return self.on_frame(bytes).await;
+        }
+        let Some(records) = self.records.clone() else {
+            return Err(MeshError::LinkAuthFailed("no open link".into()));
+        };
+        let opened = match records.open(bytes) {
+            Ok(opened) => opened,
+            Err(e) => {
+                self.node.link_counters().count_frame_rejected();
+                return Err(e);
+            }
+        };
+        if !self.peer_spoke {
+            // The peer's first record authenticated: it holds the keys this
+            // handshake agreed, so we may speak now (§B14.3).
+            self.peer_spoke = true;
+            self.link_started().await?;
+        }
+        match opened {
+            Some(frame) => self.on_frame(&frame).await,
+            None => Ok(()),
+        }
+    }
+
+    async fn on_handshake_message(&mut self, bytes: &[u8]) -> Result<(), MeshError> {
+        let Some(handshake) = self.handshake.as_mut() else {
+            self.node.link_counters().count_handshake_failed();
+            return Err(MeshError::LinkAuthFailed("no handshake running".into()));
+        };
+        let step = match handshake.read(bytes) {
+            Ok(step) => step,
+            Err(e) => {
+                self.node.link_counters().count_handshake_failed();
+                return Err(e);
+            }
+        };
+        if let Some(reply) = step.reply {
+            self.link.send_raw(reply);
+        }
+        match step.open {
+            Some(open) => self.on_link_open(open).await,
+            None => Ok(()),
+        }
+    }
+
+    /// The handshake finished: seal from now on. The dialer starts what
+    /// the link kind runs at once; an accepting side waits for the
+    /// dialer's first record (§B14.3).
+    async fn on_link_open(&mut self, open: LinkOpen) -> Result<(), MeshError> {
+        self.handshake = None;
+        if open.kind == LinkKind::Relay && !self.node.relay_enabled() {
+            self.node.link_counters().count_handshake_failed();
+            return Err(MeshError::LinkAuthFailed(
+                "relay link while relay is off".into(),
+            ));
+        }
+        let records = Arc::new(Records::new(open.transport));
+        self.link.open(records.clone(), open.kind);
+        self.records = Some(records);
+        self.link_kind = Some(open.kind);
+        self.binding = open.handshake_hash;
+        self.remote_static = open.remote_static;
+        self.node.link_counters().count_link(open.kind);
+        match open.kind {
+            LinkKind::Relay => {
+                self.state = State::RelayOnly;
+                self.handshake_deadline = None;
+                self.relay_idle_at = Some(Instant::now() + self.node.relay_idle_timeout());
+            }
+            LinkKind::Contact | LinkKind::Pairing => self.state = State::AwaitHello,
+        }
+        if open.initiator {
+            self.peer_spoke = true;
+            self.link_started().await?;
+        }
+        Ok(())
+    }
+
+    /// The link is open and we may speak: say Hello, or bring the relay
+    /// link up; then the test frames that waited.
+    async fn link_started(&mut self) -> Result<(), MeshError> {
+        match self.link_kind {
+            Some(LinkKind::Relay) => self.node.relay_stranger_link_up(&self.peer, self.id),
+            Some(LinkKind::Contact | LinkKind::Pairing) => self.send_hello(),
+            None => {}
+        }
+        for frame in std::mem::take(&mut self.early_plain) {
+            self.on_frame(&frame).await?;
+        }
+        Ok(())
+    }
+
     async fn on_frame(&mut self, bytes: &[u8]) -> Result<(), MeshError> {
-        let body = frames::decode(bytes)?;
+        let body = match frames::decode(bytes) {
+            Ok(body) => body,
+            // A stranger gets no leeway: what is not a relay frame closes
+            // the link.
+            Err(e) if self.link_kind == Some(LinkKind::Relay) => {
+                self.node.link_counters().count_frame_rejected();
+                return Err(MeshError::LinkAuthFailed(format!(
+                    "undecodable frame on a relay link: {e}"
+                )));
+            }
+            Err(e) => return Err(e),
+        };
+        if let Some(kind) = self.link_kind
+            && !crate::link::allowed_on(kind, &body)
+        {
+            self.node.link_counters().count_frame_rejected();
+            return Err(MeshError::LinkAuthFailed(format!(
+                "frame not allowed on a {kind:?} link"
+            )));
+        }
         match (self.state, body) {
+            (State::RelayOnly, body) => {
+                self.relay_idle_at = Some(Instant::now() + self.node.relay_idle_timeout());
+                self.node.on_relay_frame(&self.peer, body).await;
+                Ok(())
+            }
+            (State::Handshake, _) => Ok(()),
             (_, Body::Hello(hello)) => self.on_hello(hello),
             (State::AwaitAuth, Body::Auth(auth)) => self.on_auth(auth).await,
             (State::Authenticated, Body::Auth(_)) => Ok(()),

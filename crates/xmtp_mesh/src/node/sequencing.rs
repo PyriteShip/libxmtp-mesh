@@ -487,6 +487,7 @@ mod tests {
             store
                 .set_local_installation(&signer.installation_key())
                 .unwrap();
+            store.set_local_inbox("inbox").unwrap();
             store.append_sequenced(&msg(b"before"), 1).unwrap();
         }
         assert_eq!(
@@ -494,6 +495,7 @@ mod tests {
             None
         );
 
+        node.set_account_key(&[1; 32]).unwrap();
         node.start_sync(
             signer.clone(),
             Arc::new(NoTransport),
@@ -526,6 +528,7 @@ mod tests {
             "not signed until the next start_sync backfill"
         );
 
+        node.set_account_key(&[1; 32]).unwrap();
         node.start_sync(
             signer.clone(),
             Arc::new(NoTransport),
@@ -559,6 +562,7 @@ mod tests {
             store
                 .set_local_installation(&signer.installation_key())
                 .unwrap();
+            store.set_local_inbox("inbox").unwrap();
             store
                 .insert_sequenced(&seq::signed_row(&former, b"g", 1, b"a"))
                 .unwrap();
@@ -571,6 +575,7 @@ mod tests {
             Some(former.installation_key())
         );
 
+        node.set_account_key(&[1; 32]).unwrap();
         node.start_sync(
             signer.clone(),
             Arc::new(NoTransport),

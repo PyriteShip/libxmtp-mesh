@@ -131,6 +131,22 @@ impl MeshStore {
         rows.into_iter().map(Contact::try_from).collect()
     }
 
+    /// The live contacts' static keys, and whether any contact at all
+    /// (live or removed) is on file.
+    pub fn contact_statics(&mut self) -> Result<(Vec<[u8; 32]>, bool), MeshError> {
+        let rows: Vec<ContactRow> =
+            sql_query(format!("SELECT {CONTACT_COLUMNS} FROM contacts")).load(&mut self.conn)?;
+        let any = !rows.is_empty();
+        let mut live = Vec::with_capacity(rows.len());
+        for row in rows {
+            let contact = Contact::try_from(row)?;
+            if !contact.removed {
+                live.push(contact.noise_static_pub);
+            }
+        }
+        Ok((live, any))
+    }
+
     /// Store `card`. Without `force` a card never replaces a newer
     /// generation, another static key, or a removed contact; `force` (a
     /// confirmed pairing) always stores it and clears a removal.

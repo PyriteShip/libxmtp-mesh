@@ -556,6 +556,11 @@ fn a_removed_contact_stays_removed_until_it_is_paired_again() {
     assert!(!s.remove_contact("i", 12).unwrap(), "already removed");
     assert!(!s.remove_contact("unknown", 12).unwrap());
     assert!(s.contacts().unwrap().is_empty());
+    assert_eq!(
+        s.contact_statics().unwrap(),
+        (vec![], true),
+        "no live static, but a contact is on file"
+    );
     let tomb = s.contact_by_static(&[1; 32]).unwrap().unwrap();
     assert!(
         tomb.removed,
@@ -570,6 +575,14 @@ fn a_removed_contact_stays_removed_until_it_is_paired_again() {
         ContactUpdate::Updated
     );
     assert!(!s.contact("i").unwrap().unwrap().removed);
+    assert_eq!(s.contact_statics().unwrap(), (vec![[1; 32]], true));
+    assert_eq!(
+        MeshStore::open_in_memory()
+            .unwrap()
+            .contact_statics()
+            .unwrap(),
+        (vec![], false)
+    );
 }
 
 #[test]

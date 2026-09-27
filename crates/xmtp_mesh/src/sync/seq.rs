@@ -236,6 +236,8 @@ pub struct MeshStats {
     /// allowed on the link type, or a card or Hello that does not match it.
     pub link_frame_rejected: u64,
     pub discovery_resets: u64,
+    /// Relay links closed after carrying no relay frame for the idle bound.
+    pub relay_links_idle_closed: u64,
 }
 
 #[derive(Debug, Default)]

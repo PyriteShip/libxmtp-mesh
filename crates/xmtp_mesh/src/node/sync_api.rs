@@ -231,6 +231,17 @@ impl MeshNode {
         *self.inner.handshake_timeout.lock() = timeout;
     }
 
+    pub(crate) fn relay_idle_timeout(&self) -> Duration {
+        *self.inner.relay_idle_timeout.lock()
+    }
+
+    /// Applies to relay links opened from now on.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn set_relay_idle_timeout_for_test(&self, timeout: Duration) {
+        *self.inner.relay_idle_timeout.lock() = timeout;
+    }
+
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn suppress_identity_log_for_test(&self) {
