@@ -208,7 +208,7 @@ fn transaction_rolls_back_when_the_closure_panics() {
 use std::sync::Arc;
 
 use crate::sync::HelloSigner;
-use crate::sync::seq::{self, Equivocation, KeySigner};
+use crate::sync::seq::{self, Equivocation, KeySigner, SeqProof};
 
 #[test]
 fn a_row_is_signed_when_it_is_sequenced() {
@@ -240,9 +240,39 @@ fn rows_are_looked_up_by_id_with_their_signers() {
     s.append_sequenced(&msg(b"g", b"signed"), 2).unwrap();
     assert_eq!(s.sequenced_at(b"g", 2).unwrap().unwrap().data, b"signed");
     assert!(s.sequenced_at(b"g", 3).unwrap().is_none());
+    s.append_sequenced(&msg(b"g", b"signed again"), 3).unwrap();
+    let mut signers = s.seq_signers(b"g").unwrap();
+    signers.sort();
     assert_eq!(
-        s.seq_signers(b"g").unwrap(),
-        vec![None, Some(signer.installation_key())]
+        signers,
+        vec![(None, false), (Some(signer.installation_key()), false)],
+        "distinct pairs"
+    );
+}
+
+/// §B13: a row's attestation flag is stored with its proof and travels in it.
+#[test]
+fn a_stored_proof_keeps_its_attestation_flag() {
+    let mut s = MeshStore::open_in_memory().unwrap();
+    let signer = KeySigner::new();
+    let attested = seq::attested_row(&signer, b"g", 1, b"a");
+    let signed = seq::signed_row(&signer, b"g", 2, b"b");
+    for row in [&attested, &signed] {
+        assert_eq!(s.insert_sequenced(row).unwrap(), InsertOutcome::Inserted);
+    }
+    assert_eq!(s.sequenced_at(b"g", 1).unwrap().unwrap(), attested);
+    let rows = s.query_group(b"g", 0, 10, false).unwrap();
+    assert_eq!(rows, vec![attested.clone(), signed.clone()]);
+    assert!(rows[0].proof().attested && !rows[1].proof().attested);
+    assert!(seq::verify_proof(b"g", 1, 10, b"a", &rows[0].proof()));
+    let mut signers = s.seq_signers(b"g").unwrap();
+    signers.sort();
+    assert_eq!(
+        signers,
+        vec![
+            (Some(signer.installation_key()), false),
+            (Some(signer.installation_key()), true)
+        ]
     );
 }
 
@@ -266,9 +296,12 @@ fn unsigned_rows_are_signed_once() {
     }
 }
 
-/// §B13 upgrade: the migration keeps rows stored before it, without proofs.
+/// §B13 upgrade: the migration keeps rows stored before it, without proofs,
+/// and marks them legacy. The start-up backfill attests those, and signs a
+/// row sequenced after the migration (while no signer was set) as its
+/// sequencer.
 #[test]
-fn the_migration_keeps_existing_rows_unsigned_until_they_are_signed() {
+fn the_backfill_attests_legacy_rows_and_signs_later_ones() {
     // Reverts this migration by its own version, not whichever one happens
     // to be last: a `revert_last_migration` call here would revert the
     // wrong one once a later migration is added.
@@ -293,12 +326,28 @@ fn the_migration_keeps_existing_rows_unsigned_until_they_are_signed() {
         .unwrap();
     s.conn.run_pending_migrations(MIGRATIONS).unwrap();
     let row = s.query_group(b"g", 0, 10, false).unwrap().remove(0);
-    assert_eq!((row.seq_signer, row.seq_signature), (None, None));
+    assert_eq!(
+        (row.seq_signer, row.seq_signature, row.seq_attested),
+        (None, None, false)
+    );
+    s.append_sequenced(&msg(b"g", b"new"), 6).unwrap();
+
     let signer = Arc::new(KeySigner::new());
     s.set_seq_signer(signer.clone());
-    assert_eq!(s.sign_unsigned_rows().unwrap(), 1);
-    let row = s.query_group(b"g", 0, 10, false).unwrap().remove(0);
-    assert!(seq::verify_proof(b"g", 1, 5, b"old", &row.proof()));
+    assert_eq!(s.sign_unsigned_rows().unwrap(), 2);
+    let rows = s.query_group(b"g", 0, 10, false).unwrap();
+    assert!(rows[0].seq_attested, "the legacy row is attested");
+    assert!(seq::verify_proof(b"g", 1, 5, b"old", &rows[0].proof()));
+    let as_sequenced = SeqProof {
+        attested: false,
+        ..rows[0].proof()
+    };
+    assert!(!seq::verify_proof(b"g", 1, 5, b"old", &as_sequenced));
+    assert!(
+        !rows[1].seq_attested,
+        "the later row is signed as sequenced"
+    );
+    assert!(seq::verify_proof(b"g", 2, 6, b"new", &rows[1].proof()));
 }
 
 /// §C4.7 at start: the drain after a repin signs what it sequences.

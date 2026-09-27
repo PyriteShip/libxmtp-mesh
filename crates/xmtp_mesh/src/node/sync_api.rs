@@ -441,6 +441,7 @@ impl MeshNode {
                     is_commit: v1.is_commit,
                     seq_signer: None,
                     seq_signature: None,
+                    seq_attested: false,
                 };
                 // Our own pending copy (if any, e.g. published again after
                 // it was sequenced) is settled in the same transaction.

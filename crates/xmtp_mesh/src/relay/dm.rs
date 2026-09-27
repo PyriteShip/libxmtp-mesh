@@ -852,6 +852,7 @@ mod tests {
             is_commit: false,
             seq_signer: None,
             seq_signature: None,
+            seq_attested: false,
         }
     }
 

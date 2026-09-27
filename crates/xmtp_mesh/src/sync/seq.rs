@@ -19,6 +19,12 @@ use crate::store::sha256;
 /// the handshake's and the relay's, so no signature verifies as another kind.
 pub const SEQ_TEXT_PREFIX: &str = "xmtp-mesh-seq-v1:";
 
+/// Prefix of the text an upgrade attestation covers (§B13): a row stored
+/// before signed sequencing, signed by the node that held it rather than by
+/// the installation that ordered it. Distinct from [`SEQ_TEXT_PREFIX`], so an
+/// attestation never passes as a sequencing signature, or the reverse.
+pub const SEQ_ATTEST_TEXT_PREFIX: &str = "xmtp-mesh-seq-attest-v1:";
+
 /// What the installation that ordered a row signs (§B13).
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct SeqRecord {
@@ -44,9 +50,13 @@ pub struct SeqRecord {
 pub struct SeqProof {
     #[prost(bytes = "vec", tag = "1")]
     pub signer: Vec<u8>,
-    /// 64-byte ed25519 signature over [`SeqRecord::signing_text`].
+    /// 64-byte ed25519 signature over [`SeqRecord::signing_text_as`]`(attested)`.
     #[prost(bytes = "vec", tag = "2")]
     pub signature: Vec<u8>,
+    /// An upgrade attestation rather than a sequencing signature (§B13):
+    /// selects the signed text's prefix.
+    #[prost(bool, tag = "3")]
+    pub attested: bool,
 }
 
 impl SeqRecord {
@@ -68,16 +78,30 @@ impl SeqRecord {
 
     /// `"xmtp-mesh-seq-v1:" + hex(sha256(encoded record))`.
     pub fn signing_text(&self) -> String {
-        format!(
-            "{SEQ_TEXT_PREFIX}{}",
-            hex::encode(sha256(&self.encode_to_vec()))
-        )
+        self.signing_text_as(false)
     }
 
-    /// Whether `signature` is `originator_installation`'s over this record.
+    /// [`Self::signing_text`], or with [`SEQ_ATTEST_TEXT_PREFIX`] for an
+    /// upgrade attestation.
+    pub fn signing_text_as(&self, attested: bool) -> String {
+        let prefix = if attested {
+            SEQ_ATTEST_TEXT_PREFIX
+        } else {
+            SEQ_TEXT_PREFIX
+        };
+        format!("{prefix}{}", hex::encode(sha256(&self.encode_to_vec())))
+    }
+
+    /// Whether `signature` is `originator_installation`'s sequencing
+    /// signature over this record.
     pub fn verify(&self, signature: &[u8]) -> bool {
+        self.verify_as(signature, false)
+    }
+
+    /// [`Self::verify`], or as an attestation when `attested`.
+    pub fn verify_as(&self, signature: &[u8], attested: bool) -> bool {
         auth::verify(
-            &self.signing_text(),
+            &self.signing_text_as(attested),
             signature,
             &self.originator_installation,
         )
@@ -85,7 +109,8 @@ impl SeqRecord {
     }
 }
 
-/// Sign the row `(group_id, id, created_ns, data)` as `signer`.
+/// Sign the row `(group_id, id, created_ns, data)` as `signer`, the
+/// installation that ordered it.
 pub fn sign_row(
     signer: &dyn HelloSigner,
     group_id: &[u8],
@@ -93,16 +118,32 @@ pub fn sign_row(
     created_ns: u64,
     data: &[u8],
 ) -> Result<SeqProof, MeshError> {
+    sign_hashed(signer, group_id, id, created_ns, sha256(data), false)
+}
+
+/// Sign `(group_id, id, created_ns, sha256(data) = payload_hash)` as
+/// `signer`: an upgrade attestation when `attested`, else a sequencing
+/// signature.
+pub(crate) fn sign_hashed(
+    signer: &dyn HelloSigner,
+    group_id: &[u8],
+    id: u64,
+    created_ns: u64,
+    payload_hash: Vec<u8>,
+    attested: bool,
+) -> Result<SeqProof, MeshError> {
     let key = signer.installation_key();
-    let record = SeqRecord::new(&key, group_id, id, created_ns, sha256(data));
-    let signature = signer.sign(&record.signing_text())?;
+    let record = SeqRecord::new(&key, group_id, id, created_ns, payload_hash);
+    let signature = signer.sign(&record.signing_text_as(attested))?;
     Ok(SeqProof {
         signer: key,
         signature,
+        attested,
     })
 }
 
-/// Whether `proof` is a valid signature by `proof.signer` over the row.
+/// Whether `proof` is a valid signature by `proof.signer` over the row, of
+/// the kind `proof.attested` claims.
 pub fn verify_proof(
     group_id: &[u8],
     id: u64,
@@ -110,25 +151,27 @@ pub fn verify_proof(
     data: &[u8],
     proof: &SeqProof,
 ) -> bool {
-    SeqRecord::new(&proof.signer, group_id, id, created_ns, sha256(data)).verify(&proof.signature)
+    SeqRecord::new(&proof.signer, group_id, id, created_ns, sha256(data))
+        .verify_as(&proof.signature, proof.attested)
 }
 
-/// `(seq_signer, seq_signature)` to store for a received row. No proof, or
-/// an empty signature, is `(None, None)`. An empty signer takes
-/// `default_signer` (a relayed row signed by the envelope's signer).
+/// `(seq_signer, seq_signature, seq_attested)` to store for a received
+/// row. No proof, or an empty signature, is `(None, None, false)`. An empty
+/// signer takes `default_signer` (a relayed row signed by the envelope's
+/// signer).
 pub(crate) fn proof_fields(
     proof: Option<&SeqProof>,
     default_signer: Option<&[u8]>,
-) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+) -> (Option<Vec<u8>>, Option<Vec<u8>>, bool) {
     let Some(proof) = proof.filter(|p| !p.signature.is_empty()) else {
-        return (None, None);
+        return (None, None, false);
     };
     let signer = if proof.signer.is_empty() {
         default_signer.map(<[u8]>::to_vec)
     } else {
         Some(proof.signer.clone())
     };
-    (signer, Some(proof.signature.clone()))
+    (signer, Some(proof.signature.clone()), proof.attested)
 }
 
 /// Why a sequenced row was refused (§B13).
@@ -239,20 +282,24 @@ pub(crate) struct SignerContext {
     pub revoked: HashSet<Vec<u8>>,
 }
 
+/// The distinct `(seq_signer, seq_attested)` pairs of a group's stored
+/// rows, in any order.
+pub(crate) type StoredSigners = Vec<(Option<Vec<u8>>, bool)>;
+
 /// The stored rows of one group, as [`check_rows`] reads them.
 pub(crate) trait RowLookup {
     fn max_id(&mut self) -> Result<i64, MeshError>;
     fn stored_at(&mut self, id: i64) -> Result<Option<StoredGroupMessage>, MeshError>;
-    /// Every stored row's signer, by ascending id.
-    fn signers(&mut self) -> Result<Vec<Option<Vec<u8>>>, MeshError>;
+    fn signers(&mut self) -> Result<StoredSigners, MeshError>;
 }
 
 /// What to do with one frame's (or relayed payload's) rows.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Verdict {
     /// Store `new_rows` (contiguous, in order). `held` are rows this node
-    /// already has. `gap` is `Some(highest id held after storing)` when a
-    /// row skipped ahead: the sender's retry fills it.
+    /// already has, or repeats of an earlier row of the same frame. `gap` is
+    /// `Some(highest id held after storing)` when a row skipped ahead: the
+    /// sender's retry fills it.
     Accept {
         held: Vec<StoredGroupMessage>,
         new_rows: Vec<StoredGroupMessage>,
@@ -300,39 +347,41 @@ fn equivocation(
     }
 }
 
-/// Rule 3's state along a group's ids: a revoked key may add rows until a
-/// row by a non-revoked installation follows a revoked-signed row. Rows a
-/// joiner attested at the upgrade (§B13) may come first without closing it.
-#[derive(Default)]
-struct RevokedRun {
-    seen_revoked: bool,
-    closed: bool,
-}
-
-impl RevokedRun {
-    fn note(&mut self, signer: Option<&[u8]>, ctx: &SignerContext) {
-        match signer {
-            Some(s) if ctx.revoked.contains(s) => self.seen_revoked = true,
-            Some(_) if self.seen_revoked => self.closed = true,
-            _ => {}
-        }
-    }
+/// Rule 4 for a row at an id this node already has (`kept`, stored or
+/// earlier in the frame): `Some(equivocation)` when the same signer signed a
+/// different record there; otherwise the row is a duplicate or §C4.7 id
+/// reuse, and `kept` stays.
+fn conflicts_with(
+    group_id: &[u8],
+    kept: &StoredGroupMessage,
+    row: &StoredGroupMessage,
+) -> Option<Equivocation> {
+    (kept.seq_signer == row.seq_signer
+        && (kept.created_ns != row.created_ns || kept.data != row.data))
+        .then(|| equivocation(group_id, kept, row))
 }
 
 /// The §B13 accept rule for rows received for `group_id`, in frame order.
 /// Nothing is written; the caller stores an `Accept` and records a
 /// `Reject`'s equivocation.
 ///
-/// 1. A proof is present and verifies over the rebuilt record.
+/// 1. A proof is present and verifies over the rebuilt record, as an
+///    attestation or a sequencing signature as the row says.
 /// 2. Its signer is in `ctx.known`.
-/// 3. For a new id: the signer is the pinned sequencer, or a revoked
-///    installation whose run is still open (see [`RevokedRun`]).
-/// 4. For a held id: the same record is a duplicate; a different record by
-///    the same signer is equivocation; another signer is §C4.7 id reuse
-///    and the stored row stays.
+/// 3. For a new id: the signer is the pinned sequencer and not revoked; or
+///    a revoked installation (not the pinned one) and every row below the
+///    id, stored or earlier in the frame, is revoked-signed or an
+///    attestation. So history may open with attestations and a revoked
+///    former sequencer's rows (§C4.7), but once a live installation's
+///    ordinary row exists, no revoked key adds rows after it.
+/// 4. For an id already held, or repeated within the frame: the same record
+///    is a duplicate; a different record by the same signer is
+///    equivocation; another signer is §C4.7 id reuse and the first row
+///    stays.
 ///
-/// Rules 1–2 run for every row (one bad row rejects the frame); rules 3–4
-/// run in id order up to the first gap.
+/// Order: rules 1–2 run over the whole frame first (one bad row rejects it,
+/// including rows after a gap); then rules 3–4 in frame order, up to the
+/// first gap. The reason reported is the first failure in that order.
 pub(crate) fn check_rows(
     ctx: &SignerContext,
     group_id: &[u8],
@@ -345,50 +394,64 @@ pub(crate) fn check_rows(
             equivocation: None,
         })
     };
+    let equivocates = |e: Equivocation| -> Result<Verdict, MeshError> {
+        Ok(Verdict::Reject {
+            reason: SeqReject::Equivocation,
+            equivocation: Some(e),
+        })
+    };
     for row in &rows {
         let Some((record, signature)) = record_of(group_id, row) else {
             return reject(SeqReject::MissingProof);
         };
-        if !record.verify(signature) {
+        if !record.verify_as(signature, row.seq_attested) {
             return reject(SeqReject::BadSignature);
         }
         if !ctx.known.contains(&record.originator_installation) {
             return reject(SeqReject::WrongSigner);
         }
     }
-    let revoked_not_pinned =
-        |s: &[u8]| ctx.sequencer.as_deref() != Some(s) && ctx.revoked.contains(s);
-    let mut run = None;
+    let pinned = |s: &[u8]| ctx.sequencer.as_deref() == Some(s);
+    let revoked = |s: &[u8]| ctx.revoked.contains(s);
+    // Rule 3's "every row below is revoked-signed or an attestation".
+    let clean = |signer: Option<&[u8]>, attested: bool| attested || signer.is_some_and(revoked);
+    // Only read the stored signers when a frame row needs them.
+    let mut below_clean = None;
     if rows.iter().any(|r| {
         r.seq_signer
             .as_deref()
-            .is_some_and(|s| revoked_not_pinned(s))
+            .is_some_and(|s| !pinned(s) && revoked(s))
     }) {
-        let mut stored_run = RevokedRun::default();
-        for signer in lookup.signers()? {
-            stored_run.note(signer.as_deref(), ctx);
-        }
-        run = Some(stored_run);
+        let stored = lookup.signers()?;
+        below_clean = Some(stored.iter().all(|(s, a)| clean(s.as_deref(), *a)));
     }
     let have = lookup.max_id()?;
     let mut held = Vec::new();
     let mut new_rows: Vec<StoredGroupMessage> = Vec::new();
     for row in rows {
-        let signer = row.seq_signer.clone().unwrap_or_default();
         if row.id <= have {
-            if let Some(stored) = lookup.stored_at(row.id)?
-                && stored.seq_signer.as_deref() == Some(signer.as_slice())
-                && (stored.created_ns != row.created_ns || stored.data != row.data)
-            {
-                return Ok(Verdict::Reject {
-                    reason: SeqReject::Equivocation,
-                    equivocation: Some(equivocation(group_id, &stored, &row)),
-                });
+            let stored = lookup.stored_at(row.id)?;
+            debug_assert!(
+                stored.is_some(),
+                "no stored row at id {} at or below the group's max id {have}",
+                row.id
+            );
+            if let Some(e) = stored.and_then(|kept| conflicts_with(group_id, &kept, &row)) {
+                return equivocates(e);
             }
             held.push(row);
             continue;
         }
         let next = have + new_rows.len() as i64 + 1;
+        if row.id < next {
+            // Repeats a row accepted earlier in this frame.
+            let kept = &new_rows[(row.id - have - 1) as usize];
+            if let Some(e) = conflicts_with(group_id, kept, &row) {
+                return equivocates(e);
+            }
+            held.push(row);
+            continue;
+        }
         if row.id != next {
             return Ok(Verdict::Accept {
                 held,
@@ -396,14 +459,17 @@ pub(crate) fn check_rows(
                 gap: Some(next - 1),
             });
         }
-        let pinned = ctx.sequencer.as_deref() == Some(signer.as_slice());
-        let open_revoked =
-            revoked_not_pinned(&signer) && run.as_ref().is_some_and(|r: &RevokedRun| !r.closed);
-        if !pinned && !open_revoked {
+        let signer = row.seq_signer.as_deref().unwrap_or_default();
+        let allowed = if pinned(signer) {
+            !revoked(signer)
+        } else {
+            revoked(signer) && below_clean == Some(true)
+        };
+        if !allowed {
             return reject(SeqReject::WrongSigner);
         }
-        if let Some(run) = run.as_mut() {
-            run.note(Some(&signer), ctx);
+        if let Some(c) = below_clean.as_mut() {
+            *c &= clean(Some(signer), row.seq_attested);
         }
         new_rows.push(row);
     }
@@ -422,8 +488,38 @@ pub(crate) fn signed_row(
     id: i64,
     data: &[u8],
 ) -> StoredGroupMessage {
+    proven_row(signer, group_id, id, data, false)
+}
+
+/// [`signed_row`], as an upgrade attestation.
+#[cfg(test)]
+pub(crate) fn attested_row(
+    signer: &dyn HelloSigner,
+    group_id: &[u8],
+    id: i64,
+    data: &[u8],
+) -> StoredGroupMessage {
+    proven_row(signer, group_id, id, data, true)
+}
+
+#[cfg(test)]
+fn proven_row(
+    signer: &dyn HelloSigner,
+    group_id: &[u8],
+    id: i64,
+    data: &[u8],
+    attested: bool,
+) -> StoredGroupMessage {
     let created_ns = id * 10;
-    let proof = sign_row(signer, group_id, id as u64, created_ns as u64, data).unwrap();
+    let proof = sign_hashed(
+        signer,
+        group_id,
+        id as u64,
+        created_ns as u64,
+        sha256(data),
+        attested,
+    )
+    .unwrap();
     StoredGroupMessage {
         group_id: group_id.to_vec(),
         id,
@@ -434,6 +530,7 @@ pub(crate) fn signed_row(
         is_commit: false,
         seq_signer: Some(proof.signer),
         seq_signature: Some(proof.signature),
+        seq_attested: proof.attested,
     }
 }
 
@@ -537,12 +634,21 @@ mod tests {
         let proof = SeqProof {
             signer: vec![],
             signature: vec![9; 64],
+            attested: false,
         };
         assert_eq!(
             proof_fields(Some(&proof), Some(b"envelope")),
-            (Some(b"envelope".to_vec()), Some(vec![9; 64]))
+            (Some(b"envelope".to_vec()), Some(vec![9; 64]), false)
         );
-        assert_eq!(proof_fields(Some(&proof), None), (None, Some(vec![9; 64])));
+        assert_eq!(
+            proof_fields(Some(&proof), None),
+            (None, Some(vec![9; 64]), false)
+        );
+        let attested = SeqProof {
+            attested: true,
+            ..proof.clone()
+        };
+        assert!(proof_fields(Some(&attested), None).2, "the flag is kept");
         let explicit = SeqProof {
             signer: b"former".to_vec(),
             ..proof
@@ -554,9 +660,10 @@ mod tests {
         let unsigned = SeqProof {
             signer: b"x".to_vec(),
             signature: vec![],
+            attested: true,
         };
-        assert_eq!(proof_fields(Some(&unsigned), None), (None, None));
-        assert_eq!(proof_fields(None, Some(b"envelope")), (None, None));
+        assert_eq!(proof_fields(Some(&unsigned), None), (None, None, false));
+        assert_eq!(proof_fields(None, Some(b"envelope")), (None, None, false));
     }
 
     #[test]
@@ -611,10 +718,12 @@ mod tests {
         fn stored_at(&mut self, id: i64) -> Result<Option<StoredGroupMessage>, MeshError> {
             Ok(self.0.iter().find(|r| r.id == id).cloned())
         }
-        fn signers(&mut self) -> Result<Vec<Option<Vec<u8>>>, MeshError> {
-            let mut rows = self.0.clone();
-            rows.sort_by_key(|r| r.id);
-            Ok(rows.into_iter().map(|r| r.seq_signer).collect())
+        fn signers(&mut self) -> Result<StoredSigners, MeshError> {
+            Ok(self
+                .0
+                .iter()
+                .map(|r| (r.seq_signer.clone(), r.seq_attested))
+                .collect())
         }
     }
 
@@ -756,8 +865,8 @@ mod tests {
         let (old, next) = (KeySigner::new(), KeySigner::new());
         let c = ctx(&next, &[&old, &next], &[&old]);
         let history = vec![
-            signed_row(&next, G, 1, b"attested 1"),
-            signed_row(&next, G, 2, b"attested 2"),
+            attested_row(&next, G, 1, b"attested 1"),
+            attested_row(&next, G, 2, b"attested 2"),
             signed_row(&old, G, 3, b"old sequencer 3"),
             signed_row(&old, G, 4, b"old sequencer 4"),
             signed_row(&next, G, 5, b"successor 5"),
@@ -777,6 +886,185 @@ mod tests {
         assert_eq!(reason(&v), SeqReject::WrongSigner);
     }
 
+    /// §B13 rule 3: a stolen, revoked phone cannot extend a history that
+    /// only live installations ordered, even with a valid signature.
+    #[test]
+    fn a_revoked_key_cannot_append_after_sequencer_only_history() {
+        let (s, stolen) = (KeySigner::new(), KeySigner::new());
+        let c = ctx(&s, &[&s, &stolen], &[&stolen]);
+        let stored = vec![
+            signed_row(&s, G, 1, b"a"),
+            signed_row(&s, G, 2, b"b"),
+            signed_row(&s, G, 3, b"c"),
+        ];
+        let forged = signed_row(&stolen, G, 4, b"forged");
+        let v = check_rows(&c, G, vec![forged], &mut Stored(stored)).unwrap();
+        assert_eq!(reason(&v), SeqReject::WrongSigner);
+    }
+
+    #[test]
+    fn a_revoked_key_cannot_append_after_sequencer_rows_in_the_same_frame() {
+        let (s, stolen) = (KeySigner::new(), KeySigner::new());
+        let c = ctx(&s, &[&s, &stolen], &[&stolen]);
+        let rows = vec![
+            signed_row(&s, G, 1, b"a"),
+            signed_row(&s, G, 2, b"b"),
+            signed_row(&stolen, G, 3, b"forged"),
+        ];
+        let v = check_rows(&c, G, rows, &mut Stored::default()).unwrap();
+        assert_eq!(reason(&v), SeqReject::WrongSigner);
+    }
+
+    /// §C4.7: a DM the now-revoked installation created and sequenced,
+    /// with no attestations, is accepted up to the successor's first row.
+    #[test]
+    fn a_dm_ordered_by_a_revoked_installation_is_accepted_before_the_successor() {
+        let (old, next) = (KeySigner::new(), KeySigner::new());
+        let c = ctx(&next, &[&old, &next], &[&old]);
+        let stored = vec![signed_row(&old, G, 1, b"a"), signed_row(&old, G, 2, b"b")];
+        let v = check_rows(
+            &c,
+            G,
+            vec![signed_row(&old, G, 3, b"c")],
+            &mut Stored(stored.clone()),
+        )
+        .unwrap();
+        assert_eq!(accepted_ids(&v), vec![3], "only revoked rows below");
+        let v = check_rows(
+            &c,
+            G,
+            vec![signed_row(&next, G, 3, b"c")],
+            &mut Stored(stored),
+        )
+        .unwrap();
+        assert_eq!(accepted_ids(&v), vec![3]);
+    }
+
+    /// The node knows the pinned sequencer is revoked: the §C4.7 re-pin is
+    /// due, and its rows wait for it.
+    #[test]
+    fn a_pinned_sequencer_that_is_revoked_is_a_wrong_signer() {
+        let s = KeySigner::new();
+        let c = ctx(&s, &[&s], &[&s]);
+        let v = check_rows(
+            &c,
+            G,
+            vec![signed_row(&s, G, 1, b"a")],
+            &mut Stored::default(),
+        )
+        .unwrap();
+        assert_eq!(reason(&v), SeqReject::WrongSigner);
+        let stored = vec![signed_row(&s, G, 1, b"a")];
+        let v = check_rows(&c, G, stored.clone(), &mut Stored(stored)).unwrap();
+        assert!(
+            matches!(v, Verdict::Accept { ref held, .. } if held.len() == 1),
+            "a held row is still a duplicate"
+        );
+    }
+
+    #[test]
+    fn an_attestation_is_not_a_sequencing_signature_or_the_reverse() {
+        let s = KeySigner::new();
+        let normal = sign_row(&s, b"g", 1, 10, b"x").unwrap();
+        let attested = sign_hashed(&s, b"g", 1, 10, sha256(b"x"), true).unwrap();
+        assert!(!normal.attested && attested.attested);
+        assert!(verify_proof(b"g", 1, 10, b"x", &normal));
+        assert!(verify_proof(b"g", 1, 10, b"x", &attested));
+        let as_attested = SeqProof {
+            attested: true,
+            ..normal
+        };
+        let as_normal = SeqProof {
+            attested: false,
+            ..attested
+        };
+        assert!(!verify_proof(b"g", 1, 10, b"x", &as_attested));
+        assert!(!verify_proof(b"g", 1, 10, b"x", &as_normal));
+        let record = SeqRecord::new(&s.installation_key(), b"g", 1, 10, sha256(b"x"));
+        assert!(
+            record
+                .signing_text_as(true)
+                .starts_with("xmtp-mesh-seq-attest-v1:")
+        );
+
+        let c = ctx(&s, &[&s], &[]);
+        let mut flipped = signed_row(&s, G, 1, b"a");
+        flipped.seq_attested = true;
+        let v = check_rows(&c, G, vec![flipped], &mut Stored::default()).unwrap();
+        assert_eq!(reason(&v), SeqReject::BadSignature);
+        let mut flipped = attested_row(&s, G, 1, b"a");
+        flipped.seq_attested = false;
+        let v = check_rows(&c, G, vec![flipped], &mut Stored::default()).unwrap();
+        assert_eq!(reason(&v), SeqReject::BadSignature);
+    }
+
+    #[test]
+    fn an_id_repeated_within_a_frame_is_a_duplicate_or_equivocation() {
+        let s = KeySigner::new();
+        let c = ctx(&s, &[&s], &[]);
+        let first = signed_row(&s, G, 1, b"a");
+        let v = check_rows(
+            &c,
+            G,
+            vec![first.clone(), first.clone()],
+            &mut Stored::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            v,
+            Verdict::Accept {
+                held: vec![first.clone()],
+                new_rows: vec![first.clone()],
+                gap: None
+            }
+        );
+        let other = signed_row(&s, G, 1, b"b");
+        let v = check_rows(
+            &c,
+            G,
+            vec![first.clone(), other.clone()],
+            &mut Stored::default(),
+        )
+        .unwrap();
+        match v {
+            Verdict::Reject {
+                reason: SeqReject::Equivocation,
+                equivocation: Some(e),
+            } => {
+                assert_eq!(e.signature_a, first.seq_signature.unwrap());
+                assert_eq!(e.signature_b, other.seq_signature.unwrap());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Rules 1–2 cover the whole frame before rules 3–4: a bad signature
+    /// later in the frame is the reason, not an earlier equivocation.
+    #[test]
+    fn rules_one_and_two_run_over_the_whole_frame_first() {
+        let s = KeySigner::new();
+        let c = ctx(&s, &[&s], &[]);
+        let mut bad = signed_row(&s, G, 2, b"c");
+        bad.data = b"changed".to_vec();
+        let rows = vec![signed_row(&s, G, 1, b"b"), bad];
+        let v = check_rows(&c, G, rows, &mut Stored(vec![signed_row(&s, G, 1, b"a")])).unwrap();
+        assert_eq!(reason(&v), SeqReject::BadSignature);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "no stored row at id 1")]
+    fn a_hole_below_the_max_id_is_a_bug() {
+        let s = KeySigner::new();
+        let c = ctx(&s, &[&s], &[]);
+        let _ = check_rows(
+            &c,
+            G,
+            vec![signed_row(&s, G, 1, b"a")],
+            &mut Stored(vec![signed_row(&s, G, 2, b"b")]),
+        );
+    }
+
     /// Rule 4: rows already held are duplicates, whoever signed them; only
     /// the same signer with a different record is equivocation.
     #[test]
@@ -793,7 +1081,7 @@ mod tests {
                 gap: None
             }
         );
-        let attested = signed_row(&attester, G, 1, b"a");
+        let attested = attested_row(&attester, G, 1, b"a");
         let v = check_rows(
             &c,
             G,

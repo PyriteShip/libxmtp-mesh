@@ -160,6 +160,7 @@ fn fixture_row(gid: &[u8]) -> crate::store::StoredGroupMessage {
         is_commit: parsed.is_commit,
         seq_signer: None,
         seq_signature: None,
+        seq_attested: false,
     }
 }
 
