@@ -94,10 +94,14 @@ struct EquivocationRow {
     record_a: Vec<u8>,
     #[diesel(sql_type = Binary)]
     signature_a: Vec<u8>,
+    #[diesel(sql_type = Bool)]
+    attested_a: bool,
     #[diesel(sql_type = Binary)]
     record_b: Vec<u8>,
     #[diesel(sql_type = Binary)]
     signature_b: Vec<u8>,
+    #[diesel(sql_type = Bool)]
+    attested_b: bool,
 }
 
 /// A row to (re)sign, for [`MeshStore::sign_unsigned_rows`] and
@@ -903,16 +907,18 @@ impl MeshStore {
         self.transaction(|s| {
             sql_query(
                 "INSERT OR IGNORE INTO equivocations \
-                 (group_id, id, signer, record_a, signature_a, record_b, signature_b, seen_ns) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 (group_id, id, signer, record_a, signature_a, attested_a, record_b, signature_b, attested_b, seen_ns) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind::<Binary, _>(&e.group_id)
             .bind::<BigInt, _>(e.id)
             .bind::<Binary, _>(&e.signer)
             .bind::<Binary, _>(&e.record_a)
             .bind::<Binary, _>(&e.signature_a)
+            .bind::<Bool, _>(e.attested_a)
             .bind::<Binary, _>(&e.record_b)
             .bind::<Binary, _>(&e.signature_b)
+            .bind::<Bool, _>(e.attested_b)
             .bind::<BigInt, _>(now_ns)
             .execute(&mut s.conn)?;
             sql_query(
@@ -928,7 +934,7 @@ impl MeshStore {
     /// The group's kept equivocations, by ascending id.
     pub fn equivocations(&mut self, group_id: &[u8]) -> Result<Vec<Equivocation>, MeshError> {
         let rows: Vec<EquivocationRow> = sql_query(
-            "SELECT group_id, id, signer, record_a, signature_a, record_b, signature_b \
+            "SELECT group_id, id, signer, record_a, signature_a, attested_a, record_b, signature_b, attested_b \
              FROM equivocations WHERE group_id = ? ORDER BY id ASC, signer ASC",
         )
         .bind::<Binary, _>(group_id)
@@ -941,10 +947,28 @@ impl MeshStore {
                 signer: r.signer,
                 record_a: r.record_a,
                 signature_a: r.signature_a,
+                attested_a: r.attested_a,
                 record_b: r.record_b,
                 signature_b: r.signature_b,
+                attested_b: r.attested_b,
             })
             .collect())
+    }
+
+    /// Make every already-stored row in `group_id` look as the
+    /// signed-sequencing migration's own `UPDATE` left rows older than it:
+    /// no proof, `seq_legacy`. Test-only, to exercise the upgrade path (an
+    /// old row a later `start_sync` attests) without reverting and
+    /// reapplying the migration itself, which `store::tests` covers.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn mark_rows_legacy_for_test(&mut self, group_id: &[u8]) -> Result<(), MeshError> {
+        sql_query(
+            "UPDATE group_messages SET seq_signer = NULL, seq_signature = NULL, \
+             seq_attested = 0, seq_legacy = 1 WHERE group_id = ?",
+        )
+        .bind::<Binary, _>(group_id)
+        .execute(&mut self.conn)?;
+        Ok(())
     }
 
     // ---- pending (awaiting the sequencer) ----

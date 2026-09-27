@@ -249,6 +249,15 @@ impl MeshNode {
     ) -> Result<Vec<seq::Equivocation>, MeshError> {
         self.inner.store.lock().equivocations(group_id)
     }
+
+    /// Make every row this node already holds for `group_id` look
+    /// pre-migration: no proof, `seq_legacy`. See
+    /// [`MeshStore::mark_rows_legacy_for_test`].
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn mark_rows_legacy_for_test(&self, group_id: &[u8]) -> Result<(), MeshError> {
+        self.inner.store.lock().mark_rows_legacy_for_test(group_id)
+    }
 }
 
 #[cfg(test)]

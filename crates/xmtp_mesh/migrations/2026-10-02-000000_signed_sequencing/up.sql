@@ -9,15 +9,19 @@ ALTER TABLE group_messages ADD COLUMN seq_attested BOOLEAN NOT NULL DEFAULT 0;
 ALTER TABLE group_messages ADD COLUMN seq_legacy BOOLEAN NOT NULL DEFAULT 0;
 UPDATE group_messages SET seq_legacy = 1;
 -- Two different records one signer signed under one (group_id, id), kept
--- as proof. At most 1024 rows; the oldest are dropped.
+-- as proof. At most 1024 rows; the oldest are dropped. `attested_a`/
+-- `attested_b` record whether each record's signature was an upgrade
+-- attestation rather than a sequencing signature (§B13).
 CREATE TABLE equivocations (
     group_id BLOB NOT NULL,
     id BIGINT NOT NULL,
     signer BLOB NOT NULL,
     record_a BLOB NOT NULL,
     signature_a BLOB NOT NULL,
+    attested_a BOOLEAN NOT NULL DEFAULT 0,
     record_b BLOB NOT NULL,
     signature_b BLOB NOT NULL,
+    attested_b BOOLEAN NOT NULL DEFAULT 0,
     seen_ns BIGINT NOT NULL,
     PRIMARY KEY (group_id, id, signer)
 );

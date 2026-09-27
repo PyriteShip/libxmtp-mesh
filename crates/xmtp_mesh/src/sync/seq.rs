@@ -207,8 +207,12 @@ pub struct Equivocation {
     pub signer: Vec<u8>,
     pub record_a: Vec<u8>,
     pub signature_a: Vec<u8>,
+    /// Whether `signature_a` is an upgrade attestation rather than a
+    /// sequencing signature (§B13).
+    pub attested_a: bool,
     pub record_b: Vec<u8>,
     pub signature_b: Vec<u8>,
+    pub attested_b: bool,
 }
 
 /// Signed-sequencing counters since the node was opened (§B13). A snapshot.
@@ -337,8 +341,10 @@ fn equivocation(
         signer: row.seq_signer.clone().unwrap_or_default(),
         record_a: encode(stored),
         signature_a: stored.seq_signature.clone().unwrap_or_default(),
+        attested_a: stored.seq_attested,
         record_b: encode(row),
         signature_b: row.seq_signature.clone().unwrap_or_default(),
+        attested_b: row.seq_attested,
     }
 }
 
@@ -1072,8 +1078,10 @@ mod tests {
                     signer: s.installation_key(),
                     record_a: record(&stored),
                     signature_a: stored.seq_signature.clone().unwrap(),
+                    attested_a: false,
                     record_b: record(&other),
                     signature_b: other.seq_signature.clone().unwrap(),
+                    attested_b: false,
                 }),
             }
         );
@@ -1103,5 +1111,70 @@ mod tests {
         ];
         let v = check_rows(&ctx(&s, &[&s], &[]), G, rows, &mut Stored::default()).unwrap();
         assert_eq!(reason(&v), SeqReject::WrongSigner);
+    }
+
+    /// DESIGN.md §B13 "Cost": measures the wire overhead one proof adds,
+    /// from actual encoded sizes rather than a guess, so the doc's
+    /// approximate figures can be kept honest. A direct row's proof names
+    /// its signer explicitly (`Sequenced.proofs`, tag 4); a relay `Ref`
+    /// row's proof travels with an empty signer, meaning the envelope's
+    /// (`RelayRow.proof`, tag 3, §R4.6).
+    #[test]
+    fn proof_overhead_is_about_100_bytes_direct_and_about_70_relay() {
+        use xmtp_proto::mls_v1::{GroupMessage, group_message};
+
+        use crate::relay::inner::{RelayRow, RowRef, relay_row::Row};
+        use crate::sync::frames::Sequenced;
+
+        let message = GroupMessage {
+            version: Some(group_message::Version::V1(group_message::V1 {
+                id: 1,
+                created_ns: 1,
+                group_id: vec![1; 32],
+                data: vec![0; 200],
+                sender_hmac: vec![0; 32],
+                should_push: true,
+                is_commit: false,
+            })),
+        };
+        let bare = Sequenced {
+            group_id: vec![1; 32],
+            messages: vec![message],
+            sender_is_sequencer: true,
+            proofs: vec![],
+        };
+        let direct_proof = SeqProof {
+            signer: vec![9; 32],
+            signature: vec![9; 64],
+            attested: false,
+        };
+        let with_proof = Sequenced {
+            proofs: vec![direct_proof],
+            ..bare.clone()
+        };
+        let direct_overhead = with_proof.encoded_len() - bare.encoded_len();
+        // Named explicitly per doc so a change here is a deliberate edit,
+        // not silent drift; DESIGN.md §B13 states these as approximate.
+        assert_eq!(direct_overhead, 102, "direct proof overhead moved");
+
+        let bare_ref = RelayRow {
+            row: Some(Row::Reference(RowRef {
+                id: 1,
+                created_ns: 1,
+                data_hash: vec![9; 32],
+            })),
+            proof: None,
+        };
+        let relay_proof = SeqProof {
+            signer: vec![], // the envelope's signer, not repeated (§R4.6)
+            signature: vec![9; 64],
+            attested: false,
+        };
+        let with_ref_proof = RelayRow {
+            proof: Some(relay_proof),
+            ..bare_ref.clone()
+        };
+        let relay_overhead = with_ref_proof.encoded_len() - bare_ref.encoded_len();
+        assert_eq!(relay_overhead, 68, "relay proof overhead moved");
     }
 }

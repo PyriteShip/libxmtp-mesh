@@ -461,8 +461,10 @@ fn equivocations_keep_the_newest_1024() {
             signer: vec![1],
             record_a: vec![2],
             signature_a: vec![3],
+            attested_a: true,
             record_b: vec![4],
             signature_b: vec![5],
+            attested_b: false,
         };
         s.record_equivocation(&e, id).unwrap();
     }
@@ -470,4 +472,9 @@ fn equivocations_keep_the_newest_1024() {
     assert_eq!(kept.len(), 1024);
     assert_eq!(kept[0].id, 7, "the six oldest were dropped");
     assert_eq!(kept[0].record_b, vec![4]);
+    assert_eq!(
+        (kept[0].attested_a, kept[0].attested_b),
+        (true, false),
+        "each record's attested flag is kept"
+    );
 }

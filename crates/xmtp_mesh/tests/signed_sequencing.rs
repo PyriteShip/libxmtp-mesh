@@ -5,8 +5,8 @@ mod common;
 
 use common::{
     TestPeer, a1_created_dm, build_client, carried_node, eventually, eventually_for, pair_dm, peer,
-    peer_on, recorded_peer, relay_keys_confirmed, relay_peer, revoke_all_other_installations,
-    send_and_see, start_sync,
+    peer_on, recorded_peer, relay_keys_confirmed, relay_peer, restart_sync,
+    revoke_all_other_installations, send_and_see, start_sync,
 };
 use xmtp_cryptography::utils::generate_local_wallet;
 use xmtp_cryptography::{CredentialSign, XmtpInstallationCredential};
@@ -470,6 +470,11 @@ async fn one_signer_two_payloads_at_one_id_is_kept_as_equivocation() {
     assert_eq!(kept[0].signature_a, held.seq_signature.clone().unwrap());
     assert_eq!(kept[0].signature_b, proof.signature);
     assert_eq!(
+        (kept[0].attested_a, kept[0].attested_b),
+        (false, false),
+        "neither record is an upgrade attestation"
+    );
+    assert_eq!(
         b.node
             .sequenced_rows_for_test(&gid)
             .unwrap()
@@ -513,4 +518,103 @@ async fn relay_retries_of_held_rows_are_not_rejections() {
     assert_eq!(rejections(&stats), 0, "{stats:?}");
     assert!(d.node.equivocations_for_test(&gid).unwrap().is_empty());
     drop(b);
+}
+
+/// §B13 upgrade, pinned end to end over a session: both sides hold rows the
+/// migration would leave without a proof and mark legacy, the joiner
+/// behind the sequencer. `start_sync` on each attests its own held history
+/// before either can serve or accept anything; the joiner then fetches
+/// what it is missing under the sequencer's attested proofs, and nothing
+/// is rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_upgrade_over_a_session_fetches_attested_history_with_nothing_rejected() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    let (a_dm, _b_dm) = pair_dm(&hub, &a, &b).await;
+    let gid = a_dm.group_id.clone();
+    eventually("b holds all of a's rows", || async {
+        b.node.max_group_id_for_test(&gid).unwrap() == a.node.max_group_id_for_test(&gid).unwrap()
+    })
+    .await;
+
+    // a orders two more rows b never sees before the upgrade.
+    hub.unlink("a", "b");
+    for text in [b"two".as_slice(), b"three"] {
+        a_dm.send_message(text, SendMessageOpts::default())
+            .await
+            .unwrap();
+    }
+    let a_high = a.node.max_group_id_for_test(&gid).unwrap();
+    let b_high = b.node.max_group_id_for_test(&gid).unwrap();
+    assert!(a_high > b_high);
+
+    // Both sides now look as the signed-sequencing migration would leave
+    // data older than it: every stored row loses its proof and is marked
+    // legacy (§B13; `store::tests` covers the migration's own `UPDATE`).
+    a.node.stop_sync();
+    b.node.stop_sync();
+    a.node.mark_rows_legacy_for_test(&gid).unwrap();
+    b.node.mark_rows_legacy_for_test(&gid).unwrap();
+    for row in a.node.sequenced_rows_for_test(&gid).unwrap() {
+        assert_eq!((row.seq_signer, row.seq_signature), (None, None));
+    }
+
+    // start_sync's backfill attests each side's own held rows as its own
+    // history before the reconnect below can serve or accept any of them.
+    restart_sync(&a, hub.transport_for("a"));
+    restart_sync(&b, hub.transport_for("b"));
+    hub.link("a", "b");
+
+    eventually("b fetches what it was missing", || async {
+        b.node.max_group_id_for_test(&gid).unwrap() == a_high
+    })
+    .await;
+
+    let a_key = a.installation();
+    let b_key = b.installation();
+    let rows = b.node.sequenced_rows_for_test(&gid).unwrap();
+    for row in &rows {
+        assert!(
+            row.seq_attested,
+            "row {}: legacy history is attested, not freshly sequenced",
+            row.id
+        );
+        assert!(
+            seq::verify_proof(
+                &gid,
+                row.id as u64,
+                row.created_ns as u64,
+                &row.data,
+                &row.proof()
+            ),
+            "row {}",
+            row.id
+        );
+        let expected = if row.id > b_high { &a_key } else { &b_key };
+        assert_eq!(
+            row.seq_signer.as_deref(),
+            Some(expected.as_slice()),
+            "row {}: {}",
+            row.id,
+            if row.id > b_high {
+                "fetched under the sequencer's attestation"
+            } else {
+                "b's own pre-existing row keeps its own attestation"
+            }
+        );
+    }
+    assert_eq!(
+        rejections(&a.node.mesh_stats()),
+        0,
+        "{:?}",
+        a.node.mesh_stats()
+    );
+    assert_eq!(
+        rejections(&b.node.mesh_stats()),
+        0,
+        "{:?}",
+        b.node.mesh_stats()
+    );
+    assert_eq!(b.node.group_sequencer_for_test(&gid).unwrap(), Some(a_key));
 }

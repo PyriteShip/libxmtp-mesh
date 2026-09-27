@@ -586,9 +586,12 @@ and is dropped as `missing_proof`.
 `seq_equivocations`, `peers_rejected_version`. A refused frame or payload
 counts once, under the reason of its first failure.
 
-**Cost.** +96 bytes per row on a direct link, +64 on a relay row signed by
-the envelope's signer. One ed25519 check per row (about 50 µs on a phone);
-rule 2 replays the member inboxes' held logs once per frame.
+**Cost.** About +100 bytes per row on a direct link (the proof names its
+signer explicitly); about +70 on a relay `Ref` row signed by the envelope's
+signer (an empty signer costs nothing). Both are protobuf-encoded,
+measured, approximate figures, not a wire guarantee. One ed25519 check per
+row (about 50 µs on a phone); rule 2 replays the member inboxes' held logs
+once per frame.
 
 **Not covered.**
 
