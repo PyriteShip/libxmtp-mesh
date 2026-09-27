@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use prost::Message;
 use xmtp_proto::mls_v1::{
-    GroupMessage, GroupMessageInput, WelcomeMessageInput, group_message, group_message_input,
+    GroupMessage, GroupMessageInput, WelcomeMessageInput, group_message_input,
 };
 use xmtp_proto::xmtp::identity::api::v1::get_identity_updates_response::IdentityUpdateLog;
 use xmtp_proto::xmtp::identity::associations::IdentityUpdate as IdentityUpdateProto;
@@ -12,7 +12,7 @@ use super::welcomes::welcome_recipient;
 use super::{MeshNode, NodeEvent};
 use crate::MeshError;
 use crate::mls_parse::{parse_group_message, verify_key_package};
-use crate::store::{InsertOutcome, NewGroupMessage, StoredGroupMessage, sha256};
+use crate::store::{NewGroupMessage, sha256};
 use crate::sync::frames::{IdentityLog, Interest, KeyPackage, Welcome};
 use crate::sync::seq::SeqProof;
 
@@ -413,50 +413,6 @@ impl MeshNode {
             .iter()
             .map(|row| (row.to_proto(), row.proof()))
             .collect())
-    }
-
-    /// Store messages the sequencer sent us, in order. Returns Some(have) on a gap.
-    pub(crate) fn ingest_sequenced(
-        &self,
-        group_id: &[u8],
-        messages: Vec<GroupMessage>,
-    ) -> Result<Option<i64>, MeshError> {
-        let mut events = Vec::new();
-        let result = (|| -> Result<Option<i64>, MeshError> {
-            let mut store = self.inner.store.lock();
-            for message in messages {
-                let Some(group_message::Version::V1(v1)) = message.version else {
-                    continue;
-                };
-                if v1.group_id != group_id {
-                    return Err(MeshError::InvalidRequest(
-                        "sequenced message for another group".into(),
-                    ));
-                }
-                let row = StoredGroupMessage {
-                    group_id: v1.group_id,
-                    id: v1.id as i64,
-                    created_ns: v1.created_ns as i64,
-                    data: v1.data,
-                    sender_hmac: v1.sender_hmac,
-                    should_push: v1.should_push,
-                    is_commit: v1.is_commit,
-                    seq_signer: None,
-                    seq_signature: None,
-                    seq_attested: false,
-                };
-                // Our own pending copy (if any, e.g. published again after
-                // it was sequenced) is settled in the same transaction.
-                match store.insert_sequenced_settling_pending(&row)? {
-                    InsertOutcome::Inserted => events.push(NodeEvent::GroupSequenced(row)),
-                    InsertOutcome::Duplicate => {}
-                    InsertOutcome::Gap { have } => return Ok(Some(have)),
-                }
-            }
-            Ok(None)
-        })();
-        self.emit(events);
-        result
     }
 
     pub(crate) fn pending_inputs(

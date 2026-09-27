@@ -69,6 +69,10 @@ pub(crate) struct RelaySync {
 pub(crate) struct RelayRow {
     #[prost(oneof = "relay_row::Row", tags = "1, 2")]
     pub row: Option<relay_row::Row>,
+    /// The row's sequencing proof (§B13). An empty `signer` means the
+    /// `SignedRelayBody`'s `signer_installation`.
+    #[prost(message, optional, tag = "3")]
+    pub proof: Option<crate::sync::seq::SeqProof>,
 }
 
 pub(crate) mod relay_row {

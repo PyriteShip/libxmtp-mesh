@@ -16,8 +16,10 @@ use super::inner::{
     relay_row::Row,
 };
 use crate::MeshError;
-use crate::node::NodeEvent;
+use crate::node::{MeshNode, NodeEvent};
 use crate::store::{NewGroupMessage, StoredGroupMessage, sha256};
+use crate::sync::GroupMembership;
+use crate::sync::seq;
 
 const PAYLOAD_BUDGET: usize = MAX_BODY_LEN - SIGNED_OVERHEAD;
 
@@ -112,33 +114,45 @@ impl Quarantine {
     }
 }
 
-/// Rows to ingest, in order, and whether the list stopped early. `Ref`s at
-/// or below `have` are already held and skipped; the first unresolvable
-/// `Ref` above `have` ends the list (`stalled`): the joiner then asks for
-/// `Full` rows after `have` (`RelayPending.need_full_after`).
+/// Rows to ingest, in order, with their proofs (an empty signer becomes
+/// `envelope_signer`), and whether the list stopped early. `Ref`s at or
+/// below `have` are already held and skipped; the first unresolvable `Ref`
+/// above `have` ends the list (`stalled`): the joiner then asks for `Full`
+/// rows after `have` (`RelayPending.need_full_after`). A row without a
+/// proof comes out unproven, which the accept rule refuses.
 pub(crate) fn resolve_rows(
     rows: Vec<RelayRow>,
     have: i64,
     pending: impl Fn(&[u8]) -> Option<NewGroupMessage>,
     group_id: &[u8],
-) -> (Vec<GroupMessage>, bool) {
+    envelope_signer: &[u8],
+) -> (Vec<StoredGroupMessage>, bool) {
     let mut out = Vec::new();
-    for row in rows {
-        match row.row {
-            Some(Row::Full(m)) => out.push(m),
+    for RelayRow { row, proof } in rows {
+        match row {
+            Some(Row::Full(m)) => out.extend(StoredGroupMessage::from_proto(
+                m,
+                proof.as_ref(),
+                Some(envelope_signer),
+            )),
             Some(Row::Reference(r)) if (r.id as i64) <= have => {}
             Some(Row::Reference(r)) => match pending(&r.data_hash) {
-                Some(p) => out.push(GroupMessage {
-                    version: Some(group_message::Version::V1(group_message::V1 {
-                        id: r.id,
-                        created_ns: r.created_ns,
+                Some(p) => {
+                    let (seq_signer, seq_signature, seq_attested) =
+                        seq::proof_fields(proof.as_ref(), Some(envelope_signer));
+                    out.push(StoredGroupMessage {
                         group_id: group_id.to_vec(),
+                        id: r.id as i64,
+                        created_ns: r.created_ns as i64,
                         data: p.data,
                         sender_hmac: p.sender_hmac,
                         should_push: p.should_push,
                         is_commit: p.is_commit,
-                    })),
-                }),
+                        seq_signer,
+                        seq_signature,
+                        seq_attested,
+                    });
+                }
                 None => return (out, true),
             },
             None => {}
@@ -150,12 +164,14 @@ pub(crate) fn resolve_rows(
 /// Sequencer: pack `(row, from_peer)` in order while the encoded sync stays
 /// within `budget`. A `from_peer` row goes as a `Ref`, unless the joiner
 /// asked for `Full` rows after `full_after` and the row is past it.
-/// Returns the sync and how many `Ref`s it carries.
+/// Each row carries its stored proof; a row `local` signed leaves `signer`
+/// empty (§R4.6). Returns the sync and how many `Ref`s it carries.
 pub(crate) fn pack_sync(
     group_id: &[u8],
     rows: Vec<(StoredGroupMessage, bool)>,
     full_after: Option<i64>,
     budget: usize,
+    local: &[u8],
 ) -> (RelaySync, u64) {
     let mut sync = RelaySync {
         group_id: group_id.to_vec(),
@@ -164,6 +180,10 @@ pub(crate) fn pack_sync(
     let mut refs = 0;
     for (row, from_peer) in rows {
         let as_ref = from_peer && full_after.is_none_or(|n| row.id <= n);
+        let mut proof = row.proof();
+        if proof.signer == local {
+            proof.signer.clear();
+        }
         let relay_row = if as_ref {
             RelayRow {
                 row: Some(Row::Reference(RowRef {
@@ -171,10 +191,12 @@ pub(crate) fn pack_sync(
                     created_ns: row.created_ns as u64,
                     data_hash: sha256(&row.data),
                 })),
+                proof: Some(proof),
             }
         } else {
             RelayRow {
                 row: Some(Row::Full(row.to_proto())),
+                proof: Some(proof),
             }
         };
         sync.rows.push(relay_row);
@@ -256,6 +278,40 @@ pub(crate) fn carries_held(rows: &[RelayRow], have: i64) -> bool {
     rows.iter()
         .filter_map(row_id)
         .any(|id| i64::try_from(id).is_ok_and(|id| id <= have))
+}
+
+/// Joiner: check and store a `RelaySync` from `envelope_signer`. Returns
+/// (stored new rows, stopped at an unresolvable `Ref`, carried a row we
+/// held). The rows are checked by the same accept rule as direct sync
+/// (§B13): if any row fails, the whole payload is dropped and counted once,
+/// and the sequencer's retries bring the rows again.
+pub(crate) async fn apply_sync(
+    node: &MeshNode,
+    gid: &[u8],
+    sync: RelaySync,
+    envelope_signer: &[u8],
+    membership: &dyn GroupMembership,
+) -> Result<(bool, bool, bool), MeshError> {
+    let have = node.inner.store.lock().max_group_id(gid)?;
+    let carried_held = carries_held(&sync.rows, have);
+    let (rows, stalled) = resolve_rows(
+        sync.rows,
+        have,
+        |h| {
+            node.inner
+                .store
+                .lock()
+                .pending_by_hash(gid, h)
+                .ok()
+                .flatten()
+        },
+        gid,
+        envelope_signer,
+    );
+    // A gap is filled by the sequencer's retry.
+    let _gap = node.ingest_proven(gid, rows, membership).await?;
+    let stored = node.inner.store.lock().max_group_id(gid)? > have;
+    Ok((stored, stalled, carried_held))
 }
 
 /// What a delivered relay payload may do (§R4.6, §R6.4).
@@ -504,7 +560,7 @@ impl RelayEngine {
                 .into_iter()
                 .map(|(row, from_peer)| (row, from_peer || force_refs))
                 .collect();
-            let (sync, refs) = pack_sync(gid, rows, full_after, PAYLOAD_BUDGET);
+            let (sync, refs) = pack_sync(gid, rows, full_after, PAYLOAD_BUDGET, &local);
             if sync.rows.is_empty() {
                 tracing::warn!(after = acked, "relay: next row too large to relay");
                 self.clear(gid, generation);
@@ -672,24 +728,9 @@ impl RelayEngine {
                 sequenced?;
             }
             (Verdict::Sync, Some(relay_payload::Body::Sync(s))) => {
-                let have = node.inner.store.lock().max_group_id(&gid)?;
-                let carried_held = carries_held(&s.rows, have);
-                let (rows, stalled) = resolve_rows(
-                    s.rows,
-                    have,
-                    |h| {
-                        node.inner
-                            .store
-                            .lock()
-                            .pending_by_hash(&gid, h)
-                            .ok()
-                            .flatten()
-                    },
-                    &gid,
-                );
-                // A gap is filled by the sequencer's retry.
-                let _gap = node.ingest_sequenced(&gid, rows)?;
-                let stored = node.inner.store.lock().max_group_id(&gid)? > have;
+                let membership = self.membership().ok_or(MeshError::SyncNotStarted)?;
+                let (stored, stalled, carried_held) =
+                    apply_sync(&node, &gid, s, &signer, membership.as_ref()).await?;
                 let delay = self.answer_delay();
                 let mut st = self.state.lock();
                 st.stats.delivered += 1;
@@ -709,8 +750,11 @@ impl RelayEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::test_logs::{Members, node_with_a_revoked_and_a_live_installation};
     use crate::relay::inner::{RelayRow, RowRef, relay_row::Row};
     use crate::store::{NewGroupMessage, sha256};
+    use crate::sync::HelloSigner;
+    use crate::sync::seq::{KeySigner, SeqProof, SeqReject, attested_row, sign_row, signed_row};
 
     fn full(id: u64, data: &[u8]) -> RelayRow {
         RelayRow {
@@ -725,6 +769,7 @@ mod tests {
                     is_commit: false,
                 })),
             })),
+            proof: None,
         }
     }
 
@@ -735,6 +780,7 @@ mod tests {
                 created_ns: id,
                 data_hash: sha256(data),
             })),
+            proof: None,
         }
     }
 
@@ -748,13 +794,8 @@ mod tests {
         }
     }
 
-    fn ids(v: &[GroupMessage]) -> Vec<u64> {
-        v.iter()
-            .map(|m| match &m.version {
-                Some(group_message::Version::V1(v1)) => v1.id,
-                None => 0,
-            })
-            .collect()
+    fn ids(v: &[StoredGroupMessage]) -> Vec<i64> {
+        v.iter().map(|r| r.id).collect()
     }
 
     /// §R6.3: `Ref` rows are rebuilt from the joiner's own pending copies.
@@ -766,6 +807,7 @@ mod tests {
             2,
             |h| (h == sha256(b"mine")).then(|| pending(b"mine")),
             &[1],
+            b"envelope",
         );
         assert_eq!(ids(&out), vec![3, 4, 5]);
         assert!(!stalled);
@@ -779,7 +821,7 @@ mod tests {
             reference(4, b"lost"),
             full(5, b"b"),
         ];
-        let (out, stalled) = resolve_rows(rows, 2, |_| None, &[1]);
+        let (out, stalled) = resolve_rows(rows, 2, |_| None, &[1], b"envelope");
         assert_eq!(
             ids(&out),
             vec![3],
@@ -850,8 +892,8 @@ mod tests {
             sender_hmac: vec![],
             should_push: true,
             is_commit: false,
-            seq_signer: None,
-            seq_signature: None,
+            seq_signer: Some(vec![1; 32]),
+            seq_signature: Some(vec![2; 64]),
             seq_attested: false,
         }
     }
@@ -874,11 +916,11 @@ mod tests {
                 (stored(6, b"c"), false),
             ]
         };
-        let (sync, refs) = pack_sync(&[1], rows(), None, PAYLOAD_BUDGET);
+        let (sync, refs) = pack_sync(&[1], rows(), None, PAYLOAD_BUDGET, &[1; 32]);
         assert_eq!((refs_of(&sync), refs), (vec![true, true, false], 2));
-        let (sync, refs) = pack_sync(&[1], rows(), Some(4), PAYLOAD_BUDGET);
+        let (sync, refs) = pack_sync(&[1], rows(), Some(4), PAYLOAD_BUDGET, &[1; 32]);
         assert_eq!((refs_of(&sync), refs), (vec![true, false, false], 1));
-        let (sync, refs) = pack_sync(&[1], rows(), Some(0), PAYLOAD_BUDGET);
+        let (sync, refs) = pack_sync(&[1], rows(), Some(0), PAYLOAD_BUDGET, &[1; 32]);
         assert_eq!(
             (refs_of(&sync), refs),
             (vec![false, false, false], 0),
@@ -886,11 +928,261 @@ mod tests {
         );
     }
 
+    /// A row now also carries its proof (about 70 bytes).
     #[test]
     fn pack_sync_stops_at_the_budget() {
-        let rows = vec![(stored(1, &[0; 300]), false), (stored(2, &[0; 300]), false)];
-        let (sync, _) = pack_sync(&[1], rows, None, 400);
+        let rows = vec![(stored(1, &[0; 250]), false), (stored(2, &[0; 250]), false)];
+        let (sync, _) = pack_sync(&[1], rows, None, 400, &[1; 32]);
         assert_eq!(sync.rows.len(), 1);
+    }
+
+    /// §R4.6: every row carries its stored proof. A row this node signed
+    /// goes with an empty signer (the envelope's); a row another
+    /// installation signed names its signer. The attestation flag travels.
+    #[test]
+    fn pack_sync_names_only_a_signer_other_than_the_sender() {
+        let mut attested = stored(1, b"a");
+        attested.seq_attested = true;
+        let mut other = stored(2, b"b");
+        other.seq_signer = Some(vec![7; 32]);
+        let (sync, _) = pack_sync(
+            &[1],
+            vec![(attested, true), (other, false)],
+            None,
+            PAYLOAD_BUDGET,
+            &[1; 32],
+        );
+        let proofs: Vec<SeqProof> = sync.rows.iter().map(|r| r.proof.clone().unwrap()).collect();
+        let signers: Vec<Vec<u8>> = proofs.iter().map(|p| p.signer.clone()).collect();
+        assert_eq!(signers, vec![vec![], vec![7; 32]]);
+        assert!(proofs.iter().all(|p| p.signature == vec![2; 64]));
+        assert_eq!(
+            proofs.iter().map(|p| p.attested).collect::<Vec<_>>(),
+            vec![true, false]
+        );
+    }
+
+    #[test]
+    fn resolve_rows_fills_an_empty_signer_from_the_envelope() {
+        let rows = vec![
+            RelayRow {
+                proof: Some(SeqProof {
+                    signer: vec![],
+                    signature: vec![3; 64],
+                    attested: true,
+                }),
+                ..full(3, b"a")
+            },
+            RelayRow {
+                proof: Some(SeqProof {
+                    signer: b"other".to_vec(),
+                    signature: vec![4; 64],
+                    attested: false,
+                }),
+                ..reference(4, b"mine")
+            },
+            full(5, b"bare"),
+        ];
+        let (out, stalled) = resolve_rows(rows, 2, |_| Some(pending(b"mine")), &[1], b"envelope");
+        assert!(!stalled);
+        assert_eq!(ids(&out), vec![3, 4, 5]);
+        assert_eq!(out[0].seq_signer.as_deref(), Some(b"envelope".as_slice()));
+        assert!(out[0].seq_attested);
+        assert_eq!(out[1].seq_signer.as_deref(), Some(b"other".as_slice()));
+        assert_eq!(out[1].seq_signature, Some(vec![4; 64]));
+        assert!(!out[1].seq_attested);
+        assert_eq!(out[1].data, b"mine");
+        assert_eq!(
+            (&out[2].seq_signer, &out[2].seq_signature),
+            (&None, &None),
+            "no proof stays unproven: the accept rule refuses it"
+        );
+    }
+
+    /// §R6.3: one `Ref` row with its proof, signed and sealed, fits the
+    /// smallest bucket. (A `Full` row for a 400-byte message needs the
+    /// 1024 B bucket, with or without its proof.)
+    #[test]
+    fn a_ref_sync_with_its_proof_fits_the_512_byte_bucket() {
+        let signer = KeySigner::new();
+        let gid = vec![7u8; 32];
+        let (id, created_ns, data) = (1_000_000i64, 1_800_000_000_000_000_000i64, vec![0u8; 400]);
+        let proof = sign_row(&signer, &gid, id as u64, created_ns as u64, &data).unwrap();
+        let row = StoredGroupMessage {
+            group_id: gid.clone(),
+            id,
+            created_ns,
+            data,
+            sender_hmac: vec![0; 32],
+            should_push: true,
+            is_commit: false,
+            seq_signer: Some(proof.signer),
+            seq_signature: Some(proof.signature),
+            seq_attested: proof.attested,
+        };
+        let (sync, refs) = pack_sync(
+            &gid,
+            vec![(row, true)],
+            None,
+            PAYLOAD_BUDGET,
+            &signer.installation_key(),
+        );
+        assert_eq!(refs, 1);
+        let payload = RelayPayload {
+            body: Some(relay_payload::Body::Sync(sync)),
+        };
+        let body = inner::sign(&signer, &payload).unwrap();
+        let sealed = envelope::seal(&[3; 32], 600, &body).unwrap();
+        assert_eq!(sealed.len(), envelope::BUCKETS[0]);
+    }
+
+    /// §R4.6 + §B13: relayed rows are stored only with a proof that passes
+    /// the accept rule, and are stored with that proof (an empty signer is
+    /// the envelope's; an explicit one is kept; the attestation flag too;
+    /// a `Ref` settles our pending copy). A row by the revoked former
+    /// sequencer at a new id, a tampered row or a row without a proof
+    /// drops the whole payload, counted once.
+    #[tokio::test]
+    async fn relayed_rows_are_checked_before_they_are_stored() {
+        let (node, inbox, k1, k2) = node_with_a_revoked_and_a_live_installation().await;
+        let (former, seq) = (KeySigner(k1), KeySigner(k2));
+        let gid = b"dm".to_vec();
+        node.inner
+            .store
+            .lock()
+            .pin_sequencer(&gid, &seq.installation_key())
+            .unwrap();
+        let members = Members(Some(vec![inbox]));
+        let full_row = |r: &StoredGroupMessage, explicit: bool| RelayRow {
+            row: Some(Row::Full(r.to_proto())),
+            proof: Some(SeqProof {
+                signer: if explicit {
+                    r.seq_signer.clone().unwrap()
+                } else {
+                    vec![]
+                },
+                signature: r.seq_signature.clone().unwrap(),
+                attested: r.seq_attested,
+            }),
+        };
+        let sync = |rows| RelaySync {
+            group_id: gid.clone(),
+            rows,
+        };
+
+        // History the successor attested at its handover, then its own row
+        // naming itself explicitly.
+        let r1 = attested_row(&seq, &gid, 1, b"attested at the handover");
+        let r2 = signed_row(&seq, &gid, 2, b"from the sequencer");
+        let (stored_any, stalled, _) = apply_sync(
+            &node,
+            &gid,
+            sync(vec![full_row(&r1, false), full_row(&r2, true)]),
+            &seq.installation_key(),
+            &members,
+        )
+        .await
+        .unwrap();
+        assert!(stored_any && !stalled);
+        assert_eq!(node.sequenced_rows_for_test(&gid).unwrap(), vec![r1, r2]);
+
+        let mine = NewGroupMessage {
+            group_id: gid.clone(),
+            data: b"mine".to_vec(),
+            sender_hmac: vec![],
+            should_push: true,
+            is_commit: false,
+        };
+        node.inner.store.lock().add_pending(&mine, 1).unwrap();
+        let r3 = signed_row(&seq, &gid, 3, b"mine");
+        let reference_row = RelayRow {
+            row: Some(Row::Reference(RowRef {
+                id: 3,
+                created_ns: r3.created_ns as u64,
+                data_hash: sha256(b"mine"),
+            })),
+            proof: Some(SeqProof {
+                signer: vec![],
+                signature: r3.seq_signature.clone().unwrap(),
+                attested: false,
+            }),
+        };
+        apply_sync(
+            &node,
+            &gid,
+            sync(vec![reference_row]),
+            &seq.installation_key(),
+            &members,
+        )
+        .await
+        .unwrap();
+        assert_eq!(node.max_group_id_for_test(&gid).unwrap(), 3);
+        assert!(
+            node.pending_inputs_for_test(&gid).unwrap().is_empty(),
+            "the Ref settled our pending copy"
+        );
+
+        // A valid row followed by one the revoked former sequencer signed
+        // at a new id: neither is stored.
+        let r4 = signed_row(&seq, &gid, 4, b"four");
+        let forged = signed_row(&former, &gid, 5, b"from a revoked key");
+        let err = apply_sync(
+            &node,
+            &gid,
+            sync(vec![full_row(&r4, false), full_row(&forged, true)]),
+            &seq.installation_key(),
+            &members,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, MeshError::SequencingRejected(SeqReject::WrongSigner)),
+            "{err}"
+        );
+
+        let mut tampered = r4.clone();
+        tampered.data = b"FOUR".to_vec();
+        let err = apply_sync(
+            &node,
+            &gid,
+            sync(vec![full_row(&tampered, false)]),
+            &seq.installation_key(),
+            &members,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, MeshError::SequencingRejected(SeqReject::BadSignature)),
+            "{err}"
+        );
+        let bare = RelayRow {
+            row: Some(Row::Full(r4.to_proto())),
+            proof: None,
+        };
+        let err = apply_sync(
+            &node,
+            &gid,
+            sync(vec![bare]),
+            &seq.installation_key(),
+            &members,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, MeshError::SequencingRejected(SeqReject::MissingProof)),
+            "{err}"
+        );
+        assert_eq!(node.max_group_id_for_test(&gid).unwrap(), 3);
+        let stats = node.mesh_stats();
+        assert_eq!(
+            (
+                stats.seq_rows_verified,
+                stats.seq_rejected_wrong_signer,
+                stats.seq_rejected_bad_signature,
+                stats.seq_rejected_missing_proof
+            ),
+            (3, 1, 1, 1)
+        );
     }
 
     fn input(len: usize) -> GroupMessageInput {

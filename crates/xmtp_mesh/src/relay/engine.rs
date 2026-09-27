@@ -219,6 +219,10 @@ impl RelayEngine {
         self.parts().map(|p| p.0)
     }
 
+    pub(crate) fn membership(&self) -> Option<Arc<dyn GroupMembership>> {
+        self.parts().map(|p| p.2)
+    }
+
     /// Whether this engine is still the node's engine: a replaced or
     /// disabled engine's pending work (delayed pushes, offers) sends nothing.
     fn is_current(&self) -> bool {
