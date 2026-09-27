@@ -7,9 +7,11 @@
 //!
 //! Payloads, all of exact length (anything else fails the handshake):
 //! - IK message 1: 31 encrypted bytes, `u64_be(advert window) ‖ 16 random
-//!   bytes ‖ 7 zero bytes`. The responder accepts windows `w - 1 ..= w + 1`
-//!   and each message 1 only once ([`ReplayCache`]); a stale or replayed
-//!   one is answered exactly like a stranger's, by NN on a fresh state.
+//!   bytes ‖ 7 zero bytes`. The responder accepts it only from a dialer
+//!   its node allows (a live contact, or any dialer while the node has no
+//!   contacts), dated `w - 1 ..= w + 1`, and only once ([`ReplayCache`]).
+//!   Any other message 1 of kind 0 is answered exactly like a stranger's,
+//!   by NN on a fresh state.
 //! - NN message 1: 95 random bytes, in the clear. NN message 2: empty.
 //! - XX (commit-then-reveal): message 1 carries, in the clear,
 //!   `SHA-256("xmtp-mesh-pair-commit-v1" ‖ Na)` and 63 random bytes;
@@ -98,26 +100,30 @@ impl ReplayCache {
         }
     }
 
-    /// True if `digest` (of a message 1 dated `window`) is new; it is then
-    /// remembered. Entries dated before `now_window - 1` are forgotten (they
-    /// fail the window check anyway), and the oldest go past
-    /// [`REPLAY_CACHE_MAX`].
+    /// True if `digest` was not seen. Every kind-0 message 1 comes through
+    /// here once, accepted or not, so the work does not depend on the
+    /// outcome; only a message accepted as a contact's (`remember` = the
+    /// window it is dated) is remembered, so strangers cannot flush the
+    /// cache. Entries dated before `now_window - 1` are forgotten (they fail
+    /// the window check anyway), and the oldest go past
+    /// [`REPLAY_CACHE_MAX`]. One lock: two responders cannot both accept
+    /// the same message.
     pub(crate) fn check_and_remember(
         &self,
         digest: [u8; 32],
-        window: u64,
         now_window: u64,
+        remember: Option<u64>,
     ) -> bool {
         let mut seen = self.seen.lock();
         seen.retain(|&(_, w)| w.saturating_add(1) >= now_window);
-        if seen.iter().any(|(d, _)| *d == digest) {
-            return false;
+        let fresh = !seen.iter().any(|(d, _)| *d == digest);
+        if let (true, Some(window)) = (fresh, remember) {
+            if seen.len() >= REPLAY_CACHE_MAX {
+                seen.pop_front();
+            }
+            seen.push_back((digest, window));
         }
-        if seen.len() >= REPLAY_CACHE_MAX {
-            seen.pop_front();
-        }
-        seen.push_back((digest, window));
-        true
+        fresh
     }
 
     #[cfg(test)]
@@ -132,6 +138,18 @@ impl Default for ReplayCache {
     }
 }
 
+/// What a responder asks its node when message 1 arrives (§B14.2).
+pub(crate) trait ResponderContext: Send + Sync {
+    /// The current advert window, read when message 1 arrives.
+    fn window(&self) -> u64;
+    /// May this IK dialer have a contact link? The node answers yes for a
+    /// live (not removed) contact, or for anyone while it has no contacts
+    /// at all (a restored phone). Anyone else is answered as a stranger.
+    fn is_allowed_dialer(&self, dialer_static: &[u8; 32]) -> bool;
+    /// The node's one replay cache.
+    fn replay_cache(&self) -> &ReplayCache;
+}
+
 enum Phase {
     DialerAwait2 {
         hs: HandshakeState,
@@ -143,8 +161,7 @@ enum Phase {
         local_secret: Zeroizing<[u8; 32]>,
         pairing_mode: bool,
         relay_on: bool,
-        window: u64,
-        replay: Arc<ReplayCache>,
+        context: Arc<dyn ResponderContext>,
     },
     ResponderAwait3 {
         hs: HandshakeState,
@@ -284,30 +301,45 @@ fn ik_payload(window: u64) -> [u8; IK_PAYLOAD] {
     payload
 }
 
-/// The IK attempt on message 1: `Some` only for a fresh, well-formed IK
-/// message 1 to our static. Any failure drops the state it built.
+/// The IK attempt on message 1: `Some` only for a well-formed IK message
+/// 1 to our static, from a dialer the node allows, dated `w - 1 ..= w + 1`
+/// and not seen before. Any failure drops the state it built, and leaves
+/// no trace a stranger's message would not: the digest is checked against
+/// the replay cache for every kind-0 message 1 and remembered only when
+/// accepted.
 fn try_ik(
     local_secret: &[u8; 32],
     message: &[u8],
-    window: u64,
-    replay: &ReplayCache,
+    context: &dyn ResponderContext,
 ) -> Result<Option<HandshakeState>, MeshError> {
+    let now = context.window();
+    let digest: [u8; 32] = Sha256::digest(message).into();
     let mut ik = build(IK, Some(local_secret), None, false)?;
-    let Ok(payload) = read(&mut ik, &message[1..], "IK message 1") else {
-        return Ok(None);
+    let accepted = match read(&mut ik, &message[1..], "IK message 1") {
+        Ok(payload) => ik_window(&payload, now).filter(|_| {
+            ik.get_remote_static()
+                .and_then(|key| <[u8; 32]>::try_from(key).ok())
+                .is_some_and(|key| context.is_allowed_dialer(&key))
+        }),
+        Err(_) => None,
     };
+    let fresh = context
+        .replay_cache()
+        .check_and_remember(digest, now, accepted);
+    Ok(match accepted {
+        Some(_) if fresh => Some(ik),
+        _ => None,
+    })
+}
+
+/// The window an IK message 1 payload is dated, if well-formed and within
+/// one window of `now`.
+fn ik_window(payload: &[u8], now: u64) -> Option<u64> {
     if payload.len() != IK_PAYLOAD || payload[IK_WINDOW + IK_NONCE..].iter().any(|&b| b != 0) {
-        return Ok(None);
+        return None;
     }
     let sent = u64::from_be_bytes(payload[..IK_WINDOW].try_into().expect("8 bytes"));
-    if sent.saturating_add(1) < window || sent > window.saturating_add(1) {
-        return Ok(None);
-    }
-    let digest: [u8; 32] = Sha256::digest(message).into();
-    if !replay.check_and_remember(digest, sent, window) {
-        return Ok(None);
-    }
-    Ok(Some(ik))
+    (sent.saturating_add(1) >= now && sent <= now.saturating_add(1)).then_some(sent)
 }
 
 impl Handshake {
@@ -361,22 +393,21 @@ impl Handshake {
         ))
     }
 
-    /// Wait for a dialer's message 1, in advert window `window`. `replay`
-    /// is the node's one [`ReplayCache`].
+    /// Wait for a dialer's message 1. `context` answers for the node when
+    /// it arrives: the window, which IK dialers are allowed, the replay
+    /// cache.
     pub(crate) fn accept(
         local_secret: &[u8; 32],
         pairing_mode: bool,
         relay_on: bool,
-        window: u64,
-        replay: Arc<ReplayCache>,
+        context: Arc<dyn ResponderContext>,
     ) -> Self {
         Self {
             phase: Phase::ResponderAwait1 {
                 local_secret: Zeroizing::new(*local_secret),
                 pairing_mode,
                 relay_on,
-                window,
-                replay,
+                context,
             },
         }
     }
@@ -412,16 +443,14 @@ impl Handshake {
                 local_secret,
                 pairing_mode,
                 relay_on,
-                window,
-                replay,
+                context,
             } => {
                 if message.len() != FIRST_MESSAGE_LEN {
                     return Err(refuse("handshake message 1 has the wrong length"));
                 }
                 match message[0] {
                     KIND_CONTACT_OR_RELAY => {
-                        let (mut hs, kind) = match try_ik(&local_secret, message, window, &replay)?
-                        {
+                        let (mut hs, kind) = match try_ik(&local_secret, message, &*context)? {
                             Some(ik) => (ik, LinkKind::Contact),
                             None => {
                                 if !relay_on {
@@ -527,6 +556,8 @@ pub(crate) fn test_pair() -> (TransportState, TransportState) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use crate::link::keys::noise_public_key;
 
     /// The responder's advert window.
@@ -541,14 +572,38 @@ mod tests {
         Handshake::dial(target, secret, W).unwrap()
     }
 
+    /// A node's answers: its window, its live contacts' statics (none:
+    /// allow any dialer, as a node with no contacts does), its cache.
+    struct TestContext {
+        window: AtomicU64,
+        contacts: Vec<[u8; 32]>,
+        cache: ReplayCache,
+    }
+
+    impl TestContext {
+        fn new(contacts: Vec<[u8; 32]>) -> Arc<Self> {
+            Arc::new(Self {
+                window: AtomicU64::new(W),
+                contacts,
+                cache: ReplayCache::new(),
+            })
+        }
+    }
+
+    impl ResponderContext for TestContext {
+        fn window(&self) -> u64 {
+            self.window.load(Ordering::SeqCst)
+        }
+        fn is_allowed_dialer(&self, dialer_static: &[u8; 32]) -> bool {
+            self.contacts.is_empty() || self.contacts.contains(dialer_static)
+        }
+        fn replay_cache(&self) -> &ReplayCache {
+            &self.cache
+        }
+    }
+
     fn accept(secret: &[u8; 32], pairing_mode: bool, relay_on: bool) -> Handshake {
-        Handshake::accept(
-            secret,
-            pairing_mode,
-            relay_on,
-            W,
-            Arc::new(ReplayCache::new()),
-        )
+        Handshake::accept(secret, pairing_mode, relay_on, TestContext::new(Vec::new()))
     }
 
     /// Runs a handshake to the end: (dialer's open link, responder's).
@@ -684,14 +739,14 @@ mod tests {
     fn a_replayed_contact_message_1_is_answered_as_a_stranger() {
         let (a, a_pub) = keypair(1);
         let (b, b_pub) = keypair(2);
-        let cache = Arc::new(ReplayCache::new());
+        let node = TestContext::new(Vec::new());
         let (_, msg1) = dial(
             &DialTarget::Contact {
                 remote_static: b_pub,
             },
             &a,
         );
-        let first = Handshake::accept(&b, false, true, W, cache.clone())
+        let first = Handshake::accept(&b, false, true, node.clone())
             .read(&msg1)
             .unwrap();
         let open = first.open.unwrap();
@@ -700,7 +755,7 @@ mod tests {
             (LinkKind::Contact, Some(a_pub))
         );
 
-        let replay = Handshake::accept(&b, false, true, W, cache.clone())
+        let replay = Handshake::accept(&b, false, true, node.clone())
             .read(&msg1)
             .unwrap();
         let open = replay.open.unwrap();
@@ -718,7 +773,7 @@ mod tests {
         );
 
         assert!(matches!(
-            Handshake::accept(&b, false, false, W, cache).read(&msg1),
+            Handshake::accept(&b, false, false, node).read(&msg1),
             Err(MeshError::LinkAuthFailed(_))
         ));
     }
@@ -755,18 +810,25 @@ mod tests {
             d
         };
         for i in 0..=REPLAY_CACHE_MAX {
-            assert!(cache.check_and_remember(digest(i), W, W));
+            assert!(cache.check_and_remember(digest(i), W, Some(W)));
         }
         assert_eq!(cache.len(), REPLAY_CACHE_MAX);
         assert!(
-            !cache.check_and_remember(digest(REPLAY_CACHE_MAX), W, W),
+            !cache.check_and_remember(digest(REPLAY_CACHE_MAX), W, Some(W)),
             "newest kept"
         );
-        assert!(cache.check_and_remember(digest(0), W, W), "oldest dropped");
+        assert!(
+            cache.check_and_remember(digest(0), W, None),
+            "oldest dropped"
+        );
+        assert!(
+            cache.check_and_remember(digest(0), W, None),
+            "not remembered unless accepted"
+        );
 
         let cache = ReplayCache::new();
-        assert!(cache.check_and_remember(digest(1), W - 1, W));
-        assert!(cache.check_and_remember(digest(2), W + 1, W + 1));
+        assert!(cache.check_and_remember(digest(1), W, Some(W - 1)));
+        assert!(cache.check_and_remember(digest(2), W + 1, Some(W + 1)));
         assert_eq!(
             cache.len(),
             1,
@@ -953,5 +1015,87 @@ mod tests {
     fn the_short_code_is_six_digits_of_the_code_hash() {
         assert_eq!(short_code(&[0xab; 32], &[1; 32], &[2; 32]), "617800");
         assert_eq!(short_code(&[0; 32], &[0; 32], &[0; 32]), "487015");
+    }
+
+    /// §B14.2: only a dialer the node allows gets a contact link; anyone
+    /// else holding our static key is answered like a stranger, and leaves
+    /// nothing in the replay cache.
+    #[test]
+    fn only_allowed_dialers_get_a_contact_link() {
+        let (a, a_pub) = keypair(1);
+        let (b, b_pub) = keypair(2);
+        let (_, c_pub) = keypair(3);
+        let target = DialTarget::Contact {
+            remote_static: b_pub,
+        };
+
+        let allowed = TestContext::new(vec![a_pub]);
+        let (_, msg1) = dial(&target, &a);
+        let open = Handshake::accept(&b, false, true, allowed)
+            .read(&msg1)
+            .unwrap()
+            .open
+            .unwrap();
+        assert_eq!(
+            (open.kind, open.remote_static),
+            (LinkKind::Contact, Some(a_pub))
+        );
+
+        let refused = TestContext::new(vec![c_pub]);
+        let (mut dialer, msg1) = dial(&target, &a);
+        let step = Handshake::accept(&b, false, true, refused.clone())
+            .read(&msg1)
+            .unwrap();
+        let open = step.open.unwrap();
+        assert_eq!((open.kind, open.remote_static), (LinkKind::Relay, None));
+        let (_, relay_msg1) = dial(&DialTarget::Relay, &a);
+        let stranger_reply = accept(&b, false, true)
+            .read(&relay_msg1)
+            .unwrap()
+            .reply
+            .unwrap();
+        let reply = step.reply.unwrap();
+        assert_eq!(reply.len(), stranger_reply.len(), "same reply shape");
+        assert!(matches!(
+            dialer.read(&reply),
+            Err(MeshError::LinkAuthFailed(_))
+        ));
+        assert_eq!(refused.cache.len(), 0, "a refused dialer leaves no trace");
+        assert!(matches!(
+            Handshake::accept(&b, false, false, refused).read(&msg1),
+            Err(MeshError::LinkAuthFailed(_))
+        ));
+
+        let no_contacts = TestContext::new(Vec::new());
+        let (_, msg1) = dial(&target, &a);
+        let open = Handshake::accept(&b, false, false, no_contacts)
+            .read(&msg1)
+            .unwrap()
+            .open
+            .unwrap();
+        assert_eq!(
+            open.kind,
+            LinkKind::Contact,
+            "a node with no contacts allows any dialer"
+        );
+    }
+
+    /// The window is read when message 1 arrives, not when the responder
+    /// was set up.
+    #[test]
+    fn the_window_is_read_when_message_1_arrives() {
+        let (a, _) = keypair(1);
+        let (b, b_pub) = keypair(2);
+        let node = TestContext::new(Vec::new());
+        let mut responder = Handshake::accept(&b, false, true, node.clone());
+        node.window.store(W + 2, Ordering::SeqCst);
+        let (_, msg1) = dial(
+            &DialTarget::Contact {
+                remote_static: b_pub,
+            },
+            &a,
+        );
+        let open = responder.read(&msg1).unwrap().open.unwrap();
+        assert_eq!(open.kind, LinkKind::Relay, "dated W, read at W + 2");
     }
 }

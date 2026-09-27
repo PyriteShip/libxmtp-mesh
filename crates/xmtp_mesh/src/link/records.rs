@@ -89,7 +89,16 @@ impl Records {
     }
 }
 
+/// A half-reassembled frame is plaintext: wipe it with the link.
+impl Drop for State {
+    fn drop(&mut self) {
+        self.partial.zeroize();
+    }
+}
+
 impl State {
+    /// Every error ends up here (see [`Records::open`] and
+    /// [`Records::seal`]): the partial frame is wiped at once.
     fn fail(&mut self) {
         self.failed = true;
         self.partial.zeroize();
