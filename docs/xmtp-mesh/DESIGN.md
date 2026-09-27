@@ -5,11 +5,12 @@ no internet and no XMTP nodes. Messages are real XMTP MLS messages; only the
 transport changes. libxmtp's network API client is replaced by an in-process
 node that syncs peer to peer over BLE.
 
-Status: **experimental, not audited, not protest-safe** (see §R9 and §B12).
+Status: **experimental, not audited.** Do not describe it as protest-safe:
+see §R9 and §B14.7 for what a nearby listener can still learn.
 
 This document has three parts:
 
-- **Part B — Base mesh** (§B1–§B13): the direct, one-hop mesh. Two phones in
+- **Part B — Base mesh** (§B1–§B14): the direct, one-hop mesh. Two phones in
   BLE range sync DMs.
 - **Part C — Restore convergence** (§C1–§C7): what happens when an inbox's
   identity log forks after a restore, and how every node converges on one log.
@@ -35,7 +36,7 @@ or just "§R4.5" inside the `xmtp_mesh` crate).
 ## B1 Purpose and scope
 
 1:1 messaging that works with **no internet and no XMTP nodes**: festivals,
-disasters, protests (not yet safe for protest use; see §R9), places where the
+disasters, protests (not to be described as protest-safe; see §R9), places where the
 internet is blocked. The first app built
 on it is PyriteChat, a React Native app; this document refers to it as "the
 app".
@@ -62,20 +63,25 @@ Goals of the base mesh:
 | D6 | BLE, cross-platform capable | Wi-Fi Direct / Wi-Fi Aware fast path |
 | D7 | One installation (device) per inbox | Multi-device (needs an ordered, multi-writer identity log) |
 | D8 | Android first; nothing may block iOS later | iOS BLE radio |
-| D9 | Simple discovery: fixed service UUID, inbox ids in a cleartext `Hello` | Rotating HMAC tokens + Noise handshake (planned), then per-contact keys |
+| D9 (replaced by D31–D36, §B14) | Simple discovery: fixed service UUID, inbox ids in a cleartext `Hello` | Rotating HMAC tokens + Noise handshake (now §B14), then per-contact keys |
 | D10 | All protocol logic lives in Rust (`xmtp_mesh`); platform radios only move bytes | Protocol logic per platform |
 | D20 | One mesh node per inbox on a device, following the libxmtp database (§B10.1) | One node per app install |
 | D21 | When a node rotates for a new installation of a known inbox, carry the inbox's identity log into the new node (§B10.2) | Let peers accept a second `CreateInbox` (that is Part C, for the case with no old node) |
-| D22 | The BLE short id is per node (inbox + generation), not per install; the old install-wide id is deleted, never migrated (§B10.3) | One short id per install (links every identity the install ever used) |
+| D22 (replaced by D32, §B14.2) | The BLE short id is per node (inbox + generation), not per install; the old install-wide id is deleted, never migrated (§B10.3) | One short id per install (links every identity the install ever used) |
 | D23 | A link with no inbound packet for 24 s is closed; idle links are pinged every 8 s (§B7.3) | Trust the platform's "connected" state |
 | D30 | Every sequenced row carries a signature by the installation that ordered it, over a record shaped like XMTP d14n's originator envelope; every node checks it before storing a row, and mesh.10 syncs only with mesh.10 (§B13) | A signature per frame (lost once rows are stored); a hash chain (broken by §C4.7 id reuse); a mixed-version transition period |
+| D31 | Strangers learn nothing linkable: a relay link is Noise NN with fresh keys, carries only relay frames, is short-lived, and gets per-link and per-window relay budgets (§B14.3, §B14.5, §R5.4) | A relay identity key (trackable); XX with the installation key (names the phone) |
+| D32 | One discovery key per phone, shared with every contact; advert token = first 8 bytes of HMAC-SHA256(discovery key, 15-minute window); advert and address rotate together; the lower token dials (§B14.2) | Per-contact keys (the advert has room for one token); a fixed short id (D22) |
+| D33 | Contact links use Noise IK, accepted only from a live contact (or by a phone with no contacts at all); pairing uses Noise XX with a commit-then-reveal 6-digit code (§B14.3, §B14.4) | Noise KK (a restored phone that lost its contacts could not answer); XX everywhere (sends statics to anyone) |
+| D34 | The Noise static key and the discovery key are derived from the account key the recovery phrase restores (§B14.1) | Random keys (a restored phone could not be recognised or dialed) |
+| D35 | Contact and relay links look alike on the air: every first message is 128 bytes, stale or replayed IK is answered like a stranger, and the responder tries IK, then NN (§B14.2, §B14.3) | Distinct first messages (a sniffer learns who are contacts) |
+| D36 | Hard cut: mesh.11 talks only to mesh.11 (advert version 2, Noise prologue `xmtp-mesh-link-v1`, `Hello.link = 1`, Auth text v2) | A transition period |
 
-### Known privacy limitation of D9
+### Private discovery (D31–D36)
 
-Under D9 anyone running the software nearby learns your inbox id and can track
-your presence. Message content stays end-to-end encrypted. The mesh must not be
-presented as safe for protest use until rotating-token discovery and the Noise
-handshake ship (§B11).
+D9's cleartext `Hello` and fixed short id are replaced by rotating advert
+tokens and Noise links (§B14). What a nearby listener can still learn is in
+§B14.7 and §R9; the mesh must still not be described as protest-safe.
 
 ## B3 Facts about libxmtp the design rests on
 
@@ -124,8 +130,9 @@ handshake ship (§B11).
    own V3 client (cursor store, extractors, paging, streams) runs unchanged on
    top. The bindings gain `connect_to_mesh(...)` beside `connect_to_backend`.
 3. **`MeshTransport` (uniffi callback interface).** A platform-neutral byte
-   pipe: `send(peer_id, bytes)` is implemented natively; `on_peer_connected`,
-   `on_peer_lost` and `on_bytes(peer_id, bytes)` call into Rust. Message bytes
+   pipe: `send(peer_id, bytes)` is implemented natively; `on_peer_connected`
+   (with how the link opened, §B14.3), `on_peer_lost` and
+   `on_bytes(peer_id, bytes)` call into Rust. Message bytes
    never cross the JS bridge.
 4. **Android BLE radio (Kotlin).** Dual role (advertise + scan, GATT server +
    client), MTU negotiation, chunking, a foreground service. Moves bytes only.
@@ -149,9 +156,13 @@ own envelope instead (§R1). `decode` rejects any other `version` and any frame
 over 1 MiB. List-bearing frames are paged at 64 messages or 128 KiB (a single
 larger message goes alone).
 
+On the air, frames travel only inside an open Noise link, sealed as records
+(§B14.3). The first frame of a link is sent after its handshake, by the
+dialer.
+
 | Tag | Body | Purpose |
 |---|---|---|
-| 10 | `Hello{installation_key, inbox_id, challenge, relay, seq}` | Start of the handshake (§B5.3). `relay` is the relay version the sender speaks (§R7); `seq` the signed-sequencing version (1; a peer below it is refused, §B13). |
+| 10 | `Hello{installation_key, inbox_id, challenge, relay, seq, link}` | Start of the handshake inside a contact or pairing link (§B5.3). `relay`: relay version (§R7); `seq`: signed-sequencing version (§B13); `link`: link version (1; a peer below it is refused, §B14.4). |
 | 11 | `Auth{signature, challenge}` | Answers the peer's challenge. |
 | 12 | `IdentityLog{inbox_id, updates}` | An inbox's identity log. |
 | 13 | `KeyPackage{installation_key, key_package}` | The sender's own key package. |
@@ -161,7 +172,9 @@ larger message goes alone).
 | 17 | `Sequenced{group_id, messages, sender_is_sequencer, proofs}` | Sequenced group messages, each with its sequencing proof (`proofs[i]` for `messages[i]`, §B13). |
 | 18 | `Pending{group_id, messages}` | Unsequenced messages for the sequencer. |
 | 19 | `IdentityConflict(IdentityLog)` | "My log of this inbox beats yours" (§C4.2). |
-| 20–24 | `Relay`, `SpoolDigest`, `SpoolWant`, `RelayKeyOffer`, `RelayKeyAck` | Multi-hop relay (§R4.1). |
+| 20–24 | `Relay`, `SpoolDigest`, `SpoolWant`, `RelayKeyOffer`, `RelayKeyAck` | Multi-hop relay (§R4.1). Only 20–22 may travel on a relay link (§B14.3). |
+| 25 | `ContactCard{inbox_id, noise_static_pub, discovery_key, generation}` | A contact's discovery card (§B14.4). Contact and pairing links only. |
+| 26 | `PairConfirm{}` | "My person confirmed the pairing code" (§B14.4). The only frame a pairing link carries until both people confirmed. |
 
 An existing tag is never renumbered. An older node decodes an unknown body as
 an empty frame, a non-fatal error that the session logs and ignores.
@@ -204,9 +217,12 @@ an empty frame, a non-fatal error that the session logs and ignores.
 
 ### B5.3 Sync session
 
-A session starts when the radio reports a link (`on_peer_connected`) and ends
-when the link is lost. Each link gets a fresh, connection-scoped `PeerId`; the
-short id is never an identity.
+A session starts when the radio reports a link (`on_peer_connected(peer,
+role)`) and ends when the link is lost. Each link gets a fresh,
+connection-scoped `PeerId`. The session first runs the link's Noise handshake
+(§B14.3). A relay link then carries relay frames only; a contact link runs
+the steps below inside the encrypted link, and a pairing link runs them once
+both people confirmed the code (§B14.4).
 
 1. **Handshake.** Each side sends `Hello{its installation key, a fresh
    challenge}` and answers the other's Hello with `Auth`: a signature, with its
@@ -215,7 +231,11 @@ short id is never an identity.
    A Hello received before we are authenticated makes us re-send ours (a
    bounded number of times), so a lost first Hello does not stall the link. An
    unauthenticated session is closed after the handshake timeout. A Hello
-   whose `seq` is below 1 ends the session (§B13).
+   whose `seq` or `link` is below 1 ends the session (§B13, §B14.4). The
+   signed text also binds the link's Noise handshake hash
+   (`xmtp-mesh-hello-v2`), so an Auth cannot be moved to another link, and
+   on a contact link the Hello must name the inbox the peer's Noise static
+   key belongs to (§B14.4).
 2. **Identity.** Each side sends its own inbox's `IdentityLog` and its
    `KeyPackage`. The peer is **verified** once its authenticated installation
    is in its claimed inbox's log (§C4.2 covers logs that differ). A peer that
@@ -232,8 +252,8 @@ short id is never an identity.
    it is stored (§B13).
 6. **Live.** While connected, new rows stream immediately on the same path.
 
-"Authenticated" means exactly: *a live holder of installation key K answered
-through this pipe*. It does not bind the pipe to K; see §B12.
+"Authenticated" means: *a live holder of installation key K answered through
+this Noise link*, and the link's handshake hash is in the signed text (§B12).
 
 ### B5.4 Node endpoint mapping (v3 gRPC paths)
 
@@ -277,20 +297,19 @@ directly to a "waiting for peer" state in the UI.
 ### B6.2 Pairing (in person)
 
 Pairing is an app concern; the mesh provides what it needs. Both phones
-advertise a pairing flag (§B6.3), the users confirm a short code derived from
-both installation keys (MITM protection), and the first direct session
-exchanges identity logs and key packages (§B5.3). Creating the DM then uses
+advertise a pairing flag (§B6.3), the phones run a Noise XX link and both
+show a 6-digit code (commit-then-reveal, from its handshake); the users
+compare it and confirm, and only then do the phones exchange identity logs,
+key packages and contact cards (§B5.3, §B14.4). Creating the DM then uses
 the cached key package; its welcome and commit are sequenced at once because
 both phones are present.
 
-### B6.3 Discovery (D9)
+### B6.3 Discovery (D32, §B14.2)
 
 The radio advertises the xmtp-mesh service UUID with service data
-`version (1) ‖ flags ‖ short id (8 bytes)`; flag `0x01` is pairing mode. The
-`Hello` carries the inbox id in the clear. Advertisement and Hello are both
-versioned so that rotating tokens (`trunc8(HMAC(discovery_key, 15-minute
-window))`, exchanged after connecting) and a Noise handshake can replace them
-without a protocol break.
+`version (= 2) ‖ flags ‖ token (8 bytes)`: flag `0x01` pairing mode, `0x02`
+relay offered. The token rotates every 15 minutes together with the
+advertising address. Only contacts can match it to a phone (§B14.2).
 
 ## B7 Radio (Android)
 
@@ -301,7 +320,9 @@ without a protocol break.
   central writes link packets to RX (…0002, write without response); the
   peripheral notifies on TX (…0003).
 - Request MTU 517 and adapt to the granted MTU.
-- Link packets (big-endian): `Hello{version, short id, flags, window}`,
+- Link packets (big-endian): `Hello{version, token, flags, window}` (the
+  token is this phone's current advert token, §B14.2; `window` is the
+  flow-control window),
   `Data{msg_id, index, count, payload}`, `Ack{msg_id, index}`, `Probe`,
   `ProbeAck`, `Bye{reason}`. `ReliableLink` gives an ordered, reliable frame
   pipe over one connection: frames are chunked (u16 index/count, so at a small
@@ -320,9 +341,11 @@ without a protocol break.
   a peer is connected or was seen in the last minute. Android throttles apps
   that start scanning more than 5 times per 30 s, so no cycle is shorter than
   6 s.
-- At most 4 concurrent connections. The phone with the lower short id dials;
-  the higher one dials only as a fallback 45 s later, so both rarely dial at
-  once.
+- At most 4 concurrent connections. The phone with the lower advert token
+  dials (§B14.2); the higher one dials only as a fallback 45 s later, so both
+  rarely dial at once.
+- Two contact links to one phone (both dialed) are resolved by the node: both
+  phones keep the one dialed by the lower Noise static key (§B14.3).
 - GATT status 133 (the usual failure) and other connect errors: per-peer
   retry with backoff.
 - **Range assumption: 1M PHY (about 10–30 m in crowds).** LE Coded PHY is used
@@ -347,7 +370,7 @@ interval plus a margin.
 | Transfer interrupted | A frame is used only when complete; rows are idempotent by id or hash; resume on reconnect |
 | Sequencer absent | Messages stay queued ("waiting for peer") |
 | MLS fork despite the rules | An epoch error surfaces; the host offers a conversation reset |
-| Clock skew | Threads sort by sequence id; skew only affects displayed times |
+| Clock skew | Threads sort by sequence id; skew affects displayed times. Contacts recognise and link to each other across up to one 15-minute window of skew (§B14.2); beyond that they see each other as strangers |
 | Reinstall | Key lost → new identity, unless the recovery phrase is restored (Part C) |
 | Smart-contract wallet identity | Unsupported |
 | iOS | `mesh` throws "unsupported" |
@@ -401,20 +424,17 @@ the dead installation leaves the inbox and every DM.
 When there is no old node to carry from (a new phone, a reinstall), Part C
 applies.
 
-### B10.3 Short ids (D22)
+### B10.3 Short ids (D22, removed)
 
-The BLE short id advertised for a node is keyed to the node file (inbox +
-generation), not to the app install. A new identity or a rotated node gets a
-fresh, unlinkable id; restarting the same node reuses its id. A rotation
-forgets the retired generations' ids. The earlier install-wide id had already
-been broadcast next to every identity the install used, so it is deleted and
-never migrated to any node: handing it to whichever node was looked up first
-would recreate exactly that linkage. Pairing does not depend on the short id.
+Removed by private discovery (§B14.2, D32): a phone advertises only its
+rotating token. Tokens are derived from the account key and the inbox
+(§B14.1), so a new identity gets unlinkable tokens, and there is no
+install-wide identifier left to delete.
 
 ## B11 Deferred (in order)
 
 1. Multi-hop relay — done as Part R, phase 1.
-2. Rotating-token discovery + Noise handshake (fixes D9 and §B12).
+2. Rotating-token discovery + Noise handshake — done as §B14 (mesh.11).
 3. LE Coded PHY / Wi-Fi Direct fast paths.
 4. iOS radio.
 5. Key backup.
@@ -427,13 +447,15 @@ would recreate exactly that linkage. Pairing does not depend on the short id.
 Each session starts with Hello and Auth (§B5.3). Each side proves that it holds
 the installation key it claims by signing the other side's fresh challenge.
 The signed text binds both installation keys, and a Hello that carries the
-receiver's own key is rejected. What "authenticated" means is exactly this:
-**a live holder of installation key K answered through this pipe.** It does
-not bind the pipe to K, and frames after the handshake carry no per-frame
-authentication. Signed sequencing records (§B13) removed attack 3 below; the
-rest waits for the Noise upgrade (§B11 item 2).
+receiver's own key is rejected. Before §B14, "authenticated" meant exactly
+this: **a live holder of installation key K answered through this pipe.** It
+did not bind the pipe to K, and frames after the handshake carried no
+per-frame authentication. Signed sequencing (§B13) removed attack 3, and Noise links
+(§B14) removed attacks 1 and 4 on direct links: the Auth now binds the Noise
+handshake hash, and a relaying device sees only sealed records and can only
+forward them.
 
-### The attack
+### The attack (before §B14)
 
 Mallory places a device between Alice and Bob (easy when they are out of each
 other's range), keeps a radio link to each, and forwards frames verbatim:
@@ -456,41 +478,47 @@ sessions.
   identity updates are signature-checked before any node stores them; key
   packages are verified.
 - **Intercept pairing.** Pairing is protected separately by the code both
-  people compare (§B6.2).
+  people compare (§B6.2, §B14.4).
 
 ### What Mallory can do
 
-1. **Watch metadata**: group ids, sizes, timing, who syncs with whom. Under
-   D9 most of this already leaks to anyone nearby.
+1. **Watch metadata: fixed on direct links by §B14.** Group ids, sizes and
+   who syncs with whom travel inside Noise; Mallory sees record sizes and
+   timing only.
 2. **Drop or delay frames**, selectively. Victims see "queued", not an error.
 3. **Reorder or re-number sequenced messages: fixed by §B13.** Every row
    carries a signature by the installation that ordered it, and every node
    checks it before storing; a reordered, renumbered or altered row is
    refused and the session ends.
-4. **Inject unsigned protocol frames within one relayed session**, using only
-   the relayed victim's identity (and only for groups it really is a member
-   of). For example a forged `WelcomeAck` deletes an undelivered outbound
-   welcome; a forged `Interest` with `i_am_sequencer` can pin the wrong
-   sequencer for a group that has none pinned yet.
+4. **Inject unsigned protocol frames: fixed by §B14.** Every record is
+   authenticated; a forged, altered or reordered one closes the link. (Before
+   §B14, a forged `WelcomeAck` could delete an undelivered outbound welcome,
+   and a forged `Interest` with `i_am_sequencer` could pin the wrong
+   sequencer for a group that had none pinned yet.)
 5. **Extend range**, which makes "nearby" presence untrustworthy.
 
+Items 2 and 5 remain: no protocol can prevent dropping, delaying or range
+extension.
+
 Net effect: **no loss of confidentiality or message authenticity**;
-availability can be lost; ordering integrity is protected by §B13. The
-attack needs an active device on both links at once; it is realistic against
-a targeted pair, not passive or remote.
+availability can be lost; ordering integrity is protected by §B13, and frame
+integrity and link metadata by §B14. The attack needs an active device on
+both links at once; it is realistic against a targeted pair, not passive or
+remote.
 
 ### Mitigations
 
-1. **Noise session with installation static keys** (planned): channel binding
-   and per-frame authentication remove attack 4 and most of 1. Dropping
-   (2) can only be detected, never prevented, on any relayed radio link.
+1. **Noise session with installation-bound Auth** (done, §B14, D33):
+   per-record authentication and channel binding removed attacks 1 and 4;
+   dropping (2) can only be detected, never prevented, on any relayed radio
+   link.
 2. **Signed sequencing records** (done, §B13, D30): the sequencer signs
    `(group_id, id, created_ns, sha256(data))` and every node verifies before
    storing. Removed attack 3 without Noise.
 3. **Delivery acknowledgements in the UI** (standard XMTP read receipts) make
    selective withholding visible.
-4. Until then, the mesh must not be described as safe against an active
-   adversary nearby.
+4. The mesh must still not be described as safe against an active
+   adversary nearby: dropping, delaying and range extension remain.
 
 ## B13 Signed sequencing records (D30)
 
@@ -611,6 +639,253 @@ once per frame.
   the former sequencer's original proof, so a later conflicting record from
   the now-known-revoked former sequencer at that id is treated as the
   §C4.7 id reuse, not equivocation.
+
+## B14 Private discovery and Noise links (D31–D36)
+
+Goal: a person nearby with a Bluetooth sniffer, or with this app, cannot
+name a phone (inbox id, installation key, account address), recognise it
+from one 15-minute window to the next by what it advertises or says, see
+which phones sync with which, or read or alter a link. Contacts still find
+each other, relays still work, and a phone restored from its recovery
+phrase can still reconnect to its contacts. What remains is in §B14.7 and
+§R9.
+
+The Rust core and the FFI implement this section (mesh.11). The Android
+radio must advertise, rotate and dial as §B14.2 says; until it does, only
+the loopback simulator exercises it.
+
+### B14.1 Keys (D34)
+
+All derivation is in Rust (D10). After registration and before
+`start_sync` (which fails with `NoAccountKey` otherwise), the app hands the
+node the account's 32-byte secp256k1 private key (`set_account_key`). The
+node keeps only the HKDF PRK and the derived keys, in memory, zeroized when
+dropped:
+
+```
+prk           = HKDF-SHA256-Extract(salt = "xmtp-mesh-keys-v1", ikm = account key)
+noise_static  = HKDF-Expand(prk, "noise-static" ‖ inbox_id, 32)            (X25519)
+discovery_key = HKDF-Expand(prk, "discovery" ‖ inbox_id ‖ u32_be(generation), 32)
+```
+
+`generation` starts at 0 and is stored in the node. `reset_discovery_key`
+increments it and re-derives the discovery key; the static key never
+changes. A phone restored from its recovery phrase derives the same static
+key and the generation-0 discovery key. The installation's ed25519 key and
+its signatures are unchanged; they prove the installation inside the link
+(§B14.4).
+
+### B14.2 Adverts, tokens and dialing (D32, D35)
+
+- **Service data:** `version (= 2) ‖ flags ‖ token (8)`, 10 bytes. Flag
+  `0x01`: pairing mode; `0x02`: relay offered. Nothing else in the advert,
+  scan response or GATT database names the phone; the service and
+  characteristic UUIDs are the same on every phone. Any other version is
+  ignored.
+- **Token:** the first 8 bytes of `HMAC-SHA256(discovery_key,
+  u64_be(window))`, `window = floor(unix_seconds / 900)`. At every boundary
+  the radio stops and restarts advertising, so the token and the random
+  address change together.
+- **`advert_state(now)`** gives the radio its service data, its own token,
+  the next boundary (`next_window_at`), and every live contact's tokens for
+  windows `w-1`, `w`, `w+1` (up to 15 minutes of clock skew). Its
+  `contacts_version` changes whenever the contacts, the keys or pairing
+  mode change (the relay flag follows the relay switch the app sets).
+- **`classify_advert(data, now)`** says what a seen advert is: `Own` (our
+  token for `w-1 ..= w+1`, which also covers another installation of our
+  inbox), `Pairing` (its pairing flag is set and we are in pairing mode),
+  `Contact{inbox_id}` (a live contact's token), `Stranger{relay_offered}`,
+  or `Invalid`. Each answer says whether we dial first: the lower token
+  dials; the other phone dials only as the §B7.2 fallback. The radio dials a
+  contact as `Dial(Contact{inbox})`, a pairing phone as `Dial(Pairing)`, and
+  a stranger as `Dial(Relay)` only when the stranger offers relay and our
+  relay is on.
+- The link-layer Hello (§B7.1) carries the token in place of the old short
+  id.
+
+**Which dialers get a contact link.** A responder accepts an IK message 1
+(§B14.3) only if all of these hold:
+
+1. The dialer's static key belongs to a live (not removed) contact, or the
+   phone has no contact rows at all, live or removed (a phone just
+   restored from its recovery phrase).
+2. Its encrypted payload is dated (`u64_be(window)`) within `w-1 ..= w+1`
+   of the responder's window. It also carries 16 random bytes.
+3. It was not seen before. The node keeps one replay cache of accepted IK
+   message-1 digests for three windows, at most 4096 entries (oldest
+   dropped). Every kind-0 message 1 is checked against it, so the work does
+   not depend on the outcome; only accepted ones are remembered, so
+   strangers cannot flush it.
+
+Anything else, including a captured message 1 replayed later or an
+ex-contact dialing with our static key, is answered exactly like a
+stranger: NN on a fresh state (or refused while relay is off). So a replay
+cannot ask "are you B?", and the responder looks the same as any other
+phone. The allowed-dialer set is an in-memory copy of the contacts, so
+every dialer is answered without database I/O.
+
+### B14.3 Links and handshakes (D31, D33, D35)
+
+Noise with `snow`, `25519_ChaChaPoly_SHA256`, prologue `xmtp-mesh-link-v1`.
+The radio reports how each link opened (`on_peer_connected(peer, role)`):
+`Dial(Contact{inbox} | Relay | Pairing)` or `Accept`.
+
+| Link | When | Pattern | Who learns what |
+|---|---|---|---|
+| Contact | the dialer saw a contact's token | IK | Only the responder learns the dialer's static key (encrypted to its own). |
+| Relay | the dialer saw a stranger that offers relay, and relays itself | NN | Nobody learns anything stable: fresh ephemeral keys only. |
+| Pairing | both phones in pairing mode | XX | Both statics, encrypted; the people compare a code (§B14.4). |
+
+- **Message 1 is always 128 bytes:** a kind byte (0: contact or relay;
+  1: pairing), then Noise message 1 padded to 127 bytes. IK message 1 is
+  the ephemeral key, the encrypted static key and 31 encrypted payload
+  bytes (`u64_be(window) ‖ 16 random bytes ‖ 7 zero bytes`, §B14.2). NN
+  message 1 is the ephemeral key and 95 random bytes in the clear; XX
+  message 1 is the ephemeral key, the pairing commitment and 63 random
+  bytes (§B14.4). For kind 0 the responder tries IK with its static key,
+  then NN. It refuses NN while its relay is off, and XX outside pairing
+  mode. Every payload has an exact length; anything else fails. Message 2
+  is the same size for IK and NN.
+- **The dialer speaks first.** The responder's view of the dialer is not
+  key-confirmed by IK message 1 alone (it could be a replay), so after the
+  handshake the responder sends nothing, not even a Hello or a relay
+  frame, until the dialer's first record authenticates.
+- **Records.** After the handshake, every frame is split into records of
+  `flag ‖ up to 65 518 frame bytes`. Each record is sealed as one Noise
+  transport message of at most 65 535 bytes and sent in order. Reassembly
+  stops at 1 MiB. Both directions rekey every 65 536 records. Records fail
+  closed: after one error, every later record on the link fails too.
+- **Relay links** carry only `Relay`, `SpoolDigest` and `SpoolWant`. No
+  `Hello`, identity log, key package, interest, welcome, relay key or
+  contact card ever travels on one; any other frame, or an undecodable
+  one, closes the link. A stranger must not hold one of the radio's four
+  connections: a relay link closes after 60 s without useful traffic (an
+  envelope the relay engine accepted, or a digest or want naming at least
+  one envelope), after 10 minutes however busy, and at once when this phone
+  turns relay off. After closing one (idle, at the cap, for a rejected
+  frame, or relay off), the phone refuses that radio peer as a stranger,
+  dialing or accepting, for 30 s (at most 256 peers remembered).
+- **Failures.** A failed or timed-out (15 s) handshake, a record that fails
+  authentication, a frame the link type does not allow, or a Hello, Auth or
+  card that does not match the link ends it. The error is fatal
+  (`LinkAuthFailed`) and counted (§B14.6).
+- **Two contact links to one phone** (both dialed at once) are resolved
+  when the second is verified: both phones keep the one dialed by the lower
+  static key and close the other.
+
+### B14.4 Contact and pairing links
+
+- **Inner Hello/Auth.** On contact and pairing links the §B5.3 Hello/Auth
+  runs inside Noise. `Hello.link = 1`; a peer below it is refused. The
+  signed text is
+  `xmtp-mesh-hello-v2:challenge:signer:verifier:handshake_hash`, so an
+  installation proof made for one link never verifies on another (a
+  malicious mutual contact cannot forward one contact's Auth).
+- **Expected inbox.** On a contact link the Hello must name the inbox the
+  Noise static key belongs to: on the dialer, the contact it dialed; on the
+  responder, the contact whose static key dialed in.
+- **Contact cards** (`ContactCard{inbox_id, noise_static_pub,
+  discovery_key, generation}`, tag 25) travel on every contact link, so a
+  reset or a restore reaches contacts without re-pairing:
+  - A phone sends its own card once the peer's Auth verifies, if it knows
+    the peer as a contact (the dialer always does; a responder does when it
+    recognised the dialer's static key).
+  - A phone that did not know the dialer (restored, no contact rows) sends
+    its card only after the dialer is verified (Auth and identity log,
+    §B5.3) and the dialer's card is stored.
+  - A received card must name the link's static key and the peer's
+    verified inbox, never this phone's own inbox or static key, and is
+    applied only after verification.
+  - Storing: a new inbox is added; a newer generation with the same static
+    key replaces the stored card. An older generation, a different static
+    key for a known inbox, or a removed contact's card is ignored; only a
+    confirmed pairing replaces those.
+- **Reset** (`reset_discovery_key`): the phone advertises only the new
+  token. Contacts that have not yet received the new card stop recognising
+  it, but it still recognises them, dials them and sends the new card.
+- **Removed contacts** (`remove_contact`) keep a tombstone: their tokens are
+  no longer matched, and an IK dialer with their static key is answered as
+  a stranger (§B14.2). Removing a contact and then resetting the discovery
+  key cuts it off.
+- **Pairing** runs XX, in person, commit-then-reveal. The dialer picks a
+  random 32-byte `Na` and sends `SHA-256("xmtp-mesh-pair-commit-v1" ‖ Na)`
+  in message 1; the responder answers with a random 32-byte `Nb` in
+  message 2; the dialer reveals `Na` in message 3, and the responder checks
+  it against the commitment. Both phones show
+  `u32_be(SHA-256("xmtp-mesh-pair-code-v1" ‖ h2 ‖ Na ‖ Nb)[0..4]) mod
+  1 000 000` as 6 digits, where `h2` is the handshake hash after message 2.
+  Each side's randomness is fixed before it sees the other's and message 3
+  does not enter the code, so a device in the middle runs two handshakes,
+  shows two codes, and gets one 1-in-a-million guess per attempt.
+- **Nothing identifying until both people confirm.** Until this phone's
+  person confirmed (`confirm_pairing`) and the other phone's
+  `PairConfirm` (tag 26) arrived, a pairing link carries only
+  `PairConfirm`; any other frame closes it. The dialer speaks first here
+  too. Then Hello/Auth, identity logs, key packages and cards follow as on
+  a contact link. The other phone's card is stored once, forced: it
+  replaces any card or removal stored for that inbox; later cards on the
+  link are ignored. `reject_pairing` closes the link, and so does waiting
+  120 s for the confirmations.
+- **Pairing mode ends** after a successful pairing, after 5 unfinished
+  pairings (failed, rejected, timed out or dropped) since it was turned on
+  (counted), or when the app turns it off. Leaving it closes every open
+  pairing link that both people have not confirmed, so a nearby guesser
+  gets few tries at the code.
+
+### B14.5 Relay links
+
+A relay link gets a fresh 33-byte relay source id (never a 32-byte
+installation key): its rate and spool budgets are its own for its lifetime,
+and all stranger links together share per-window and spool caps (§R5.4).
+Contact links keep D18's per-installation budgets. Relay keys (§R4.5) are
+never offered on a relay link; a recipient's own envelope is still
+delivered past a limit (§R5.4).
+
+### B14.6 Counters
+
+`MeshStats` (§B13) adds `links_contact`, `links_relay` and `links_pairing`
+(links opened, by kind), `handshake_failed`, `link_frame_rejected` (a
+record, frame, Hello, Auth or card the link refused), `discovery_resets`,
+`relay_links_idle_closed`, `relay_links_force_closed` (at the lifetime cap
+or relay turned off), `relay_links_backoff_refused` and
+`pairing_attempts_exhausted`. `peers_rejected_version` also counts a
+`Hello.link` below 1. `RelayStats` adds `dropped_full` (a stranger's
+envelope with only contacts' entries left to displace). The FFI's
+`FfiMeshStats` and `FfiRelayStats` carry them all. Contacts' discovery keys
+never cross the FFI.
+
+### B14.7 What this does not fix
+
+- **Ex-contacts.** Anyone who was ever your contact can recognise your
+  adverts until you remove them and reset the discovery key. The static
+  key never changes, so a removal is what refuses their links.
+- **A restore forgets removals.** Tombstones live on the phone. A removed
+  contact that still holds your card and dials in is stored again, and
+  later resets reach it. The app should list contacts a restored phone
+  added by itself, so the user can remove them again.
+- **A restored phone re-learns contacts one way only.** It accepts any IK
+  dialer only while it has no contact rows. Once it has stored one card,
+  contacts it has not yet re-learned are answered as strangers, and it
+  cannot recognise their adverts without their cards; they re-pair in
+  person.
+- **A restore after a reset** derives generation 0, which contacts no
+  longer recognise: they re-pair in person.
+- **Two live installations of one inbox** (§C4, D7's fork case) derive the
+  same keys and tokens. They classify each other's adverts as their own
+  and never link directly, and a contact cannot tell which one it dials.
+- **Relay links show their peer** the spool digests and wants on that link
+  (sealed from everyone else) and the envelopes' `ttl` and expiry. NN is
+  unauthenticated, so a device in the middle of a relay link sees the same.
+- **Relay limits** use fixed 15-minute windows, so strangers together can
+  push up to twice the window cap across a boundary (§R5.4).
+- **Radio fingerprinting, RSSI, origin location and timing** (§R9) are
+  unchanged, as are record sizes and timing, and the small timing
+  difference between trying IK and falling back to NN. The service UUID
+  says "a PyriteChat phone is here"; the pairing flag and a pairing link's
+  kind byte say "pairing".
+- **iOS:** a backgrounded app cannot change its adverts (§R11). Rotating
+  tokens in the advert are Android-only until tokens are also exchanged
+  after connecting.
 
 ---
 
@@ -980,7 +1255,7 @@ envelope.
 | D11 | **Open relay.** Any phone relays and carries for anyone. | Contacts-only relay: reach too poor in a crowd of strangers. Possible later setting. |
 | D12 | **Nothing stable in the clear** on a relayed envelope: no inbox id, installation key, `group_id` or address. Relay-visible fields are a per-envelope tag, a coarse expiry, the TTL/copy counters and a padded size. | Cleartext ids (trackable across the whole mesh). Hourly tags (link a conversation's envelopes for an hour; cannot match an envelope carried for a day). |
 | D13 | **One relay spool for flood and carry.** Live relay is carry with a short hold. | Pure live flood first (dies under BLE connection churn; carry would need a second mechanism). Connectionless flood over BLE advertising (≤255 B adverts, Android throttling). |
-| D14 | **Multi-hop ships before the discovery fix** (rotating tokens + Noise). The envelope is already D12-clean, so the discovery fix does not change it. | Discovery fix first. |
+| D14 | **Multi-hop ships before the discovery fix** (rotating tokens + Noise). The envelope is already D12-clean, so the discovery fix does not change it. (Done: §B14.) | Discovery fix first. |
 | D15 | **No relay-visible "delivered" notices.** The sealed `acked_high` (§R6.3) is the sender's delivery signal; relays drop copies only by expiry and copy budget. | A relay-visible `Delivered` notice: its first transmitter is the recipient, and anyone holding the relay key could probe "is my contact in this crowd?" (a presence oracle). |
 | D16 | **Welcomes and identity logs stay direct-only in phase 1.** Pairing is in person, so they already travel over direct BLE. | Relayed welcomes (HPKE; phase 2). |
 | D17 | **Per-DM relay key pinned at first direct contact** (§R4.5), sent exporter-encrypted over BLE, fixed for the DM's life. The same key is re-offered when the other member's installation changes or the sequencer is re-pinned. | Per-epoch exporter keys (a missed epoch wedges delivery); refresh on every meeting (more code). |
@@ -1196,11 +1471,31 @@ There is no signal-strength-weighted delay and no "cancel on duplicate", as in
 broadcast-radio meshes: those rely on phones overhearing each other, and BLE
 GATT links are unicast. The digest gives exact knowledge instead.
 
-### R5.4 Abuse limits (D18)
+### R5.4 Abuse limits (D18, D31)
 
-Relays cannot identify senders, so limits apply per **neighbour phone**, keyed
-by its verified installation key; all of a phone's links share one budget,
-which survives disconnecting and reconnecting.
+Relays cannot identify senders. On a **contact link** (§B14.3) limits apply
+per **neighbour phone**, keyed by its verified installation key; all of a
+phone's links share one budget, which survives disconnecting and
+reconnecting (D18).
+
+A **stranger (relay) link** has no stable identity: it gets a fresh 33-byte
+source id and the same per-neighbour budgets and share below, for its own
+lifetime (at most 10 minutes, §B14.3). All stranger links together also
+keep to caps of `stranger_window_factor` (default 4) times one neighbour's
+share:
+
+- **Per discovery window** (15 minutes): at most factor × share-cap
+  envelopes and factor × share-cap bytes accepted from strangers. Only what
+  enters the spool counts: a duplicate, invalid or expired envelope costs the
+  stranger its own link's budget, never the shared window. These are fixed
+  windows, not a bucket, so strangers can push up to twice the cap across a
+  window boundary.
+- **In the spool:** strangers' entries together hold at most factor × the
+  share in entries and in bytes. To make room, a stranger's envelope
+  displaces only strangers' entries (soonest-drop first), never a contact's;
+  when only contacts' entries are left it is dropped (`dropped_full`). With
+  the default 25% share, 4× equals the whole spool; lower the factor to
+  reserve room for contacts.
 
 - Token bucket per neighbour: 200 envelopes and 256 KiB per minute, burst up
   to the share cap (so an honest carrier can hand over a full share on first
@@ -1335,32 +1630,39 @@ this also stops their own messages from travelling through other phones.
 
 ## R9 What this does not protect
 
-Relay-blindness plus end-to-end MLS, **not anonymity** (D19). Until
-rotating-token discovery and the Noise handshake ship, the mesh is **not
-protest-safe**.
+Relay-blindness plus end-to-end MLS, **not anonymity** (D19). Private
+discovery and Noise links (§B14) removed the cleartext `Hello`, the fixed
+short id and the cleartext link: a listener no longer learns inbox ids,
+cannot link a phone across 15-minute windows by what it advertises, and
+cannot read hop counts, spool digests or group ids on a link. What remains
+(details in §B14.7):
 
-1. **Inbox id in the cleartext `Hello`** (D9). The biggest leak: it names both
-   ends of every hop even though the envelope between them is sealed.
-2. **Spool fingerprint.** `SpoolDigest` and `SpoolWant` travel in the clear,
-   so a sniffer can recognise a phone by what it carries and see that one
-   phone had something new for another.
+1. **Ex-contacts** recognise you until you remove them and reset the
+   discovery key; a restore forgets removals (§B14.7).
+2. **What your relay links show their peer.** A relay stranger you link
+   with sees your `SpoolDigest`s and `SpoolWant`s on that link (a spool
+   fingerprint for up to 10 minutes) and the `ttl` and expiry of the
+   envelopes it receives. Relay links are unauthenticated (NN), so a device
+   in the middle of one sees the same.
 3. **Origin location.** The first phone to transmit a new envelope can be
    located by radio. Random delays blur this; nothing removes it.
-4. **Hop distance.** `ttl` is a cleartext counter that drops by one per hop.
-   The random 3–5 start widens each observation to three candidates; it does
-   not hide it. Encrypting the link (Noise) would.
-5. **Origin time.** `expires_at` is coarse, but still says roughly when an
-   envelope was made.
-6. **Radio fingerprinting.** Signal-strength (RSSI) patterns re-identify a
-   phone with commodity hardware regardless of what the protocol rotates.
-7. **Active attackers.** Malicious relays can drop or delay. Replays are
-   harmless (MLS drops duplicates). Out of scope by choice.
-8. **Global timing analysis.** An observer covering the whole crowd can
-   correlate send and arrival times; without cover traffic no design prevents
-   that.
-9. **Answer timing.** A phone next to a recipient can see an envelope go in
-   and, soon after, a fresh one come out. The random 2–10 s answer delay blurs
-   this; it does not remove it.
+4. **Origin time.** `expires_at` is coarse, but still says roughly when an
+   envelope was made (visible to the relays that carry it).
+5. **Radio fingerprinting.** Signal-strength (RSSI) patterns and radio
+   quirks re-identify a phone with commodity hardware regardless of what
+   the protocol rotates. The service UUID says "a PyriteChat phone is here",
+   and the pairing flag and a pairing link's first message say "pairing".
+6. **Active attackers.** Malicious relays can drop or delay. Replays are
+   harmless (MLS drops duplicates; records and the IK replay cache reject
+   them).
+7. **Global timing analysis.** An observer covering the whole crowd can
+   correlate send and arrival times; without cover traffic no design
+   prevents that.
+8. **Answer timing.** A phone next to a recipient can see an envelope go
+   in and, soon after, a fresh one come out. The random 2–10 s answer
+   delay blurs this; it does not remove it.
+9. **Link sizes and timing.** Records hide content, not sizes and times.
+10. **iOS.** Rotating tokens in adverts are Android-only for now (§B14.7).
 
 **Claims to avoid** in apps, store listings and docs built on this:
 *anonymous*, *untraceable*, *metadata-free*, *protest-safe*, *relays learn
@@ -1416,10 +1718,10 @@ on three or more real phones is not yet tested.
 relationship-tiered spool shares (§R5.4), an hourly relay-key ratchet for
 forward metadata secrecy, relayed welcomes over HPKE (D16).
 
-**Later, separate designs:** rotating-token discovery + Noise (fixes §R9 items
-1, 2 and 4; must respect iOS, where a backgrounded app cannot change its
-adverts and its service UUID moves to Apple's "overflow area", so tokens are
-exchanged after connecting and the service UUID stays fixed); signed,
+**Done:** rotating-token discovery + Noise links (§B14; iOS still needs
+tokens exchanged after connecting, because a backgrounded iOS app cannot
+change its adverts and its service UUID moves to Apple's "overflow area",
+§B14.7). **Later, separate designs:** signed,
 hash-chained sequencing records (active-attacker defence, §B12); source
 routing only if floods prove too costly and it can be done without breaking
 D12.
@@ -1451,5 +1753,10 @@ D12.
   capacity.
 - **Exporter secret.** A per-epoch MLS secret every group member can derive;
   used only to wrap the relay key on a direct link.
-- **Noise.** A handshake framework for encrypting a link; the planned fix for
-  the cleartext `Hello`, digests and TTL.
+- **Noise.** A handshake framework for encrypting and authenticating a link;
+  every mesh link runs IK, NN or XX (§B14.3).
+- **Advert token / discovery key.** The 8 bytes a phone advertises, from
+  its discovery key and the 15-minute window; only contacts hold the key
+  (§B14.2).
+- **Contact card.** A contact's inbox id, Noise static key and discovery
+  key, exchanged on contact and pairing links (§B14.4).

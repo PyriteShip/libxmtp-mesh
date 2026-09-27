@@ -128,7 +128,7 @@ mod tests {
         AccountPrk::extract(&[0x11; 32]).unwrap()
     }
 
-    /// Fixed vectors (§B14.1): HKDF-SHA256 with the spec's salt and info.
+    /// Fixed vectors (§B14.1): HKDF-SHA256 with the salt and info labels of §B14.1.
     #[test]
     fn keys_derive_from_the_account_key() {
         let k = MeshKeys::derive(&prk(), INBOX, 0);

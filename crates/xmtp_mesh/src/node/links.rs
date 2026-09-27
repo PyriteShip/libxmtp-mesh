@@ -837,7 +837,7 @@ mod tests {
         assert_ne!(a_first, b_first, "exactly one side dials first");
     }
 
-    /// Spec §10 "discovery reset" (node side): the phone advertises only
+    /// §B14.4 discovery reset (node side): the phone advertises only
     /// the new token; a contact holding the old card no longer recognises
     /// it until it gets the new card.
     #[test]

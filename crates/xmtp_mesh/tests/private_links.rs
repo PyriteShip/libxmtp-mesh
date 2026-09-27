@@ -125,14 +125,14 @@ async fn a_removed_contact_stays_removed_across_re_links() {
     );
     assert!(a.node.contacts().unwrap().is_empty());
     // a no longer recognises b: if a dials, it dials as a stranger.
-    if let Some((dialer, intent)) = hub.planned_link_for_test("a", "b") {
-        if dialer == "a" {
-            assert_eq!(intent, DialIntent::Relay);
-        }
+    if let Some((dialer, intent)) = hub.planned_link_for_test("a", "b")
+        && dialer == "a"
+    {
+        assert_eq!(intent, DialIntent::Relay);
     }
 }
 
-/// Spec §10 "IK contact link": both sides authenticate inside Noise, a DM
+/// §B14.3 contact link (IK): both sides authenticate inside Noise, a DM
 /// round-trips, and nothing on the air names either phone (§B14 goal).
 #[tokio::test(flavor = "multi_thread")]
 async fn contacts_link_over_ik_and_nothing_on_the_air_names_them() {
@@ -164,7 +164,7 @@ async fn contacts_link_over_ik_and_nothing_on_the_air_names_them() {
     }
 }
 
-/// Spec §10 "NN relay link": relay frames flow between strangers; a
+/// §B14.3 relay link (NN): relay frames flow between strangers; a
 /// Hello, Interest or KeyPackage on the link closes it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_relay_link_carries_relay_frames_only() {
@@ -224,7 +224,7 @@ async fn a_relay_link_carries_relay_frames_only() {
     }
 }
 
-/// Spec §10 "wrong static": a dialer that takes a stranger for a contact
+/// §B14.3 wrong static: a dialer that takes a stranger for a contact
 /// fails its handshake; the stranger reads a relay link and learns
 /// nothing that names the dialer.
 #[tokio::test(flavor = "multi_thread")]
@@ -277,7 +277,8 @@ fn interest(g: &[u8]) -> Body {
     })
 }
 
-/// Spec §10 "tampered ciphertext / reordered records".
+/// §B14.3 records: tampered ciphertext or reordered records close the
+/// link.
 #[tokio::test(flavor = "multi_thread")]
 async fn tampered_or_reordered_records_close_the_link() {
     let hub = LoopbackHub::new();
@@ -323,7 +324,7 @@ async fn tampered_or_reordered_records_close_the_link() {
     assert_eq!(b.node.mesh_stats().link_frame_rejected, 2);
 }
 
-/// Spec §10 "1 MiB frame", end to end: a frame near the limit crosses as
+/// §B14.3 records, end to end: a frame near the limit crosses as
 /// full 65 535-byte records and the link stays in step.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_frame_near_the_limit_crosses_as_records() {
@@ -1162,7 +1163,7 @@ fn identifying(body: &Body) -> bool {
     !matches!(body, Body::PairConfirm(_))
 }
 
-/// Spec §10 "pairing XX": one 6-digit code on both phones. Nothing that
+/// §B14.4 pairing (XX): one 6-digit code on both phones. Nothing that
 /// identifies either phone crosses until both people confirmed: the
 /// accepting phone, confirming first, says nothing at all until the
 /// dialer's confirmation (the dialer speaks first). Then both store the
@@ -1287,7 +1288,7 @@ async fn a_hello_before_both_confirmed_closes_the_pairing() {
     assert!(b.node.contacts().unwrap().is_empty());
 }
 
-/// Spec §10: a middle phone relaying the pairing runs two handshakes, so
+/// §B14.4: a middle phone relaying the pairing runs two handshakes, so
 /// the two people see different codes (and confirming a mismatch is what
 /// the people must not do).
 #[tokio::test(flavor = "multi_thread")]
