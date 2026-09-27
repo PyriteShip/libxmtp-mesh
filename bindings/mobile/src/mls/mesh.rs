@@ -335,7 +335,6 @@ impl From<FfiLinkRole> for LinkRole {
     }
 }
 
-/// Public facts about the link keys derived from the account key.
 /// An open pairing link (DESIGN.md §B14.4).
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct FfiPendingPairing {
@@ -359,6 +358,7 @@ impl From<xmtp_mesh::PendingPairing> for FfiPendingPairing {
     }
 }
 
+/// Public facts about the link keys derived from the account key.
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct FfiLinkKeyInfo {
     pub noise_static_pub: Vec<u8>,

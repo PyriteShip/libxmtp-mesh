@@ -4,6 +4,8 @@ use std::sync::atomic::Ordering;
 
 use super::MeshNode;
 use crate::MeshError;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::link::LinkRole;
 use crate::link::keys::{AccountPrk, MeshKeys};
 use crate::link::noise::{ReplayCache, ResponderContext};
 use crate::link::{
@@ -11,12 +13,14 @@ use crate::link::{
     FLAG_RELAY, LinkCounters, LinkKeyInfo, Token, WINDOW_SECS, advert_token, parse_service_data,
     service_data, window_at,
 };
-use crate::link::{LinkRole, MAX_UNFINISHED_PAIRINGS, PairingEntry, PendingPairing};
+use crate::link::{MAX_UNFINISHED_PAIRINGS, PairingEntry, PendingPairing};
 use crate::store::{Contact, ContactUpdate};
 use crate::sync::MeshTransport;
 use crate::sync::frames::ContactCard;
 use crate::sync::frames::frame::Body;
-use crate::sync::session::{Inbound, LinkSetup};
+use crate::sync::session::Inbound;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::sync::session::LinkSetup;
 
 impl MeshNode {
     /// Derive this phone's link keys from the account key (the secp256k1
@@ -92,14 +96,37 @@ impl MeshNode {
     }
 
     /// Advertise and accept pairing links (§B14.4). Each time it is turned
-    /// on, [`MAX_UNFINISHED_PAIRINGS`] unfinished pairings are allowed
-    /// before the phone leaves pairing mode by itself.
+    /// on, [`MAX_UNFINISHED_PAIRINGS`] unfinished pairings are allowed.
+    /// The phone leaves pairing mode by itself after a successful pairing
+    /// or at that cap. Turning it off closes every open pairing link the
+    /// people have not both confirmed.
     pub fn set_pairing_mode(&self, on: bool) {
         if on {
             self.inner.link.pairing_failures.store(0, Ordering::Relaxed);
+            self.inner.link.pairing_mode.store(true, Ordering::Relaxed);
+            self.inner.link.bump_contacts_version();
+        } else {
+            self.leave_pairing_mode();
         }
-        self.inner.link.pairing_mode.store(on, Ordering::Relaxed);
+    }
+
+    /// Stop advertising and accepting pairing links, and close the open
+    /// ones not yet confirmed by both people (a handshake still running
+    /// is refused when it opens). Returns whether pairing mode was on.
+    fn leave_pairing_mode(&self) -> bool {
+        let was_on = self.inner.link.pairing_mode.swap(false, Ordering::Relaxed);
         self.inner.link.bump_contacts_version();
+        let sessions = self.inner.sessions.lock();
+        self.inner.link.pairings.lock().retain(|peer, e| {
+            if e.confirmed && e.peer_confirmed {
+                return true;
+            }
+            if let Some(handle) = sessions.get(peer).filter(|h| h.id == e.session_id) {
+                let _ = handle.tx.send(Inbound::Pairing { confirm: false });
+            }
+            false
+        });
+        was_on
     }
 
     pub fn pairing_mode(&self) -> bool {
@@ -346,15 +373,19 @@ impl MeshNode {
     }
 
     /// The pairing on `peer` stored the other phone's card: it is done.
+    /// Its job done, pairing mode ends (§B14.4).
     pub(crate) fn pairing_completed(&self, peer: &str, session_id: u64) {
-        let _sessions = self.inner.sessions.lock();
-        let mut pairings = self.inner.link.pairings.lock();
-        if pairings
-            .get(peer)
-            .is_some_and(|e| e.session_id == session_id)
         {
-            pairings.remove(peer);
+            let _sessions = self.inner.sessions.lock();
+            let mut pairings = self.inner.link.pairings.lock();
+            if pairings
+                .get(peer)
+                .is_some_and(|e| e.session_id == session_id)
+            {
+                pairings.remove(peer);
+            }
         }
+        self.leave_pairing_mode();
     }
 
     /// A pairing handshake or link ended before the other phone's card was
@@ -367,15 +398,12 @@ impl MeshNode {
             .pairing_failures
             .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
-        if failures >= MAX_UNFINISHED_PAIRINGS
-            && self.inner.link.pairing_mode.swap(false, Ordering::Relaxed)
-        {
+        if failures >= MAX_UNFINISHED_PAIRINGS && self.leave_pairing_mode() {
             tracing::warn!(
                 failures,
                 "too many unfinished pairings; leaving pairing mode"
             );
             self.inner.link.counters.count_pairing_exhausted();
-            self.inner.link.bump_contacts_version();
         }
     }
 

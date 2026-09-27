@@ -164,6 +164,7 @@ pub(crate) const MEMBERSHIP_RETRY_WINDOW: Duration = Duration::from_secs(60);
 pub(crate) const MAX_DEFERRED_GROUPS: usize = 64;
 
 /// Most test-injected frames held while the handshake runs.
+#[cfg(any(test, feature = "test-utils"))]
 const MAX_EARLY_PLAIN: usize = 64;
 
 /// Whether the verified peer's inbox is a member of a group, per the local
@@ -648,6 +649,13 @@ impl Session {
         if open.kind == LinkKind::Contact {
             self.contact_link_opened(&open)?;
         }
+        // Pairing mode ended while this handshake ran (a pairing succeeded,
+        // the cap was reached, or the app turned it off).
+        if open.kind == LinkKind::Pairing && !self.node.pairing_mode() {
+            return Err(MeshError::LinkAuthFailed(
+                "pairing mode ended during the handshake".into(),
+            ));
+        }
         let pairing_code = open.pairing_code.clone();
         if open.kind == LinkKind::Pairing && pairing_code.is_none() {
             self.node.link_counters().count_handshake_failed();
@@ -782,6 +790,11 @@ impl Session {
     fn apply_pairing_card(&mut self, card: ContactCard) -> Result<(), MeshError> {
         if !(self.pair_confirmed && self.pair_peer_confirmed) {
             return Ok(()); // unreachable: nothing but confirmations before that
+        }
+        if self.paired {
+            // One forced store per pairing: later cards on this link are
+            // ignored.
+            return Ok(());
         }
         self.node.store_contact_card(&card, true)?;
         self.paired = true;

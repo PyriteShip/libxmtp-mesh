@@ -1190,6 +1190,10 @@ async fn pairing_shows_one_code_and_sends_nothing_identifying_until_both_confirm
         a.node.pending_pairings().is_empty() && b.node.pending_pairings().is_empty()
     })
     .await;
+    eventually("both left pairing mode", || async {
+        !a.node.pairing_mode() && !b.node.pairing_mode()
+    })
+    .await;
     assert_eq!(a.node.mesh_stats().links_pairing, 1);
     hub.unlink("a", "b");
     for p in [&a, &b] {
@@ -1420,4 +1424,96 @@ async fn unfinished_pairings_end_pairing_mode_at_the_cap() {
     b.node.set_pairing_mode(true);
     let (_, pb) = open_pairing(&hub, &a, &b).await;
     assert_eq!(pb.peer, "a");
+}
+
+/// Once a pairing stored the peer's card, later cards on that link are
+/// ignored: one forced store per pairing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_paired_link_stores_no_second_card() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    open_pairing(&hub, &a, &b).await;
+    confirm_both(&a, &b).await;
+    assert!(b.node.remove_contact(&inbox(&a)).unwrap());
+    assert!(a.node.send_frame_for_test(
+        "b",
+        Body::ContactCard(a.node.own_contact_card_for_test().unwrap())
+    ));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(hub.is_linked("a", "b"));
+    assert!(
+        b.node
+            .contact(&inbox(&a))
+            .unwrap()
+            .is_some_and(|c| c.removed),
+        "the removal stands"
+    );
+}
+
+/// The app turning pairing mode off closes a pairing the people have not
+/// both confirmed.
+#[tokio::test(flavor = "multi_thread")]
+async fn leaving_pairing_mode_closes_an_unconfirmed_pairing() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    open_pairing(&hub, &a, &b).await;
+    a.node.confirm_pairing("b").unwrap();
+    b.node.set_pairing_mode(false);
+    assert!(b.node.pending_pairings().is_empty());
+    eventually("the pairing link closes", || async {
+        !hub.is_linked("a", "b")
+    })
+    .await;
+    assert!(a.node.contacts().unwrap().is_empty() && b.node.contacts().unwrap().is_empty());
+}
+
+/// When the cap ends pairing mode, an open unconfirmed pairing closes and
+/// a pairing handshake still running is refused when it completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cap_closes_open_and_in_flight_pairings() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    let c = peer(&hub, "c").await;
+    let d = peer(&hub, "d").await;
+    open_pairing(&hub, &d, &b).await;
+    // c's handshake with b waits for its message 3.
+    c.node.set_pairing_mode(true);
+    hub.hold_for_test("c", "b");
+    hub.link_as("c", "b", DialIntent::Pairing);
+    eventually("c's message 1 held", || async {
+        hub.held_count_for_test("c", "b") == 1
+    })
+    .await;
+    let msg1 = hub.take_held_for_test("c", "b").remove(0);
+    hub.hold_for_test("c", "b");
+    hub.inject_wire_for_test("c", "b", msg1);
+    eventually("c's message 3 held", || async {
+        hub.held_count_for_test("c", "b") == 1
+    })
+    .await;
+    for _ in 0..xmtp_mesh::MAX_UNFINISHED_PAIRINGS {
+        a.node.set_pairing_mode(true);
+        hub.link_as("a", "b", DialIntent::Pairing);
+        eventually("b shows a code", || async { pending_on(&b, "a").is_some() }).await;
+        b.node.reject_pairing("a");
+        eventually("closed", || async { !hub.is_linked("a", "b") }).await;
+    }
+    eventually("b left pairing mode", || async { !b.node.pairing_mode() }).await;
+    assert_eq!(b.node.mesh_stats().pairing_attempts_exhausted, 1);
+    eventually("d's unconfirmed pairing closes", || async {
+        !hub.is_linked("d", "b")
+    })
+    .await;
+    for m in hub.take_held_for_test("c", "b") {
+        hub.inject_wire_for_test("c", "b", m);
+    }
+    eventually("c's pairing is refused", || async {
+        !hub.is_linked("c", "b")
+    })
+    .await;
+    assert!(b.node.pending_pairings().is_empty());
+    assert!(b.node.contacts().unwrap().is_empty());
 }
