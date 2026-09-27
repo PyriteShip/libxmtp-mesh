@@ -4,9 +4,13 @@
 mod common;
 
 use common::{
-    TestPeer, build_client, eventually, pair_dm, peer, recorded_peer, send_and_see, start_sync,
+    TestPeer, a1_created_dm, build_client, carried_node, eventually, eventually_for, pair_dm, peer,
+    peer_on, recorded_peer, relay_keys_confirmed, relay_peer, revoke_all_other_installations,
+    send_and_see, start_sync,
 };
+use xmtp_cryptography::utils::generate_local_wallet;
 use xmtp_cryptography::{CredentialSign, XmtpInstallationCredential};
+use xmtp_db::group::GroupQueryArgs;
 use xmtp_mesh::frames::{self, Sequenced, frame::Body};
 use xmtp_mesh::sync::seq::{self, SeqProof};
 use xmtp_mesh::{
@@ -332,4 +336,182 @@ async fn a_signer_no_member_log_lists_is_a_wrong_signer() {
         s.seq_rejected_wrong_signer
     })
     .await;
+}
+
+/// §B13 rule 3 with the §C4.7 handover: A1 sequenced the DM, then was
+/// revoked and b took over. Re-pinning to itself, b attests every row it
+/// holds that A1 ordered, so A2, the owner's new installation, fetches the
+/// whole history under b's key alone: b's attestations for A1's rows, then
+/// b's own rows. A row A1 signs at a new id is refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_installation_gets_the_successors_attested_history_after_a_handover() {
+    let hub = LoopbackHub::new();
+    let wallet = generate_local_wallet();
+    let (a, b, b_dm) = a1_created_dm(&hub, &wallet).await;
+    let gid = b_dm.group_id.clone();
+    let inbox = a.client.inbox_id().to_string();
+    let a1_high = b.node.max_group_id_for_test(&gid).unwrap();
+    assert!(a1_high > 0);
+    hub.unlink("a", "b");
+    a.node.stop_sync();
+    let a2 = peer_on(&hub, "a2", carried_node(&a.node, &inbox).await, &wallet).await;
+    revoke_all_other_installations(&a2, &wallet).await;
+    hub.link("a2", "b");
+    eventually("b takes over sequencing", || async {
+        b.node.group_sequencer_for_test(&gid).unwrap() == Some(b.installation())
+    })
+    .await;
+    eventually("b has a2's key package", || async {
+        b.node.has_key_package(&a2.installation()).unwrap()
+    })
+    .await;
+    b_dm.update_installations().await.unwrap();
+    b_dm.send_message(b"after the handover", SendMessageOpts::default())
+        .await
+        .unwrap();
+    eventually("a2 joins", || async {
+        a2.client.sync_welcomes().await.ok();
+        a2.client
+            .find_groups(GroupQueryArgs::default())
+            .unwrap()
+            .iter()
+            .any(|g| g.group_id == gid)
+    })
+    .await;
+    eventually("a2 holds all of b's rows", || async {
+        a2.client.group(&gid).unwrap().sync().await.ok();
+        a2.node.max_group_id_for_test(&gid).unwrap() == b.node.max_group_id_for_test(&gid).unwrap()
+    })
+    .await;
+
+    let rows = a2.node.sequenced_rows_for_test(&gid).unwrap();
+    assert_eq!(rows[0].id, 1, "a2 fetched the history from the start");
+    assert!(rows.last().unwrap().id > a1_high, "b sequenced rows too");
+    let b_key = b.installation();
+    for row in &rows {
+        assert_eq!(row.seq_signer.as_ref(), Some(&b_key), "row {}", row.id);
+        assert_eq!(
+            row.seq_attested,
+            row.id <= a1_high,
+            "row {}: attested iff A1 ordered it",
+            row.id
+        );
+        assert!(
+            seq::verify_proof(
+                &gid,
+                row.id as u64,
+                row.created_ns as u64,
+                &row.data,
+                &row.proof()
+            ),
+            "row {}",
+            row.id
+        );
+    }
+    assert_eq!(rejections(&a2.node.mesh_stats()), 0);
+    assert_eq!(a2.node.group_sequencer_for_test(&gid).unwrap(), Some(b_key));
+
+    let have = a2.node.max_group_id_for_test(&gid).unwrap();
+    let late = StoredGroupMessage {
+        id: have + 1,
+        created_ns: rows.last().unwrap().created_ns + 1,
+        data: b"the revoked phone orders again".to_vec(),
+        ..rows.last().unwrap().clone()
+    };
+    let proof = seq::sign_row(
+        &ClientHelloSigner(a.client.clone()),
+        &gid,
+        late.id as u64,
+        late.created_ns as u64,
+        &late.data,
+    )
+    .unwrap();
+    hub.inject("b", "a2", sequenced(&gid, &[late], vec![proof]));
+    eventually("a2 ends the session", || async {
+        !hub.is_linked("a2", "b")
+    })
+    .await;
+    assert_eq!(a2.node.max_group_id_for_test(&gid).unwrap(), have);
+    let stats = a2.node.mesh_stats();
+    assert_eq!(stats.seq_rejected_wrong_signer, 1, "{stats:?}");
+    assert_eq!(rejections(&stats), 1, "{stats:?}");
+}
+
+/// §B13 rule 4: the sequencer's key signs a second payload for an id b
+/// holds; b keeps both records and signatures and ends the session.
+#[tokio::test(flavor = "multi_thread")]
+async fn one_signer_two_payloads_at_one_id_is_kept_as_equivocation() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    let (a_dm, _) = pair_dm(&hub, &a, &b).await;
+    let gid = a_dm.group_id.clone();
+    eventually("b holds all of a's rows", || async {
+        b.node.max_group_id_for_test(&gid).unwrap() == a.node.max_group_id_for_test(&gid).unwrap()
+    })
+    .await;
+    let held = b.node.sequenced_rows_for_test(&gid).unwrap().pop().unwrap();
+    let forged = StoredGroupMessage {
+        data: b"a second payload for the same id".to_vec(),
+        ..held.clone()
+    };
+    let proof = seq::sign_row(
+        &ClientHelloSigner(a.client.clone()),
+        &gid,
+        forged.id as u64,
+        forged.created_ns as u64,
+        &forged.data,
+    )
+    .unwrap();
+    hub.inject("a", "b", sequenced(&gid, &[forged], vec![proof.clone()]));
+    eventually("b ends the session", || async { !hub.is_linked("a", "b") }).await;
+    let kept = b.node.equivocations_for_test(&gid).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!((kept[0].id, &kept[0].signer), (held.id, &a.installation()));
+    assert_eq!(kept[0].signature_a, held.seq_signature.clone().unwrap());
+    assert_eq!(kept[0].signature_b, proof.signature);
+    assert_eq!(
+        b.node
+            .sequenced_rows_for_test(&gid)
+            .unwrap()
+            .last()
+            .unwrap()
+            .data,
+        held.data,
+        "the stored row stays"
+    );
+    assert_eq!(b.node.mesh_stats().seq_equivocations, 1);
+}
+
+/// §B13 rule 4 over relay: the sequencer's retries re-send rows the joiner
+/// already holds (its acks are lost). They are duplicates, not rejections.
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_retries_of_held_rows_are_not_rejections() {
+    let hub = LoopbackHub::new();
+    let (a, _) = relay_peer(&hub, "a").await;
+    let (b, _) = relay_peer(&hub, "b").await;
+    let (d, _) = relay_peer(&hub, "d").await;
+    let (a_dm, _) = pair_dm(&hub, &a, &d).await;
+    let gid = a_dm.group_id.clone();
+    relay_keys_confirmed(&a, &d, &gid).await;
+    hub.unlink("a", "d");
+    hub.link("a", "b");
+    hub.link("b", "d");
+    d.node.relay_drop_pure_acks_for_test(true);
+    a_dm.send_message(b"acked late", SendMessageOpts::default())
+        .await
+        .ok();
+    eventually_for("d holds all of a's rows", 30, || async {
+        d.node.max_group_id_for_test(&gid).unwrap() == a.node.max_group_id_for_test(&gid).unwrap()
+    })
+    .await;
+    let delivered = d.node.relay_stats().delivered;
+    eventually_for("a re-sends rows d already holds", 30, || async {
+        d.node.relay_stats().delivered >= delivered + 2
+    })
+    .await;
+    let stats = d.node.mesh_stats();
+    assert_eq!(rejections(&stats), 0, "{stats:?}");
+    assert!(d.node.equivocations_for_test(&gid).unwrap().is_empty());
+    drop(b);
 }

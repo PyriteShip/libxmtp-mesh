@@ -1185,6 +1185,153 @@ mod tests {
         );
     }
 
+    /// A node whose DM `dm` is pinned to `seq` (the live installation;
+    /// `former` is the revoked one), holding row 1 and our two pending
+    /// copies `mine a` and `mine b`.
+    async fn joiner_with_two_pending_copies() -> (MeshNode, Members, KeySigner, KeySigner, Vec<u8>)
+    {
+        let (node, inbox, k1, k2) = node_with_a_revoked_and_a_live_installation().await;
+        let (former, seq) = (KeySigner(k1), KeySigner(k2));
+        let gid = b"dm".to_vec();
+        node.inner
+            .store
+            .lock()
+            .pin_sequencer(&gid, &seq.installation_key())
+            .unwrap();
+        let members = Members(Some(vec![inbox]));
+        node.ingest_proven(&gid, vec![signed_row(&seq, &gid, 1, b"one")], &members)
+            .await
+            .unwrap();
+        for data in [b"mine a".as_slice(), b"mine b"] {
+            let copy = NewGroupMessage {
+                group_id: gid.clone(),
+                data: data.to_vec(),
+                sender_hmac: vec![],
+                should_push: true,
+                is_commit: false,
+            };
+            node.inner.store.lock().add_pending(&copy, 1).unwrap();
+        }
+        (node, members, former, seq, gid)
+    }
+
+    /// A `Ref` for `row`'s id and `created_ns` naming the pending copy with
+    /// `data`, carrying `row`'s proof (the envelope's signer).
+    fn ref_to(row: &StoredGroupMessage, data: &[u8]) -> RelayRow {
+        RelayRow {
+            row: Some(Row::Reference(RowRef {
+                id: row.id as u64,
+                created_ns: row.created_ns as u64,
+                data_hash: sha256(data),
+            })),
+            proof: Some(SeqProof {
+                signer: vec![],
+                signature: row.seq_signature.clone().unwrap(),
+                attested: row.seq_attested,
+            }),
+        }
+    }
+
+    /// §R6.3 + §B13: a `Ref` rebuilds the row from the pending copy it
+    /// names, so a valid proof for id 2 over `mine a` attached to a `Ref`
+    /// naming `mine b` is a bad signature, and neither copy is settled.
+    #[tokio::test]
+    async fn a_ref_naming_another_pending_copy_is_a_bad_signature() {
+        let (node, members, _, seq, gid) = joiner_with_two_pending_copies().await;
+        let r2 = signed_row(&seq, &gid, 2, b"mine a");
+        let sync = RelaySync {
+            group_id: gid.clone(),
+            rows: vec![ref_to(&r2, b"mine b")],
+        };
+        let err = apply_sync(&node, &gid, sync, &seq.installation_key(), &members)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, MeshError::SequencingRejected(SeqReject::BadSignature)),
+            "{err}"
+        );
+        assert_eq!(node.max_group_id_for_test(&gid).unwrap(), 1);
+        assert_eq!(node.pending_count_for_test(&gid).unwrap(), 2);
+        assert_eq!(node.mesh_stats().seq_rejected_bad_signature, 1);
+
+        // The honest Ref settles exactly its own copy.
+        let sync = RelaySync {
+            group_id: gid.clone(),
+            rows: vec![ref_to(&r2, b"mine a")],
+        };
+        apply_sync(&node, &gid, sync, &seq.installation_key(), &members)
+            .await
+            .unwrap();
+        assert_eq!(node.max_group_id_for_test(&gid).unwrap(), 2);
+        assert_eq!(
+            node.pending_count_for_test(&gid).unwrap(),
+            1,
+            "mine b is still pending"
+        );
+    }
+
+    /// §R4.6: a rejected payload is dropped whole, so a valid `Ref` in it
+    /// settles nothing: every pending copy stays pending, whatever the
+    /// reason for the rejection.
+    #[tokio::test]
+    async fn a_rejected_relay_payload_leaves_every_pending_copy_pending() {
+        let (node, members, former, seq, gid) = joiner_with_two_pending_copies().await;
+        let r2 = signed_row(&seq, &gid, 2, b"mine a");
+        let r3 = signed_row(&seq, &gid, 3, b"mine b");
+        let full = |r: &StoredGroupMessage, proof: Option<SeqProof>| RelayRow {
+            row: Some(Row::Full(r.to_proto())),
+            proof,
+        };
+        let forged = signed_row(&former, &gid, 4, b"from a revoked key");
+        let mut tampered = signed_row(&seq, &gid, 4, b"four");
+        tampered.data = b"FOUR".to_vec();
+        let payloads: Vec<(Vec<RelayRow>, SeqReject)> = vec![
+            (
+                vec![
+                    ref_to(&r2, b"mine a"),
+                    ref_to(&r3, b"mine b"),
+                    full(&forged, Some(forged.proof())),
+                ],
+                SeqReject::WrongSigner,
+            ),
+            (
+                vec![
+                    ref_to(&r2, b"mine a"),
+                    ref_to(&r3, b"mine b"),
+                    full(&tampered, Some(tampered.proof())),
+                ],
+                SeqReject::BadSignature,
+            ),
+            (
+                vec![
+                    ref_to(&r2, b"mine a"),
+                    ref_to(&r3, b"mine b"),
+                    full(&tampered, None),
+                ],
+                SeqReject::MissingProof,
+            ),
+        ];
+        for (rows, reason) in payloads {
+            let sync = RelaySync {
+                group_id: gid.clone(),
+                rows,
+            };
+            let err = apply_sync(&node, &gid, sync, &seq.installation_key(), &members)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, MeshError::SequencingRejected(r) if *r == reason),
+                "{err}"
+            );
+            assert_eq!(node.max_group_id_for_test(&gid).unwrap(), 1);
+            assert_eq!(
+                node.pending_count_for_test(&gid).unwrap(),
+                2,
+                "after {reason:?}"
+            );
+        }
+    }
+
     fn input(len: usize) -> GroupMessageInput {
         use xmtp_proto::mls_v1::group_message_input;
         GroupMessageInput {

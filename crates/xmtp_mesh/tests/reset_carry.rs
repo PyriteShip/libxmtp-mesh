@@ -8,8 +8,8 @@ mod common;
 
 use alloy::signers::local::PrivateKeySigner;
 use common::{
-    ClientGroupMembership, MeshGroup, TestPeer, app_payloads, association_state, eventually, peer,
-    peer_on, restart_sync, revoke_all_other_installations,
+    ClientGroupMembership, TestPeer, a1_created_dm, app_payloads, association_state, carried_node,
+    eventually, peer, peer_on, restart_sync, revoke_all_other_installations,
 };
 use std::time::Duration;
 use xmtp_cryptography::utils::generate_local_wallet;
@@ -40,21 +40,6 @@ async fn known_to_b(hub: &LoopbackHub, wallet: &PrivateKeySigner) -> (TestPeer, 
     hub.unlink("a", "b");
     a.node.stop_sync();
     (a, b)
-}
-
-/// The reset path rotates twice (stopAndRotate, then forClient because the
-/// libxmtp DB is gone); each rotation carries the log.
-async fn carried_node(old: &MeshNode, inbox_id: &str) -> MeshNode {
-    let mid = MeshNode::in_memory().unwrap();
-    mid.import_identity_log(inbox_id, old.identity_log(inbox_id).unwrap())
-        .await
-        .unwrap();
-    let fresh = MeshNode::in_memory().unwrap();
-    fresh
-        .import_identity_log(inbox_id, mid.identity_log(inbox_id).unwrap())
-        .await
-        .unwrap();
-    fresh
 }
 
 /// The bug, pinned: without a carry the new installation's node re-creates
@@ -415,49 +400,6 @@ async fn a_dm_the_peer_created_before_the_reset_keeps_working_after_a_carried_re
         app_payloads(&b_dm).contains(&b"a2 replies".to_vec())
     })
     .await;
-}
-
-/// `a` (A1) creates a DM with `b` before the reset and they exchange a
-/// message each way. Returns (a, b, b's copy of the DM).
-async fn a1_created_dm(
-    hub: &LoopbackHub,
-    wallet: &PrivateKeySigner,
-) -> (TestPeer, TestPeer, MeshGroup) {
-    let a = peer_on(hub, "a", MeshNode::in_memory().unwrap(), wallet).await;
-    let b = peer(hub, "b").await;
-    hub.link("a", "b");
-    eventually("b has a's key package", || async {
-        b.node.has_key_package(&a.installation()).unwrap()
-    })
-    .await;
-    let a_dm = a
-        .client
-        .find_or_create_dm(b.client.inbox_id(), None)
-        .await
-        .unwrap();
-    a_dm.send_message(b"hi from a1", SendMessageOpts::default())
-        .await
-        .unwrap();
-    eventually("b receives the welcome", || async {
-        b.client.sync_welcomes().await.unwrap();
-        b.client
-            .find_groups(GroupQueryArgs::default())
-            .unwrap()
-            .len()
-            == 1
-    })
-    .await;
-    let b_dm = b
-        .client
-        .find_groups(GroupQueryArgs::default())
-        .unwrap()
-        .remove(0);
-    eventually("b sees hi from a1", || async {
-        b_dm.sync().await.ok();
-        app_payloads(&b_dm) == vec![b"hi from a1".to_vec()]
-    })
-    .await;
-    (a, b, b_dm)
 }
 
 /// Fixed by the §C4.7 sequencer handover (before it, this was

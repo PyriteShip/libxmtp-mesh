@@ -648,3 +648,61 @@ pub fn relay_hashes(frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
         })
         .collect()
 }
+
+/// The reset path rotates twice (stopAndRotate, then forClient because the
+/// libxmtp DB is gone); each rotation carries the log.
+pub async fn carried_node(old: &MeshNode, inbox_id: &str) -> MeshNode {
+    let mid = MeshNode::in_memory().unwrap();
+    mid.import_identity_log(inbox_id, old.identity_log(inbox_id).unwrap())
+        .await
+        .unwrap();
+    let fresh = MeshNode::in_memory().unwrap();
+    fresh
+        .import_identity_log(inbox_id, mid.identity_log(inbox_id).unwrap())
+        .await
+        .unwrap();
+    fresh
+}
+
+/// `a` (A1) creates a DM with `b` before the reset and they exchange a
+/// message each way. Returns (a, b, b's copy of the DM).
+pub async fn a1_created_dm(
+    hub: &LoopbackHub,
+    wallet: &PrivateKeySigner,
+) -> (TestPeer, TestPeer, MeshGroup) {
+    let a = peer_on(hub, "a", MeshNode::in_memory().unwrap(), wallet).await;
+    let b = peer(hub, "b").await;
+    hub.link("a", "b");
+    eventually("b has a's key package", || async {
+        b.node.has_key_package(&a.installation()).unwrap()
+    })
+    .await;
+    let a_dm = a
+        .client
+        .find_or_create_dm(b.client.inbox_id(), None)
+        .await
+        .unwrap();
+    a_dm.send_message(b"hi from a1", SendMessageOpts::default())
+        .await
+        .unwrap();
+    eventually("b receives the welcome", || async {
+        b.client.sync_welcomes().await.unwrap();
+        b.client
+            .find_groups(GroupQueryArgs::default())
+            .unwrap()
+            .len()
+            == 1
+    })
+    .await;
+    let b_dm = b
+        .client
+        .find_groups(GroupQueryArgs::default())
+        .unwrap()
+        .remove(0);
+    eventually("b sees hi from a1", || async {
+        b_dm.sync().await.ok();
+        app_payloads(&b_dm) == vec![b"hi from a1".to_vec()]
+    })
+    .await;
+    (a, b, b_dm)
+}
