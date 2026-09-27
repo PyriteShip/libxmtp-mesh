@@ -92,6 +92,9 @@ pub(crate) struct NodeInner {
     pub(crate) relay_links: Mutex<HashMap<PeerId, (Vec<u8>, String)>>,
     /// Signed-sequencing counters, shared with the store (§B13).
     pub(crate) seq: Arc<crate::sync::seq::SeqCounters>,
+    /// Test only: the order `stop_sync`'s teardown steps ran in.
+    #[cfg(test)]
+    pub(crate) stop_sync_order: Mutex<Vec<&'static str>>,
 }
 
 /// Default time an authenticated peer has to prove inbox membership.
@@ -201,6 +204,8 @@ impl MeshNode {
                 relay: Mutex::new(None),
                 relay_links: Mutex::new(HashMap::new()),
                 seq,
+                #[cfg(test)]
+                stop_sync_order: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -337,14 +342,25 @@ impl MeshNode {
         // stored before signed sequencing) before a session, the relay or
         // the handover below can serve it; and attest, as ours, held rows
         // another installation signed in groups pinned to us (a §C4.7
-        // re-pin that ran while no signer was set). If the backfill errors (e.g. the
-        // signer fails), `?` returns before `sync` is set: sync never
-        // started, and the next `start_sync` retries the backfill from
-        // scratch (unsigned rows are untouched by a failed attempt).
+        // re-pin that ran while no signer was set). If the backfill errors
+        // (e.g. the signer fails), the signer is cleared before returning:
+        // sync never started, so nothing must be left holding the
+        // Client-backed signer's reference back to this node, and the next
+        // `start_sync` retries the backfill from scratch (unsigned rows are
+        // untouched by a failed attempt).
         {
             let mut store = self.inner.store.lock();
             store.set_seq_signer(signer.clone());
-            let signed = store.sign_unsigned_rows()? + store.attest_foreign_rows(None)?;
+            let backfilled = store
+                .sign_unsigned_rows()
+                .and_then(|a| store.attest_foreign_rows(None).map(|b| a + b));
+            let signed = match backfilled {
+                Ok(signed) => signed,
+                Err(e) => {
+                    store.clear_seq_signer();
+                    return Err(e);
+                }
+            };
             if signed > 0 {
                 tracing::info!(
                     signed,
@@ -423,13 +439,17 @@ impl MeshNode {
     /// this node, so keeping it past `stop_sync` would keep the node, and
     /// its database, from ever being dropped after logout. Rows sequenced
     /// while stopped stay unsigned until the next `start_sync`'s backfill.
+    ///
+    /// The signer is cleared last, after every session and the relay are
+    /// torn down: a still-live session's push or the relay's `pack_sync`
+    /// reads the signer to decide whether a row has a proof, and clearing it
+    /// first would let a row sequenced in this window be served unsigned.
     pub fn stop_sync(&self) {
         // See `start_sync`.
         let _lifecycle = self.inner.sync_lifecycle.lock();
         if let Some(task) = self.inner.identity_task.lock().take() {
             task.abort();
         }
-        self.inner.store.lock().clear_seq_signer();
         let mut sync = self.inner.sync.lock();
         *sync = None;
         let mut sessions = self.inner.sessions.lock();
@@ -441,6 +461,14 @@ impl MeshNode {
         drop(sync);
         self.disable_relay_locked();
         drop(old);
+        #[cfg(test)]
+        self.inner
+            .stop_sync_order
+            .lock()
+            .push("sessions_and_relay_torn_down");
+        self.inner.store.lock().clear_seq_signer();
+        #[cfg(test)]
+        self.inner.stop_sync_order.lock().push("signer_cleared");
     }
 
     pub fn authenticated_peers(&self) -> Vec<PeerId> {
@@ -620,5 +648,113 @@ mod session_registry_tests {
         node.session_ended("p", 2);
         assert!(node.authenticated_peers().is_empty());
         assert!(!node.inner.sessions.lock().contains_key("p"));
+    }
+}
+
+#[cfg(test)]
+mod sync_lifecycle_tests {
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::store::NewGroupMessage;
+    use crate::sync::{GroupMembership, HelloSigner, LoopbackHub};
+
+    struct NoGroups;
+
+    #[async_trait]
+    impl GroupMembership for NoGroups {
+        async fn member_inboxes(&self, _group_id: &[u8]) -> Result<Option<Vec<String>>, MeshError> {
+            Ok(None)
+        }
+    }
+
+    /// §B13: `stop_sync` must clear the store's signer only after sessions
+    /// and the relay are torn down, so nothing still live in that window
+    /// can read the signer as already gone and serve or pack a row
+    /// unsigned.
+    #[test]
+    fn stop_sync_clears_the_signer_after_sessions_and_relay_are_torn_down() {
+        let node = MeshNode::in_memory().unwrap();
+        node.stop_sync();
+        assert_eq!(
+            *node.inner.stop_sync_order.lock(),
+            vec!["sessions_and_relay_torn_down", "signer_cleared"],
+        );
+    }
+
+    struct FailingSigner(Vec<u8>);
+
+    impl HelloSigner for FailingSigner {
+        fn installation_key(&self) -> Vec<u8> {
+            self.0.clone()
+        }
+
+        fn sign(&self, _text: &str) -> Result<Vec<u8>, MeshError> {
+            Err(MeshError::AuthFailed("signer unavailable".into()))
+        }
+    }
+
+    /// §B13: a `start_sync` whose backfill fails (the signer errors) must
+    /// not leave the store holding that signer. If it did, a `Client`-backed
+    /// signer would keep the node (and its database) alive past logout, and
+    /// every row sequenced until the next `start_sync` would fail to store
+    /// at all (this test's own row-append would fail too, since the same
+    /// failing signer would still be asked to sign it).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_start_sync_clears_the_signer() {
+        let node = MeshNode::in_memory().unwrap();
+        let key = b"a-failing-installation-key".to_vec();
+        node.inner
+            .store
+            .lock()
+            .set_local_installation(&key)
+            .unwrap();
+        // An unsigned row already stored, so the backfill actually reaches
+        // the signer instead of returning early with nothing to sign.
+        node.inner
+            .store
+            .lock()
+            .append_sequenced(
+                &NewGroupMessage {
+                    group_id: b"g".to_vec(),
+                    data: b"one".to_vec(),
+                    sender_hmac: vec![],
+                    should_push: true,
+                    is_commit: false,
+                },
+                1,
+            )
+            .unwrap();
+
+        let hub = LoopbackHub::new();
+        let err = node.start_sync(
+            Arc::new(FailingSigner(key)),
+            hub.transport_for("a"),
+            Arc::new(NoGroups),
+        );
+        assert!(err.is_err(), "the backfill's signing error must propagate");
+
+        // If the signer were still held, this would fail too (signing "two"
+        // with the same failing signer): it succeeds only because start_sync
+        // cleared it.
+        let (row, _) = node
+            .inner
+            .store
+            .lock()
+            .append_sequenced(
+                &NewGroupMessage {
+                    group_id: b"g".to_vec(),
+                    data: b"two".to_vec(),
+                    sender_hmac: vec![],
+                    should_push: true,
+                    is_commit: false,
+                },
+                2,
+            )
+            .unwrap();
+        assert!(
+            row.seq_signer.is_none(),
+            "no signer means unsigned, not a signing error"
+        );
     }
 }
