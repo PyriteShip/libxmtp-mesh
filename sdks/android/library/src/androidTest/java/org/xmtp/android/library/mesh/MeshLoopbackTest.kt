@@ -14,6 +14,8 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -195,6 +197,51 @@ class MeshLoopbackTest {
                 assertSame(radio, Mesh.radio)
                 Mesh.stop(context)
                 assertFalse(Mesh.relay.value.active)
+            } finally {
+                Mesh.stop(context)
+                runCatching { client.ffiClientForMesh.close() }
+            }
+        }
+
+    /**
+     * Signed sequencing over the real bindings (DESIGN.md §B13): one node signs the rows it
+     * orders, the other checks them, and nothing is refused.
+     */
+    @Test
+    fun signedSequencingCountersMoveOverLoopback() =
+        runBlocking {
+            val (alix, a, bo, b) = connectedPair()
+            val dm = retrying("create DM", 60_000) { alix.conversations.findOrCreateDm(bo.inboxId) }
+            dm.send("signed hello")
+            eventually("bo receives") { hasMessage(bo, "signed hello") }
+            val sa = a.node.meshStats()
+            val sb = b.node.meshStats()
+            assertTrue("rows signed on some node", sa.seqRowsSigned + sb.seqRowsSigned > 0uL)
+            assertTrue("rows checked on some node", sa.seqRowsVerified + sb.seqRowsVerified > 0uL)
+            for (s in listOf(sa, sb)) {
+                assertEquals(0uL, s.seqRejectedMissingProof)
+                assertEquals(0uL, s.seqRejectedBadSignature)
+                assertEquals(0uL, s.seqRejectedWrongSigner)
+                assertEquals(0uL, s.seqEquivocations)
+                assertEquals(0uL, s.peersRejectedVersion)
+            }
+        }
+
+    /**
+     * Mesh.stats() follows the node Mesh.start opens: present while running, null after stop.
+     * Rejection counters are not asserted: a nearby phone on an older build may be refused.
+     * Needs the Nearby-devices runtime permissions already granted to the test APK.
+     */
+    @Test
+    fun statsFollowTheRunningMesh() =
+        runBlocking {
+            val (client, options) = meshClient("stats")
+            try {
+                assertNull(Mesh.stats())
+                Mesh.start(context, client, options)
+                assertNotNull(Mesh.stats())
+                Mesh.stop(context)
+                assertNull(Mesh.stats())
             } finally {
                 Mesh.stop(context)
                 runCatching { client.ffiClientForMesh.close() }

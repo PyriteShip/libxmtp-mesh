@@ -16,6 +16,7 @@ import kotlinx.coroutines.withContext
 import org.xmtp.android.library.Client
 import uniffi.xmtpv3.FfiMeshIdentityStream
 import uniffi.xmtpv3.FfiMeshNode
+import uniffi.xmtpv3.FfiMeshStats
 import uniffi.xmtpv3.FfiRelayStats
 import uniffi.xmtpv3.FfiXmtpClient
 import uniffi.xmtpv3.openMeshNode
@@ -42,7 +43,7 @@ object Mesh {
     var radio: MeshRadio? = null
         private set
 
-    // Read without the lock by relayStats().
+    // Read without the lock by relayStats() and stats().
     @Volatile
     private var node: FfiMeshNode? = null
     private var relayClient: FfiXmtpClient? = null
@@ -207,6 +208,14 @@ object Mesh {
 
     /** Relay counters of the running node, or null when stopped. */
     fun relayStats(): FfiRelayStats? = node?.relayStats()
+
+    /**
+     * Signed-sequencing counters of the running node (DESIGN.md §B13): rows this node signed
+     * and checked, rows refused by reason, conflicting copies kept as proof, and peers refused
+     * for an older protocol version. Counted since the node was opened, so they start at zero
+     * on every [start]. Null when stopped.
+     */
+    fun stats(): FfiMeshStats? = node?.meshStats()
 
     private suspend fun onBattery(
         percent: Int,
