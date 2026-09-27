@@ -653,6 +653,7 @@ async fn a_revoked_installation_that_is_still_alive_cannot_sequence() {
             group_id: b_dm.group_id.clone(),
             messages: vec![forged],
             sender_is_sequencer: true,
+            proofs: vec![],
         })),
     );
     tokio::time::sleep(Duration::from_millis(500)).await;

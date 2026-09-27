@@ -12,6 +12,7 @@ use crate::MeshError;
 use crate::mls_parse::parse_group_message;
 use crate::store::{NewGroupMessage, StoredGroupMessage, sha256};
 use crate::sync::frames::{MAX_FRAME_LEN, single_message_frame_len};
+use crate::sync::seq::{self, SeqProof};
 
 fn check_frame_len(group_id: &[u8], v1: &group_message_input::V1) -> Result<(), MeshError> {
     let len = single_message_frame_len(group_id, v1);
@@ -36,6 +37,36 @@ impl StoredGroupMessage {
                 is_commit: self.is_commit,
             })),
         }
+    }
+
+    /// A received row with its proof (§B13). `default_signer` fills an empty
+    /// `proof.signer` (a relayed row signed by the envelope's signer,
+    /// §R4.6). `is_commit` is not signed, so it is re-derived from `data`
+    /// when `data` parses as MLS. `None` for a message without V1.
+    pub fn from_proto(
+        message: GroupMessage,
+        proof: Option<&SeqProof>,
+        default_signer: Option<&[u8]>,
+    ) -> Option<Self> {
+        let Some(group_message::Version::V1(v1)) = message.version else {
+            return None;
+        };
+        let (seq_signer, seq_signature, seq_attested) = seq::proof_fields(proof, default_signer);
+        let is_commit = parse_group_message(&v1.data)
+            .map(|p| p.is_commit)
+            .unwrap_or(v1.is_commit);
+        Some(Self {
+            group_id: v1.group_id,
+            id: v1.id as i64,
+            created_ns: v1.created_ns as i64,
+            data: v1.data,
+            sender_hmac: v1.sender_hmac,
+            should_push: v1.should_push,
+            is_commit,
+            seq_signer,
+            seq_signature,
+            seq_attested,
+        })
     }
 }
 

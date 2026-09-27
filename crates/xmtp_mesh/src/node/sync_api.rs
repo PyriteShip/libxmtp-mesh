@@ -14,6 +14,7 @@ use crate::MeshError;
 use crate::mls_parse::{parse_group_message, verify_key_package};
 use crate::store::{InsertOutcome, NewGroupMessage, StoredGroupMessage, sha256};
 use crate::sync::frames::{IdentityLog, Interest, KeyPackage, Welcome};
+use crate::sync::seq::SeqProof;
 
 /// Longest identity log accepted from a peer. Under D7 (one installation per
 /// inbox) an honest log stays far shorter; the cap bounds what a peer can
@@ -396,20 +397,21 @@ impl MeshNode {
             .pin_sequencer(group_id, installation)
     }
 
-    /// Up to `limit` sequenced messages with `id > high`, oldest first.
+    /// Up to `limit` sequenced messages with `id > high`, oldest first, each
+    /// with its sequencing proof (§B13).
     pub(crate) fn sequenced_after(
         &self,
         group_id: &[u8],
         high: i64,
         limit: usize,
-    ) -> Result<Vec<GroupMessage>, MeshError> {
+    ) -> Result<Vec<(GroupMessage, SeqProof)>, MeshError> {
         Ok(self
             .inner
             .store
             .lock()
             .query_group(group_id, high, limit as i64, false)?
             .iter()
-            .map(StoredGroupMessage::to_proto)
+            .map(|row| (row.to_proto(), row.proof()))
             .collect())
     }
 

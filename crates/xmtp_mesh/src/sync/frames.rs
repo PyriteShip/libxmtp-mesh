@@ -4,6 +4,7 @@ use xmtp_proto::mls_v1::{
 };
 use xmtp_proto::xmtp::identity::api::v1::get_identity_updates_response::IdentityUpdateLog;
 
+use super::seq::SeqProof;
 use crate::MeshError;
 
 pub const FRAME_VERSION: u32 = 1;
@@ -48,9 +49,20 @@ pub(crate) fn pages<T>(items: Vec<T>, size: impl Fn(&T) -> usize) -> Vec<Vec<T>>
     pages
 }
 
+/// The `Sequenced` frame for one page of rows and their proofs, in order.
+pub(crate) fn sequenced_frame(group_id: &[u8], page: Vec<(GroupMessage, SeqProof)>) -> Sequenced {
+    let (messages, proofs) = page.into_iter().unzip();
+    Sequenced {
+        group_id: group_id.to_vec(),
+        messages,
+        sender_is_sequencer: true,
+        proofs,
+    }
+}
+
 /// Encoded length of the larger of the two frames that carry `input` alone
 /// for `group_id`: `Pending` (to the sequencer) and `Sequenced` (from it,
-/// with worst-case id and timestamp). A message for which this exceeds
+/// with worst-case id, timestamp and proof). A message for which this exceeds
 /// [`MAX_FRAME_LEN`] could never be synced.
 pub(crate) fn single_message_frame_len(group_id: &[u8], input: &group_message_input::V1) -> usize {
     let frame_len = |body| {
@@ -82,6 +94,12 @@ pub(crate) fn single_message_frame_len(group_id: &[u8], input: &group_message_in
             })),
         }],
         sender_is_sequencer: true,
+        // The largest proof a row carries (§B13): an attestation.
+        proofs: vec![SeqProof {
+            signer: vec![0; 32],
+            signature: vec![0; 64],
+            attested: true,
+        }],
     }));
     pending.max(sequenced)
 }
@@ -216,6 +234,9 @@ pub struct Sequenced {
     pub messages: Vec<GroupMessage>,
     #[prost(bool, tag = "3")]
     pub sender_is_sequencer: bool,
+    /// One sequencing proof per entry in `messages`, same order (§B13).
+    #[prost(message, repeated, tag = "4")]
+    pub proofs: Vec<SeqProof>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -332,6 +353,104 @@ mod tests {
                 vec![10 * kib]
             ]
         );
+    }
+
+    fn message(id: u64, len: usize) -> GroupMessage {
+        GroupMessage {
+            version: Some(group_message::Version::V1(group_message::V1 {
+                id,
+                created_ns: id,
+                group_id: b"g".to_vec(),
+                data: vec![0; len],
+                sender_hmac: vec![],
+                should_push: true,
+                is_commit: false,
+            })),
+        }
+    }
+
+    fn data_len(m: &GroupMessage) -> usize {
+        match &m.version {
+            Some(group_message::Version::V1(v1)) => v1.data.len(),
+            None => 0,
+        }
+    }
+
+    /// §B13: a page cut by bytes (two 100 KiB rows mid-batch) keeps every
+    /// proof next to its own message.
+    #[test]
+    fn sequenced_pages_keep_each_proof_with_its_message() {
+        let kib = 1024;
+        let batch: Vec<(GroupMessage, SeqProof)> = (1..=70u64)
+            .map(|id| {
+                let len = if id == 11 || id == 12 { 100 * kib } else { 10 };
+                let proof = SeqProof {
+                    signer: vec![1; 32],
+                    signature: id.to_be_bytes().repeat(8),
+                    attested: false,
+                };
+                (message(id, len), proof)
+            })
+            .collect();
+        let frames: Vec<Sequenced> = pages(batch, |(m, _)| data_len(m))
+            .into_iter()
+            .map(|page| sequenced_frame(b"g", page))
+            .collect();
+        assert_eq!(
+            frames.iter().map(|f| f.messages.len()).collect::<Vec<_>>(),
+            vec![11, 59],
+            "cut by bytes, not by count"
+        );
+        let mut seen = 0;
+        for f in &frames {
+            assert!(f.sender_is_sequencer);
+            assert_eq!(f.messages.len(), f.proofs.len());
+            for (m, p) in f.messages.iter().zip(&f.proofs) {
+                let Some(group_message::Version::V1(v1)) = &m.version else {
+                    panic!("no V1");
+                };
+                assert_eq!(p.signature[..8], v1.id.to_be_bytes());
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 70);
+    }
+
+    /// §B13: the single-message bound counts the proof, so a message whose
+    /// frame fits only without one is refused at publish.
+    #[test]
+    fn the_single_message_frame_bound_counts_the_proof() {
+        let input = |len: usize| group_message_input::V1 {
+            data: vec![0; len],
+            sender_hmac: vec![],
+            should_push: true,
+        };
+        let unproven_len = |len: usize| {
+            encode(frame::Body::Sequenced(Sequenced {
+                group_id: b"g".to_vec(),
+                messages: vec![GroupMessage {
+                    version: Some(group_message::Version::V1(group_message::V1 {
+                        id: u64::MAX,
+                        created_ns: u64::MAX,
+                        group_id: b"g".to_vec(),
+                        data: vec![0; len],
+                        sender_hmac: vec![],
+                        should_push: true,
+                        is_commit: true,
+                    })),
+                }],
+                sender_is_sequencer: true,
+                proofs: vec![],
+            }))
+            .len()
+        };
+        // The largest message whose frame would fit without a proof.
+        let mut len = MAX_FRAME_LEN;
+        while unproven_len(len) > MAX_FRAME_LEN {
+            len -= 1;
+        }
+        assert!(single_message_frame_len(b"g", &input(len)) > MAX_FRAME_LEN);
+        assert!(single_message_frame_len(b"g", &input(len - 128)) <= MAX_FRAME_LEN);
     }
 
     #[test]

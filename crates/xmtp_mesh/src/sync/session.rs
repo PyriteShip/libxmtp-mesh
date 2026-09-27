@@ -968,15 +968,11 @@ impl Session {
             let pages = if batch.is_empty() {
                 vec![vec![]]
             } else {
-                frames::pages(batch, message_len)
+                frames::pages(batch, |(m, _)| message_len(m))
             };
-            for messages in pages {
-                high = messages.last().map_or(high, message_id);
-                let frame = Sequenced {
-                    group_id: group_id.to_vec(),
-                    messages,
-                    sender_is_sequencer: true,
-                };
+            for page in pages {
+                high = page.last().map_or(high, |(m, _)| message_id(m));
+                let frame = frames::sequenced_frame(group_id, page);
                 if !self.try_send(Body::Sequenced(frame)) {
                     return Ok(()); // oversized (logged) or cancelled
                 }
@@ -1069,8 +1065,9 @@ impl Session {
         Ok(())
     }
 
-    /// Accepted only from the group's pinned sequencer (a member); on a gap,
-    /// ask again from what we hold.
+    /// Accepted only from the group's pinned sequencer (a member), and only
+    /// if the whole frame passes the §B13 accept rule (a refused frame ends
+    /// the session); on a gap, ask again from what we hold.
     async fn on_sequenced(&mut self, sequenced: Sequenced) -> Result<(), MeshError> {
         let gid = sequenced.group_id.clone();
         if !self.node.is_known_group(&gid)? {
@@ -1092,7 +1089,14 @@ impl Session {
         if sequencer != peer {
             return Ok(());
         }
-        if let Some(have) = self.node.ingest_sequenced(&gid, sequenced.messages)? {
+        let rows =
+            crate::node::sequencing::rows_from_sequenced(sequenced.messages, sequenced.proofs)
+                .map_err(|reason| self.node.reject_sequencing(reason))?;
+        if let Some(have) = self
+            .node
+            .ingest_proven(&gid, rows, self.membership.as_ref())
+            .await?
+        {
             self.send(Body::Interest(Interest {
                 group_id: gid.clone(),
                 high_id: have as u64,
@@ -1174,11 +1178,10 @@ impl Session {
                     && self.node.sequencer_of(&row.group_id)?.as_deref() == Some(local.as_slice())
                     && self.peer_membership(&row.group_id).await == Membership::Member
                 {
-                    self.send(Body::Sequenced(Sequenced {
-                        group_id: row.group_id.clone(),
-                        messages: vec![row.to_proto()],
-                        sender_is_sequencer: true,
-                    }));
+                    self.send(Body::Sequenced(frames::sequenced_frame(
+                        &row.group_id,
+                        vec![(row.to_proto(), row.proof())],
+                    )));
                 }
                 Ok(())
             }

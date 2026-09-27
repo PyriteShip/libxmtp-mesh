@@ -102,7 +102,7 @@ impl MeshNode {
 
     /// Replays one inbox's held log: every installation id it has ever
     /// added, and the ones still live. `Ok(None)` for an empty log.
-    async fn replay_inbox_log(
+    pub(crate) async fn replay_inbox_log(
         &self,
         inbox_id: &str,
     ) -> Result<Option<(HashSet<Vec<u8>>, HashSet<Vec<u8>>)>, MeshError> {

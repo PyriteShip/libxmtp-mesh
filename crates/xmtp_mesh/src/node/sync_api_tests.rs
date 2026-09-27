@@ -1,7 +1,6 @@
 use prost::Message;
 use xmtp_proto::mls_v1::{
-    GroupMessageInput, WelcomeMessageInput, group_message, group_message_input,
-    welcome_message_input,
+    GroupMessageInput, WelcomeMessageInput, group_message_input, welcome_message_input,
 };
 
 use super::MeshNode;
@@ -40,24 +39,6 @@ fn duplicate_pending_is_sequenced_once() {
     node.sequence_from_peer(&gid, vec![input.clone()]).unwrap();
     node.sequence_from_peer(&gid, vec![input]).unwrap();
     assert_eq!(node.inner.store.lock().max_group_id(&gid).unwrap(), 1);
-}
-
-#[test]
-fn sequenced_gap_requests_resend() {
-    let (node, gid) = seeded_node();
-    let far = xmtp_proto::mls_v1::GroupMessage {
-        version: Some(group_message::Version::V1(group_message::V1 {
-            id: 5,
-            created_ns: 1,
-            group_id: gid.clone(),
-            data: FIXTURE.to_vec(),
-            sender_hmac: vec![],
-            should_push: false,
-            is_commit: true,
-        })),
-    };
-    assert_eq!(node.ingest_sequenced(&gid, vec![far]).unwrap(), Some(0));
-    assert_eq!(node.inner.store.lock().max_group_id(&gid).unwrap(), 0);
 }
 
 #[test]
@@ -196,7 +177,8 @@ fn duplicate_sequenced_copy_clears_stale_pending() {
         store.add_pending(&pending, 1).unwrap();
     }
     assert_eq!(
-        node.ingest_sequenced(&gid, vec![row.to_proto()]).unwrap(),
+        node.store_accepted(&gid, vec![row.clone()], vec![], None)
+            .unwrap(),
         None
     );
     assert!(

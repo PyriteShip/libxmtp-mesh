@@ -102,6 +102,7 @@ async fn verified_stranger_cannot_hijack_or_read_a_dm() {
         group_id: gid.clone(),
         messages: vec![],
         sender_is_sequencer: true,
+        proofs: vec![],
     };
     hub.inject("c", "b", frames::encode(Body::Sequenced(claim)));
     tokio::time::sleep(Duration::from_millis(300)).await;
