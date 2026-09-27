@@ -236,7 +236,6 @@ async fn an_untampered_frame_is_stored() {
     .await;
     assert_eq!(u.b.node.mesh_stats().seq_rows_verified, verified + 2);
     assert!(u.hub.is_linked("a", "b"));
-    let _ = &u.a;
 }
 
 #[tokio::test(flavor = "multi_thread")]

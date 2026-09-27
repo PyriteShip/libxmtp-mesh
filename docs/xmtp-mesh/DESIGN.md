@@ -9,7 +9,7 @@ Status: **experimental, not audited, not protest-safe** (see §R9 and §B12).
 
 This document has three parts:
 
-- **Part B — Base mesh** (§B1–§B12): the direct, one-hop mesh. Two phones in
+- **Part B — Base mesh** (§B1–§B13): the direct, one-hop mesh. Two phones in
   BLE range sync DMs.
 - **Part C — Restore convergence** (§C1–§C7): what happens when an inbox's
   identity log forks after a restore, and how every node converges on one log.
@@ -68,6 +68,7 @@ Goals of the base mesh:
 | D21 | When a node rotates for a new installation of a known inbox, carry the inbox's identity log into the new node (§B10.2) | Let peers accept a second `CreateInbox` (that is Part C, for the case with no old node) |
 | D22 | The BLE short id is per node (inbox + generation), not per install; the old install-wide id is deleted, never migrated (§B10.3) | One short id per install (links every identity the install ever used) |
 | D23 | A link with no inbound packet for 24 s is closed; idle links are pinged every 8 s (§B7.3) | Trust the platform's "connected" state |
+| D30 | Every sequenced row carries a signature by the installation that ordered it, over a record shaped like XMTP d14n's originator envelope; every node checks it before storing a row, and mesh.10 syncs only with mesh.10 (§B13) | A signature per frame (lost once rows are stored); a hash chain (broken by §C4.7 id reuse); a mixed-version transition period |
 
 ### Known privacy limitation of D9
 
@@ -150,14 +151,14 @@ larger message goes alone).
 
 | Tag | Body | Purpose |
 |---|---|---|
-| 10 | `Hello{installation_key, inbox_id, challenge, relay}` | Start of the handshake (§B5.3). `relay` is the relay version the sender speaks (§R7). |
+| 10 | `Hello{installation_key, inbox_id, challenge, relay, seq}` | Start of the handshake (§B5.3). `relay` is the relay version the sender speaks (§R7); `seq` the signed-sequencing version (1; a peer below it is refused, §B13). |
 | 11 | `Auth{signature, challenge}` | Answers the peer's challenge. |
 | 12 | `IdentityLog{inbox_id, updates}` | An inbox's identity log. |
 | 13 | `KeyPackage{installation_key, key_package}` | The sender's own key package. |
 | 14 | `Welcome{envelope_hash, input}` | A welcome for the receiving installation. |
 | 15 | `WelcomeAck{envelope_hash}` | The receiver stored the welcome; the sender drops its outbound copy. |
 | 16 | `Interest{group_id, high_id, i_am_sequencer}` | "I know this group up to id N" (pull sync). |
-| 17 | `Sequenced{group_id, messages, sender_is_sequencer}` | Sequenced group messages. |
+| 17 | `Sequenced{group_id, messages, sender_is_sequencer, proofs}` | Sequenced group messages, each with its sequencing proof (`proofs[i]` for `messages[i]`, §B13). |
 | 18 | `Pending{group_id, messages}` | Unsequenced messages for the sequencer. |
 | 19 | `IdentityConflict(IdentityLog)` | "My log of this inbox beats yours" (§C4.2). |
 | 20–24 | `Relay`, `SpoolDigest`, `SpoolWant`, `RelayKeyOffer`, `RelayKeyAck` | Multi-hop relay (§R4.1). |
@@ -213,7 +214,8 @@ short id is never an identity.
    installation keys. A Hello carrying our own key is rejected (reflection).
    A Hello received before we are authenticated makes us re-send ours (a
    bounded number of times), so a lost first Hello does not stall the link. An
-   unauthenticated session is closed after the handshake timeout.
+   unauthenticated session is closed after the handshake timeout. A Hello
+   whose `seq` is below 1 ends the session (§B13).
 2. **Identity.** Each side sends its own inbox's `IdentityLog` and its
    `KeyPackage`. The peer is **verified** once its authenticated installation
    is in its claimed inbox's log (§C4.2 covers logs that differ). A peer that
@@ -225,7 +227,9 @@ short id is never an identity.
    §B5.2), each side sends `Interest{group_id, high_id, i_am_sequencer}`.
 5. **Fill and sequence.** The sequencer answers with `Sequenced` rows after
    the peer's `high_id`; the joiner sends its unsequenced messages as
-   `Pending`; the sequencer assigns ids, persists and pushes them back.
+   `Pending`; the sequencer assigns ids, signs and persists the rows and
+   pushes them back; every row travels with its proof and is checked before
+   it is stored (§B13).
 6. **Live.** While connected, new rows stream immediately on the same path.
 
 "Authenticated" means exactly: *a live holder of installation key K answered
@@ -426,8 +430,8 @@ The signed text binds both installation keys, and a Hello that carries the
 receiver's own key is rejected. What "authenticated" means is exactly this:
 **a live holder of installation key K answered through this pipe.** It does
 not bind the pipe to K, and frames after the handshake carry no per-frame
-authentication. This is accepted for now and fixed by the Noise upgrade
-(§B11 item 2) together with signed sequencing.
+authentication. Signed sequencing records (§B13) removed attack 3 below; the
+rest waits for the Noise upgrade (§B11 item 2).
 
 ### The attack
 
@@ -459,10 +463,10 @@ sessions.
 1. **Watch metadata**: group ids, sizes, timing, who syncs with whom. Under
    D9 most of this already leaks to anyone nearby.
 2. **Drop or delay frames**, selectively. Victims see "queued", not an error.
-3. **Reorder or re-number sequenced messages.** `Sequenced` frames are
-   trusted because they arrive on the session authenticated as the sequencer,
-   not because each message is signed. Diverging orders can fork the MLS
-   state and force a conversation reset (§B8).
+3. **Reorder or re-number sequenced messages: fixed by §B13.** Every row
+   carries a signature by the installation that ordered it, and every node
+   checks it before storing; a reordered, renumbered or altered row is
+   refused and the session ends.
 4. **Inject unsigned protocol frames within one relayed session**, using only
    the relayed victim's identity (and only for groups it really is a member
    of). For example a forged `WelcomeAck` deletes an undelivered outbound
@@ -471,22 +475,139 @@ sessions.
 5. **Extend range**, which makes "nearby" presence untrustworthy.
 
 Net effect: **no loss of confidentiality or message authenticity**;
-availability and ordering integrity can be lost. The attack needs an active
-device on both links at once; it is realistic against a targeted pair, not
-passive or remote.
+availability can be lost; ordering integrity is protected by §B13. The
+attack needs an active device on both links at once; it is realistic against
+a targeted pair, not passive or remote.
 
 ### Mitigations
 
 1. **Noise session with installation static keys** (planned): channel binding
-   and per-frame authentication remove attacks 3–4 and most of 1. Dropping
+   and per-frame authentication remove attack 4 and most of 1. Dropping
    (2) can only be detected, never prevented, on any relayed radio link.
-2. **Signed sequencing records**: the sequencer signs `(group_id, id,
-   sha256(data), created_ns)` and every node verifies before storing. Removes
-   attack 3 even without Noise.
+2. **Signed sequencing records** (done, §B13, D30): the sequencer signs
+   `(group_id, id, created_ns, sha256(data))` and every node verifies before
+   storing. Removed attack 3 without Noise.
 3. **Delivery acknowledgements in the UI** (standard XMTP read receipts) make
    selective withholding visible.
 4. Until then, the mesh must not be described as safe against an active
    adversary nearby.
+
+## B13 Signed sequencing records (D30)
+
+A device relaying a sync session (§B12) must not be able to reorder,
+renumber or alter a group's sequenced messages. So every sequenced row a
+node stores carries a signature from the installation that ordered it, and
+every node checks it before it stores a row from someone else.
+
+**Record and signature.** `SeqRecord{originator_installation, group_id,
+originator_sequence_id, originator_ns, payload_hash}` holds the signer's
+installation key, the group, the row's id, its `created_ns` and
+`sha256(data)`. The field names follow XMTP d14n's
+`UnsignedOriginatorEnvelope`, so a later bridge can re-wrap signed rows. Only
+`SeqProof{signer, signature, attested}` travels; the verifier rebuilds the
+record from the row it received. `is_commit`, `sender_hmac` and
+`should_push` are not signed: `is_commit` is re-derived from `data` when it
+parses as MLS, and the other two are unused offline. XMTP's `GroupMessage`
+is not changed.
+
+The signed text is `"xmtp-mesh-seq-v1:" + hex(sha256(encoded record))`,
+signed with the installation key's public-context signature, as `Hello`/
+`Auth` and `SignedRelayBody` are. An **attestation** — a node vouching for a
+row it holds rather than signing as the installation that ordered it — signs
+the same record under the distinct prefix `xmtp-mesh-seq-attest-v1:` instead;
+`attested` says which kind a proof is. The three kinds of signature
+(handshake, relay, sequencing/attestation) never verify as one another.
+
+**When a row is signed.** `start_sync` gives the store a signer and
+`stop_sync` clears it; a row sequenced while sync is stopped stays unsigned
+until the next `start_sync`. On every start, before any session exists, the
+store signs every row that has no proof: a row that pre-dates the signed-
+sequencing migration — a *legacy* row, including the sequencer's own history
+— as an attestation, and any other unsigned row (sequenced locally while
+sync was stopped) with a real sequencing signature. After `start_sync`, no
+stored row lacks a proof.
+
+**Handover (§C4.7).** When a node re-pins a group to itself, in the same
+transaction it re-signs every held row it did not sign itself as its own
+attestation. A new installation that fetches history after a handover
+therefore sees only the successor's proofs, never the former sequencer's
+original ones.
+
+**Where rows are checked.** On a direct link, `Sequenced.proofs` holds one
+proof per message, in order, both for served history and for live pushes; a
+length mismatch refuses the frame. Over relay, every `RelayRow` carries
+`proof`; an empty `signer` means the `SignedRelayBody`'s signer, which
+covers a former sequencer's history once the successor has re-attested it as
+its own. A row signed by an installation other than the sender names its
+signer explicitly. A `Ref` is checked with the id, time and hash it carries.
+
+**Accept rule.** Rules 1–2 run over the whole frame first, so one bad row
+anywhere refuses the whole frame; then, in frame order, rules 3–4. The
+reported reason is the first failure in that order.
+
+1. A proof is present and verifies, as the sequencing signature or
+   attestation it claims to be, over the rebuilt record (`missing_proof`,
+   `bad_signature`).
+2. The signer is an installation, live or revoked, in the held identity log
+   of an inbox that is a member of the group, per the local client
+   (`wrong_signer`). If the client cannot report the members yet, nothing is
+   checked, stored or counted, and the session stays up.
+3. **Signer order, strict.** A row at a new id is accepted only if it is
+   signed — as a sequencing signature or an attestation — by the pinned
+   sequencer, and the pinned sequencer is not revoked (`wrong_signer`
+   otherwise). A revoked installation is never accepted at a new id, even
+   one that was the legitimate sequencer until just now: once the node
+   knows its pinned sequencer is revoked, that sequencer's rows are refused
+   until the §C4.7 re-pin runs, which happens after every identity-log
+   change and at start.
+4. **Same id already stored, or repeated within the frame.** An identical
+   record is a duplicate and is skipped. A different record from the same
+   signer is equivocation: both records and signatures are kept (at most
+   1024, oldest dropped) and the frame is refused. A different signer is the
+   §C4.7 id reuse; the stored row stays.
+
+A relaying device holds no member's key, so rules 1–2 alone stop §B12
+attack 3; rule 3 limits what a stolen, revoked phone could do with rows it
+signed before the node had heard of the revocation.
+
+**Failures.** One bad row refuses the whole frame, and nothing from it
+reaches libxmtp. On a direct link the session ends with the fatal
+`SequencingRejected`. A relayed payload is dropped entirely; the sequencer's
+retries bring the rows again. There is no user-facing warning in this phase.
+
+**Version (hard cut).** `Hello.seq` is 1. A peer whose Hello says less gets
+the fatal `IncompatibleVersion` and is counted. mesh.10 syncs only with
+mesh.10; a relayed payload from an older phone carries rows without proofs
+and is dropped as `missing_proof`.
+
+**Counters.** `MeshNode::mesh_stats()` (FFI `FfiMeshNode::mesh_stats()`):
+`seq_rows_signed`, `seq_rows_verified`, `seq_rejected_missing_proof`,
+`seq_rejected_bad_signature`, `seq_rejected_wrong_signer`,
+`seq_equivocations`, `peers_rejected_version`. A refused frame or payload
+counts once, under the reason of its first failure.
+
+**Cost.** +96 bytes per row on a direct link, +64 on a relay row signed by
+the envelope's signer. One ed25519 check per row (about 50 µs on a phone);
+rule 2 replays the member inboxes' held logs once per frame.
+
+**Not covered.**
+
+- Dropped or withheld rows (gaps are still filled by retries), unsigned
+  `Interest`, `WelcomeAck` and `Pending` (§B12 attack 4), and per-frame
+  authentication (Noise, §B11 item 2).
+- A restore-convergence log replace (§C4.3) can drop an installation that
+  existed only in the losing fork; rows it signed then fail as
+  `wrong_signer` until the logs are re-based. A relay row rejected this way
+  is dropped, and the sender's retries are bounded (the first send plus up
+  to four more), so a log that arrives after the last retry leaves those
+  rows waiting for new content to trigger another send.
+- A stolen phone that is still the pinned sequencer on a node that has not
+  yet learned of its revocation can still append rows there — including on
+  the successor itself, which then attests those rows at its own re-pin and
+  serves them to new installations. The successor's attestation replaces
+  the former sequencer's original proof, so a later conflicting record from
+  the now-known-revoked former sequencer at that id is treated as the
+  §C4.7 id reuse, not equivocation.
 
 ---
 
@@ -1010,6 +1131,8 @@ member, that a `RelaySync` comes from the pinned sequencer, that a
 - `RelaySync{group_id, rows}`: sequencer → joiner. Every sequenced row after
   the joiner's last acked id, in order. A row the joiner itself sent is a
   `Ref{id, created_ns, data_hash}`; other rows are `Full(GroupMessage)`.
+  Every row carries `proof`, its sequencing proof (§B13); an empty `signer`
+  means this body's `signer_installation`.
 
 ## R5 The relay spool
 
@@ -1150,8 +1273,9 @@ echo is replaced by a small ack.
   joiner never sees a gap it cannot fill; rows it already holds are skipped.
 - The sequencer knows which rows came from the joiner: rows sequenced from a
   peer's `Pending` are flagged `from_peer` in the store.
-- A `Ref` is a few dozen bytes, so a sync for a 400-byte message still fits
-  512 B. A joiner that cannot resolve a `Ref` (for example a fresh
+- A `Ref` and its proof take well under 200 bytes, so a sync for a 400-byte
+  message still fits 512 B (a unit test pins it). A joiner that cannot
+  resolve a `Ref` (for example a fresh
   installation) sets `need_full_after`, and the sequencer sends those rows in
   full. A request below what the sequencer knows the joiner holds is ignored.
 - **Answer only on progress.** A phone answers a delivered envelope only when
