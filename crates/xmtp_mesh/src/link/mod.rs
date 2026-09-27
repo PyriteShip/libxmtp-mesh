@@ -182,6 +182,16 @@ pub(crate) struct ContactLinkEntry {
     pub(crate) dialer_static: [u8; 32],
 }
 
+/// What a verified contact link does about a second link to one phone.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ContactLinkOutcome {
+    /// This link stays and is registered verified; `close` is the other
+    /// link to that phone, if any.
+    Kept { close: Option<PeerId> },
+    /// The other link stays: close this one, which is not registered.
+    Superseded,
+}
+
 /// The node's link state (§B14). Keys live in memory only and are zeroized
 /// on drop. Lock order: `prk`, then the store, then `keys`, then
 /// `dialers`.

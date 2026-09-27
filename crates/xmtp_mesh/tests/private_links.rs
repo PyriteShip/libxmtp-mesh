@@ -10,14 +10,14 @@ use std::time::Duration;
 use common::peer_on;
 use common::{
     ClientGroupMembership, ClientHelloSigner, TestPeer, build_client, eventually, pair_dm, peer,
-    relay_peer, send_and_see,
+    recorded_peer, relay_peer, send_and_see,
 };
 use xmtp_cryptography::utils::generate_local_wallet;
 use xmtp_db::group::GroupQueryArgs;
-use xmtp_mesh::frames::{self, Hello, Interest, KeyPackage, SpoolWant, frame::Body};
+use xmtp_mesh::frames::{self, Auth, Hello, Interest, KeyPackage, SpoolWant, frame::Body};
 use xmtp_mesh::link::{WINDOW_SECS, service_data};
 use xmtp_mesh::{AdvertMatch, DialIntent, LoopbackHub, MAX_FRAME_LEN, MeshError, MeshNode};
-use xmtp_mesh::{LinkRole, MeshTransport, PeerId};
+use xmtp_mesh::{HelloSigner, LinkRole, MeshTransport, PeerId};
 
 fn inbox(p: &TestPeer) -> String {
     p.client.inbox_id().to_string()
@@ -923,15 +923,16 @@ async fn simultaneous_contact_dials_keep_the_same_link_on_both_phones() {
             inbox_id: ca.inbox_id().to_string(),
         }),
     );
-    let lose = if card_a.noise_static_pub < card_b.noise_static_pub {
-        2
+    let (win, lose) = if card_a.noise_static_pub < card_b.noise_static_pub {
+        (1, 2)
     } else {
-        1
+        (2, 1)
     };
     eventually("each phone closes one link", || async {
         !ta.closed.lock().unwrap().is_empty() && !tb.closed.lock().unwrap().is_empty()
     })
     .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         ta.closed
             .lock()
@@ -946,4 +947,149 @@ async fn simultaneous_contact_dials_keep_the_same_link_on_both_phones() {
             .iter()
             .all(|p| *p == format!("a#{lose}"))
     );
+    // Only the kept link is verified, and closing the other is no failure.
+    let peers = |n: &MeshNode| {
+        n.verified_peers()
+            .into_iter()
+            .map(|p| p.peer)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(peers(&na), vec![format!("b#{win}")]);
+    assert_eq!(peers(&nb), vec![format!("a#{win}")]);
+    for n in [&na, &nb] {
+        let stats = n.mesh_stats();
+        assert_eq!((stats.handshake_failed, stats.link_frame_rejected), (0, 0));
+    }
+}
+
+/// A restored phone (no contact rows) accepts any IK dialer, but stores
+/// and answers only one that proves its inbox: `m` dials with its own
+/// static key and a Hello claiming `a`'s inbox, is dropped at the
+/// verification deadline, is not stored, and never gets `b2`'s card.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_phone_drops_a_dialer_that_cannot_prove_its_inbox() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let (b2, rec) = recorded_peer(&hub, "b2").await;
+    let m = peer(&hub, "m").await;
+    b2.node
+        .set_peer_verify_timeout_for_test(Duration::from_millis(500));
+    assert!(b2.node.contacts().unwrap().is_empty());
+    m.node
+        .add_contact_for_test(b2.node.own_contact_card_for_test().unwrap());
+    // m's link keys stay its own; only its Hello claims a's inbox.
+    m.node.set_local_inbox_for_test(&inbox(&a));
+    m.node.suppress_identity_log_for_test();
+    hub.link_as(
+        "m",
+        "b2",
+        DialIntent::Contact {
+            inbox_id: inbox(&b2),
+        },
+    );
+    eventually("b2 authenticates m", || async {
+        b2.node.authenticated_peers().contains(&"m".to_string())
+    })
+    .await;
+    eventually("b2 drops m", || async { !hub.is_linked("m", "b2") }).await;
+    assert!(b2.node.verified_peers().is_empty());
+    assert!(b2.node.contact(&inbox(&a)).unwrap().is_none());
+    assert!(b2.node.contacts().unwrap().is_empty());
+    assert!(
+        !rec.sent_to("m")
+            .iter()
+            .any(|b| matches!(b, Body::ContactCard(_))),
+        "no card for a dialer that did not prove its inbox"
+    );
+}
+
+/// The signed hello text, pinned here: v2 binds a handshake hash.
+fn hello_text_v2(challenge: &[u8], signer: &[u8], verifier: &[u8], binding: &[u8; 32]) -> String {
+    format!(
+        "xmtp-mesh-hello-v2:{}:{}:{}:{}",
+        hex::encode(challenge),
+        hex::encode(signer),
+        hex::encode(verifier),
+        hex::encode(binding)
+    )
+}
+
+/// `a` dials `b` over IK; `b`'s real Auth is held back and `a` gets an Auth
+/// signed by `b`'s installation key over `text(a's challenge, b's key,
+/// a's key)` instead. It must not verify: the link closes, counted.
+async fn a_forged_auth_closes_the_link(text: fn(&[u8], &[u8], &[u8]) -> String) {
+    let hub = LoopbackHub::new();
+    let (a, rec) = recorded_peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    hub.make_contacts("a", "b");
+    hub.hold_for_test("b", "a");
+    hub.link_as(
+        "a",
+        "b",
+        DialIntent::Contact {
+            inbox_id: inbox(&b),
+        },
+    );
+    eventually("b's handshake reply held", || async {
+        hub.held_count_for_test("b", "a") == 1
+    })
+    .await;
+    let reply = hub.take_held_for_test("b", "a").remove(0);
+    hub.hold_for_test("b", "a");
+    hub.inject_wire_for_test("b", "a", reply);
+    // b's Hello, then its Auth (held back for good).
+    eventually("b's Hello and Auth held", || async {
+        hub.held_count_for_test("b", "a") >= 2
+    })
+    .await;
+    let hello = hub.take_held_for_test("b", "a").remove(0);
+    hub.hold_for_test("b", "a");
+    hub.inject_wire_for_test("b", "a", hello);
+    eventually("a answered b's Hello", || async {
+        rec.sent_to("b").iter().any(|f| matches!(f, Body::Auth(_)))
+    })
+    .await;
+    let challenge = rec
+        .sent_to("b")
+        .into_iter()
+        .find_map(|f| match f {
+            Body::Hello(h) => Some(h.challenge),
+            _ => None,
+        })
+        .unwrap();
+    let signature = ClientHelloSigner(b.client.clone())
+        .sign(&text(&challenge, &b.installation(), &a.installation()))
+        .unwrap();
+    hub.inject(
+        "b",
+        "a",
+        frames::encode(Body::Auth(Auth {
+            signature,
+            challenge,
+        })),
+    );
+    eventually("a closes the link", || async { !hub.is_linked("a", "b") }).await;
+    assert_eq!(a.node.mesh_stats().link_frame_rejected, 1);
+    assert!(!a.node.authenticated_peers().contains(&"b".to_string()));
+}
+
+/// §B14.4: an Auth made for another link (another handshake hash) never
+/// verifies on this one.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_auth_bound_to_another_link_is_refused() {
+    a_forged_auth_closes_the_link(|c, s, v| hello_text_v2(c, s, v, &[9; 32])).await;
+}
+
+/// The mesh.10 hello text (no binding) never verifies on a Noise link.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_auth_over_the_unbound_v1_text_is_refused() {
+    a_forged_auth_closes_the_link(|c, s, v| {
+        format!(
+            "xmtp-mesh-hello-v1:{}:{}:{}",
+            hex::encode(c),
+            hex::encode(s),
+            hex::encode(v)
+        )
+    })
+    .await;
 }

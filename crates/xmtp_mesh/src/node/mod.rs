@@ -578,26 +578,32 @@ impl MeshNode {
     ) {
         let sessions = self.inner.sessions.lock();
         if sessions.get(peer).is_some_and(|h| h.id == session_id) {
-            let verified = VerifiedPeer {
-                peer: peer.to_string(),
-                inbox_id,
-                installation,
-            };
-            self.inner
-                .verified
-                .lock()
-                .insert(peer.to_string(), verified.clone());
-            let VerifiedPeer {
-                peer,
-                inbox_id,
-                installation,
-            } = verified;
-            self.emit(vec![NodeEvent::PeerVerified {
-                peer,
-                inbox_id,
-                installation,
-            }]);
+            self.register_verified(peer, inbox_id, installation);
         }
+    }
+
+    /// Record `peer` as verified and emit `PeerVerified`. Callers hold
+    /// `sessions` and checked the session is current.
+    pub(crate) fn register_verified(&self, peer: &str, inbox_id: String, installation: Vec<u8>) {
+        let verified = VerifiedPeer {
+            peer: peer.to_string(),
+            inbox_id,
+            installation,
+        };
+        self.inner
+            .verified
+            .lock()
+            .insert(peer.to_string(), verified.clone());
+        let VerifiedPeer {
+            peer,
+            inbox_id,
+            installation,
+        } = verified;
+        self.emit(vec![NodeEvent::PeerVerified {
+            peer,
+            inbox_id,
+            installation,
+        }]);
     }
 
     /// The session's peer lost its verification (its installation left its

@@ -18,7 +18,7 @@ use crate::MeshError;
 use crate::link::noise::{DialTarget, Handshake, LinkOpen};
 use crate::link::records::Records;
 use crate::link::tx::LinkTx;
-use crate::link::{DialIntent, LinkKind, LinkRole, window_at};
+use crate::link::{ContactLinkOutcome, DialIntent, LinkKind, LinkRole, window_at};
 use crate::node::{
     MAX_PEER_IDENTITY_LOG, MAX_RELAYED_IDENTITY_LOGS, MeshNode, NodeEvent, Resolution,
 };
@@ -240,6 +240,9 @@ pub(crate) struct Session {
     card_sent: bool,
     /// A card received before the peer was verified.
     pending_card: Option<ContactCard>,
+    /// Another contact link to the same phone was kept (§B14.3): this one
+    /// is closing and ignores whatever still arrives.
+    superseded: bool,
     /// An open relay link closes when no relay frame arrived by then.
     relay_idle_at: Option<Instant>,
     /// An open relay link closes then however busy it is, so a stranger
@@ -320,6 +323,7 @@ pub(crate) fn spawn(
         dialer_static: None,
         card_sent: false,
         pending_card: None,
+        superseded: false,
         relay_idle_at: None,
         relay_ends_at: None,
         signer,
@@ -728,6 +732,9 @@ impl Session {
     }
 
     async fn on_frame(&mut self, bytes: &[u8]) -> Result<(), MeshError> {
+        if self.superseded {
+            return Ok(());
+        }
         let body = match frames::decode(bytes) {
             Ok(body) => body,
             // A stranger gets no leeway: what is not a relay frame closes
@@ -861,7 +868,14 @@ impl Session {
             &self.signer.installation_key(),
             &self.binding,
         );
-        auth::verify(&text, &auth_frame.signature, &peer_key)?;
+        if let Err(e) = auth::verify(&text, &auth_frame.signature, &peer_key) {
+            // On a Noise link a bad Auth is a signature for another link
+            // or text, or a forgery (§B14.4).
+            if self.link_kind.is_some() {
+                self.node.link_counters().count_frame_rejected();
+            }
+            return Err(e);
+        }
         self.state = State::Authenticated;
         self.handshake_deadline = None;
         self.node.session_authenticated(&self.peer, self.id);
@@ -912,35 +926,50 @@ impl Session {
             .contains(claimed))
     }
 
-    /// The peer proved its inbox. On a contact link: of two links to one
-    /// phone keep one (§B14.3); then store a card the peer sent (§B14.4).
+    /// The peer proved its inbox. On a contact link, of two links to one
+    /// phone only one is kept and registered verified (§B14.3). Then sync
+    /// starts and a card the peer sent is stored (§B14.4).
     async fn mark_verified(&mut self) -> Result<(), MeshError> {
-        self.verified = true;
         self.verify_deadline = None;
         let inbox_id = self.peer_inbox.clone().unwrap_or_default();
         let installation = self.peer_installation();
-        self.node
-            .session_verified(&self.peer, self.id, inbox_id, installation.clone());
-        if self.link_kind == Some(LinkKind::Contact)
-            && let Some(dialer) = self.dialer_static
-            && let Some(loser) =
-                self.node
-                    .contact_link_verified(&self.peer, self.id, &installation, dialer)
-            && !self.is_cancelled()
-        {
-            tracing::info!(peer = %self.peer, closing = %loser, "two contact links to one phone: keeping one");
-            self.transport.disconnect(&loser);
-            if loser == self.peer {
-                // This link is closing: no sync and no cards on it. Not a
-                // failure, so nothing is counted.
-                return Ok(());
+        match (self.link_kind, self.dialer_static) {
+            (Some(LinkKind::Contact), Some(dialer)) => {
+                match self.node.contact_link_verified(
+                    &self.peer,
+                    self.id,
+                    inbox_id,
+                    installation,
+                    dialer,
+                ) {
+                    ContactLinkOutcome::Superseded => {
+                        tracing::info!(peer = %self.peer, "another contact link to this phone is kept; closing this one");
+                        self.superseded = true;
+                        if !self.is_cancelled() {
+                            self.transport.disconnect(&self.peer);
+                        }
+                        // Closing is no failure: nothing is counted.
+                        return Ok(());
+                    }
+                    ContactLinkOutcome::Kept { close: Some(other) } => {
+                        tracing::info!(peer = %self.peer, closing = %other, "two contact links to one phone: keeping this one");
+                        if !self.is_cancelled() {
+                            self.transport.disconnect(&other);
+                        }
+                    }
+                    ContactLinkOutcome::Kept { close: None } => {}
+                }
             }
+            _ => self
+                .node
+                .session_verified(&self.peer, self.id, inbox_id, installation),
         }
-        let verified = self.on_verified().await;
+        self.verified = true;
+        self.on_verified().await?;
         if let Some(card) = self.pending_card.take() {
             self.apply_contact_card(card).await?;
         }
-        verified
+        Ok(())
     }
 
     /// The peer's identity log for `log.inbox_id`. The log of the inbox the

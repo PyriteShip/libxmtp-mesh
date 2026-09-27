@@ -8,15 +8,15 @@ use crate::link::LinkRole;
 use crate::link::keys::{AccountPrk, MeshKeys};
 use crate::link::noise::{ReplayCache, ResponderContext};
 use crate::link::{
-    AdvertMatch, AdvertState, AllowedDialers, ContactLinkEntry, FLAG_PAIRING, FLAG_RELAY,
-    LinkCounters, LinkKeyInfo, Token, WINDOW_SECS, advert_token, parse_service_data, service_data,
-    window_at,
+    AdvertMatch, AdvertState, AllowedDialers, ContactLinkEntry, ContactLinkOutcome, FLAG_PAIRING,
+    FLAG_RELAY, LinkCounters, LinkKeyInfo, Token, WINDOW_SECS, advert_token, parse_service_data,
+    service_data, window_at,
 };
 use crate::store::{Contact, ContactUpdate};
 use crate::sync::frames::ContactCard;
 use crate::sync::frames::frame::Body;
 use crate::sync::session::{Inbound, LinkSetup};
-use crate::sync::{MeshTransport, PeerId};
+use crate::sync::MeshTransport;
 
 impl MeshNode {
     /// Derive this phone's link keys from the account key (the secp256k1
@@ -257,42 +257,59 @@ impl MeshNode {
         Ok(outcome)
     }
 
-    /// Contact link `peer` (session `session_id`) verified `installation`.
-    /// If another live contact link reaches the same installation (both
-    /// phones dialed), both phones keep the one dialed by the lower static
-    /// key (§B14.3): returns the peer to close, if any.
+    /// Contact link `peer` (session `session_id`) verified `inbox_id` /
+    /// `installation`. If another live contact link reaches the same
+    /// installation (both phones dialed), both phones keep the one dialed
+    /// by the lower static key (§B14.3). Decided, and the kept link
+    /// registered verified, under one `sessions` lock, so a closing link
+    /// is never left verified.
     pub(crate) fn contact_link_verified(
         &self,
         peer: &str,
         session_id: u64,
-        installation: &[u8],
+        inbox_id: String,
+        installation: Vec<u8>,
         dialer_static: [u8; 32],
-    ) -> Option<PeerId> {
+    ) -> ContactLinkOutcome {
         let sessions = self.inner.sessions.lock();
         let current = |p: &str, id: u64| sessions.get(p).is_some_and(|h| h.id == id);
         if !current(peer, session_id) {
-            return None;
+            return ContactLinkOutcome::Kept { close: None };
         }
-        let mut links = self.inner.link.contact_links.lock();
-        links.retain(|p, l| current(p, l.session_id));
-        let rival = links
-            .iter()
-            .find(|(p, l)| p.as_str() != peer && l.installation == installation)
-            .map(|(p, l)| (p.clone(), l.dialer_static));
-        links.insert(
-            peer.to_string(),
-            ContactLinkEntry {
-                session_id,
-                installation: installation.to_vec(),
-                dialer_static,
-            },
-        );
-        let (rival_peer, rival_dialer) = rival?;
-        match dialer_static.cmp(&rival_dialer) {
-            std::cmp::Ordering::Less => Some(rival_peer),
-            std::cmp::Ordering::Greater => Some(peer.to_string()),
-            // The same phone dialed both: leave it to the radio (§B7.3).
-            std::cmp::Ordering::Equal => None,
+        let rival = {
+            let mut links = self.inner.link.contact_links.lock();
+            links.retain(|p, l| current(p, l.session_id));
+            let rival = links
+                .iter()
+                .find(|(p, l)| p.as_str() != peer && l.installation == installation)
+                .map(|(p, l)| (p.clone(), l.dialer_static));
+            if let Some((_, rival_dialer)) = &rival
+                && dialer_static > *rival_dialer
+            {
+                return ContactLinkOutcome::Superseded;
+            }
+            links.insert(
+                peer.to_string(),
+                ContactLinkEntry {
+                    session_id,
+                    installation: installation.clone(),
+                    dialer_static,
+                },
+            );
+            rival
+        };
+        self.register_verified(peer, inbox_id, installation);
+        match rival {
+            Some((rival_peer, rival_dialer)) if dialer_static < rival_dialer => {
+                // The rival verified first; it is closing now.
+                self.forget_peer(&rival_peer);
+                ContactLinkOutcome::Kept {
+                    close: Some(rival_peer),
+                }
+            }
+            // No rival, or the same phone dialed both: leave it to the
+            // radio (§B7.3).
+            _ => ContactLinkOutcome::Kept { close: None },
         }
     }
 
