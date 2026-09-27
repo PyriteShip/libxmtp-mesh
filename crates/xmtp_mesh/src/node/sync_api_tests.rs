@@ -158,6 +158,8 @@ fn fixture_row(gid: &[u8]) -> crate::store::StoredGroupMessage {
         sender_hmac: vec![],
         should_push: false,
         is_commit: parsed.is_commit,
+        seq_signer: None,
+        seq_signature: None,
     }
 }
 

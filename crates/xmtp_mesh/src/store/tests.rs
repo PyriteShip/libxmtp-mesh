@@ -204,3 +204,127 @@ fn transaction_rolls_back_when_the_closure_panics() {
     );
     assert_eq!(s.pending_for(b"g").unwrap().len(), 1);
 }
+
+use std::sync::Arc;
+
+use crate::sync::HelloSigner;
+use crate::sync::seq::{self, Equivocation, KeySigner};
+
+#[test]
+fn a_row_is_signed_when_it_is_sequenced() {
+    let mut s = MeshStore::open_in_memory().unwrap();
+    let signer = Arc::new(KeySigner::new());
+    s.set_seq_signer(signer.clone());
+    let (row, _) = s
+        .append_sequenced_marked(&msg(b"g", b"one"), 7, true)
+        .unwrap();
+    assert_eq!(
+        row.seq_signer.as_deref(),
+        Some(signer.installation_key().as_slice())
+    );
+    assert!(seq::verify_proof(b"g", 1, 7, b"one", &row.proof()));
+    assert_eq!(
+        s.query_group(b"g", 0, 1, false).unwrap()[0],
+        row,
+        "stored as returned"
+    );
+    assert_eq!(s.seq_counters().snapshot().seq_rows_signed, 1);
+}
+
+#[test]
+fn rows_are_looked_up_by_id_with_their_signers() {
+    let mut s = MeshStore::open_in_memory().unwrap();
+    s.append_sequenced(&msg(b"g", b"unsigned"), 1).unwrap();
+    let signer = Arc::new(KeySigner::new());
+    s.set_seq_signer(signer.clone());
+    s.append_sequenced(&msg(b"g", b"signed"), 2).unwrap();
+    assert_eq!(s.sequenced_at(b"g", 2).unwrap().unwrap().data, b"signed");
+    assert!(s.sequenced_at(b"g", 3).unwrap().is_none());
+    assert_eq!(
+        s.seq_signers(b"g").unwrap(),
+        vec![None, Some(signer.installation_key())]
+    );
+}
+
+#[test]
+fn unsigned_rows_are_signed_once() {
+    let mut s = MeshStore::open_in_memory().unwrap();
+    s.append_sequenced(&msg(b"g", b"a"), 1).unwrap();
+    s.append_sequenced(&msg(b"h", b"b"), 2).unwrap();
+    assert_eq!(
+        s.sign_unsigned_rows().unwrap(),
+        0,
+        "no signer: nothing to do"
+    );
+    let signer = Arc::new(KeySigner::new());
+    s.set_seq_signer(signer.clone());
+    assert_eq!(s.sign_unsigned_rows().unwrap(), 2);
+    assert_eq!(s.sign_unsigned_rows().unwrap(), 0, "idempotent");
+    for (gid, data, ns) in [(b"g", b"a", 1), (b"h", b"b", 2)] {
+        let row = s.query_group(gid, 0, 1, false).unwrap().remove(0);
+        assert!(seq::verify_proof(gid, 1, ns, data, &row.proof()));
+    }
+}
+
+/// §B13 upgrade: the migration keeps rows stored before it, without proofs.
+#[test]
+fn the_migration_keeps_existing_rows_unsigned_until_they_are_signed() {
+    let mut s = MeshStore::open_in_memory().unwrap();
+    s.conn.revert_last_migration(MIGRATIONS).unwrap();
+    s.conn
+        .batch_execute(
+            "INSERT INTO group_messages (group_id, id, created_ns, data, sender_hmac, should_push, is_commit, data_hash, from_peer) \
+             VALUES (x'67', 1, 5, x'6f6c64', x'', 1, 0, x'00', 0);",
+        )
+        .unwrap();
+    s.conn.run_pending_migrations(MIGRATIONS).unwrap();
+    let row = s.query_group(b"g", 0, 10, false).unwrap().remove(0);
+    assert_eq!((row.seq_signer, row.seq_signature), (None, None));
+    let signer = Arc::new(KeySigner::new());
+    s.set_seq_signer(signer.clone());
+    assert_eq!(s.sign_unsigned_rows().unwrap(), 1);
+    let row = s.query_group(b"g", 0, 10, false).unwrap().remove(0);
+    assert!(seq::verify_proof(b"g", 1, 5, b"old", &row.proof()));
+}
+
+/// §C4.7 at start: the drain after a repin signs what it sequences.
+#[test]
+fn the_handover_drain_signs_the_rows_it_sequences() {
+    let mut s = MeshStore::open_in_memory().unwrap();
+    let signer = Arc::new(KeySigner::new());
+    s.set_seq_signer(signer.clone());
+    s.add_pending(&msg(b"g", b"held for the dead sequencer"), 1)
+        .unwrap();
+    let rows = s
+        .repin_sequencer_and_drain_pending(b"g", &signer.installation_key(), 9)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(seq::verify_proof(
+        b"g",
+        1,
+        9,
+        b"held for the dead sequencer",
+        &rows[0].proof()
+    ));
+}
+
+#[test]
+fn equivocations_keep_the_newest_1024() {
+    let mut s = MeshStore::open_in_memory().unwrap();
+    for id in 1..=1030i64 {
+        let e = Equivocation {
+            group_id: b"g".to_vec(),
+            id,
+            signer: vec![1],
+            record_a: vec![2],
+            signature_a: vec![3],
+            record_b: vec![4],
+            signature_b: vec![5],
+        };
+        s.record_equivocation(&e, id).unwrap();
+    }
+    let kept = s.equivocations(b"g").unwrap();
+    assert_eq!(kept.len(), 1024);
+    assert_eq!(kept[0].id, 7, "the six oldest were dropped");
+    assert_eq!(kept[0].record_b, vec![4]);
+}

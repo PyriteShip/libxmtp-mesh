@@ -136,3 +136,49 @@ pub(crate) fn drain(rx: &mut broadcast::Receiver<NodeEvent>) -> Vec<NodeEvent> {
     }
     out
 }
+
+/// A node holding inbox I's log [create, add k1, add k2, revoke k1]: k1 is
+/// revoked, k2 live. Returns (node, I, k1, k2).
+pub(crate) async fn node_with_a_revoked_and_a_live_installation() -> (
+    MeshNode,
+    String,
+    XmtpInstallationCredential,
+    XmtpInstallationCredential,
+) {
+    let owner = generate_local_wallet();
+    let inbox = owner.get_inbox_id(0);
+    let (k1, k2) = (
+        XmtpInstallationCredential::new(),
+        XmtpInstallationCredential::new(),
+    );
+    let log = vec![
+        origin(&owner).await,
+        added_installation(&owner, &inbox, 2, &k1).await,
+        added_installation(&owner, &inbox, 3, &k2).await,
+        revoked_installation(&owner, &inbox, 4, &k1).await,
+    ];
+    let node = MeshNode::in_memory().unwrap();
+    node.ingest_identity_log(&inbox, log).await.unwrap();
+    (node, inbox, k1, k2)
+}
+
+/// A [`crate::sync::GroupMembership`] reporting the same members for every group.
+pub(crate) struct Members(pub Option<Vec<String>>);
+
+#[async_trait::async_trait]
+impl crate::sync::GroupMembership for Members {
+    async fn member_inboxes(
+        &self,
+        _group_id: &[u8],
+    ) -> Result<Option<Vec<String>>, crate::MeshError> {
+        Ok(self.0.clone())
+    }
+}
+
+/// A transport that goes nowhere.
+pub(crate) struct NoTransport;
+
+impl crate::sync::MeshTransport for NoTransport {
+    fn send(&self, _peer: &crate::sync::PeerId, _frame: Vec<u8>) {}
+    fn disconnect(&self, _peer: &crate::sync::PeerId) {}
+}

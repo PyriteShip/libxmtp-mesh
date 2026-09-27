@@ -1,12 +1,16 @@
+use std::sync::Arc;
+
 use diesel::connection::{SimpleConnection, TransactionManager};
 use diesel::prelude::*;
 use diesel::sql_query;
-use diesel::sql_types::{BigInt, Binary, Bool, Integer, Text};
+use diesel::sql_types::{BigInt, Binary, Bool, Integer, Nullable, Text};
 use diesel::sqlite::SqliteConnection;
 use diesel_migrations::{EmbeddedMigrations, MigrationHarness, embed_migrations};
 use sha2::{Digest, Sha256};
 
 use crate::MeshError;
+use crate::sync::HelloSigner;
+use crate::sync::seq::{self, Equivocation, SeqCounters, SeqProof};
 
 mod relay;
 #[cfg(test)]
@@ -16,6 +20,8 @@ pub use relay::SpoolEntry;
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");
 const META_LOCAL_INSTALLATION: &str = "local_installation";
 const META_LOCAL_INBOX: &str = "local_inbox";
+/// Most equivocations kept (§B13); the oldest are dropped first.
+const MAX_EQUIVOCATIONS: i64 = 1024;
 
 pub fn sha256(bytes: &[u8]) -> Vec<u8> {
     Sha256::digest(bytes).to_vec()
@@ -46,6 +52,47 @@ pub struct StoredGroupMessage {
     pub should_push: bool,
     #[diesel(sql_type = Bool)]
     pub is_commit: bool,
+    /// The installation that signed this row's sequencing record (§B13).
+    /// `None` only for a row stored before signed sequencing, until
+    /// `start_sync` signs it.
+    #[diesel(sql_type = Nullable<Binary>)]
+    pub seq_signer: Option<Vec<u8>>,
+    #[diesel(sql_type = Nullable<Binary>)]
+    pub seq_signature: Option<Vec<u8>>,
+}
+
+impl StoredGroupMessage {
+    /// The row's stored proof, as it travels (§B13). Every row a node
+    /// serves has one: `start_sync` signs any row stored without it.
+    pub fn proof(&self) -> SeqProof {
+        debug_assert!(
+            self.seq_signer.is_some() && self.seq_signature.is_some(),
+            "sequenced row {} has no proof (§B13)",
+            self.id
+        );
+        SeqProof {
+            signer: self.seq_signer.clone().unwrap_or_default(),
+            signature: self.seq_signature.clone().unwrap_or_default(),
+        }
+    }
+}
+
+#[derive(QueryableByName)]
+struct EquivocationRow {
+    #[diesel(sql_type = Binary)]
+    group_id: Vec<u8>,
+    #[diesel(sql_type = BigInt)]
+    id: i64,
+    #[diesel(sql_type = Binary)]
+    signer: Vec<u8>,
+    #[diesel(sql_type = Binary)]
+    record_a: Vec<u8>,
+    #[diesel(sql_type = Binary)]
+    signature_a: Vec<u8>,
+    #[diesel(sql_type = Binary)]
+    record_b: Vec<u8>,
+    #[diesel(sql_type = Binary)]
+    signature_b: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, QueryableByName)]
@@ -131,13 +178,17 @@ struct OutboundRow {
     input: Vec<u8>,
 }
 
-const GROUP_COLUMNS: &str = "group_id, id, created_ns, data, sender_hmac, should_push, is_commit";
+const GROUP_COLUMNS: &str = "group_id, id, created_ns, data, sender_hmac, should_push, is_commit, seq_signer, seq_signature";
 
 /// (envelope_hash, input) pairs for outbound welcomes awaiting delivery.
 type OutboundWelcomePairs = Vec<(Vec<u8>, Vec<u8>)>;
 
 pub struct MeshStore {
     conn: SqliteConnection,
+    /// Signs each row as it is sequenced here (§B13). Set by
+    /// `MeshNode::start_sync`; kept after `stop_sync`.
+    seq_signer: Option<Arc<dyn HelloSigner>>,
+    seq: Arc<SeqCounters>,
 }
 
 impl MeshStore {
@@ -150,7 +201,11 @@ impl MeshStore {
         conn.batch_execute("PRAGMA foreign_keys = ON;")?;
         conn.run_pending_migrations(MIGRATIONS)
             .map_err(|e| MeshError::Migration(e.to_string()))?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            seq_signer: None,
+            seq: Arc::default(),
+        })
     }
 
     pub fn open_in_memory() -> Result<Self, MeshError> {
@@ -542,8 +597,8 @@ impl MeshStore {
         from_peer: bool,
     ) -> Result<(), MeshError> {
         sql_query(
-            "INSERT INTO group_messages (group_id, id, created_ns, data, sender_hmac, should_push, is_commit, data_hash, from_peer) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO group_messages (group_id, id, created_ns, data, sender_hmac, should_push, is_commit, data_hash, from_peer, seq_signer, seq_signature) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind::<Binary, _>(&row.group_id)
         .bind::<BigInt, _>(row.id)
@@ -554,6 +609,8 @@ impl MeshStore {
         .bind::<Bool, _>(row.is_commit)
         .bind::<Binary, _>(sha256(&row.data))
         .bind::<Bool, _>(from_peer)
+        .bind::<Nullable<Binary>, _>(row.seq_signer.as_deref())
+        .bind::<Nullable<Binary>, _>(row.seq_signature.as_deref())
         .execute(&mut self.conn)?;
         Ok(())
     }
@@ -581,7 +638,7 @@ impl MeshStore {
             if let Some(existing) = s.sequenced_by_hash(&msg.group_id, &sha256(&msg.data))? {
                 return Ok((existing, false));
             }
-            let row = StoredGroupMessage {
+            let mut row = StoredGroupMessage {
                 group_id: msg.group_id.clone(),
                 id: s.max_group_id(&msg.group_id)? + 1,
                 created_ns: now_ns,
@@ -589,7 +646,10 @@ impl MeshStore {
                 sender_hmac: msg.sender_hmac.clone(),
                 should_push: msg.should_push,
                 is_commit: msg.is_commit,
+                seq_signer: None,
+                seq_signature: None,
             };
+            s.sign_new_row(&mut row)?;
             s.insert_group_row(&row, from_peer)?;
             Ok((row, true))
         })
@@ -661,6 +721,148 @@ impl MeshStore {
             .load(&mut self.conn)?,
         };
         Ok(rows)
+    }
+
+    // ---- signed sequencing (§B13) ----
+
+    /// Sign rows sequenced here from now on as `signer`.
+    pub fn set_seq_signer(&mut self, signer: Arc<dyn HelloSigner>) {
+        self.seq_signer = Some(signer);
+    }
+
+    pub(crate) fn seq_counters(&self) -> Arc<SeqCounters> {
+        self.seq.clone()
+    }
+
+    /// Sign `row` if a signer is set (a row sequenced before one is set is
+    /// signed later by [`Self::sign_unsigned_rows`]).
+    fn sign_new_row(&self, row: &mut StoredGroupMessage) -> Result<(), MeshError> {
+        let Some(signer) = self.seq_signer.as_ref() else {
+            return Ok(());
+        };
+        let proof = seq::sign_row(
+            signer.as_ref(),
+            &row.group_id,
+            row.id as u64,
+            row.created_ns as u64,
+            &row.data,
+        )?;
+        row.seq_signer = Some(proof.signer);
+        row.seq_signature = Some(proof.signature);
+        self.seq.count_signed(1);
+        Ok(())
+    }
+
+    /// Sign, in one transaction, every stored row that has no proof yet:
+    /// rows sequenced while no signer was set, and rows stored before
+    /// signed sequencing (on a joiner these are attestations). Returns how
+    /// many were signed; 0 without a signer.
+    pub fn sign_unsigned_rows(&mut self) -> Result<u64, MeshError> {
+        let Some(signer) = self.seq_signer.clone() else {
+            return Ok(0);
+        };
+        self.transaction(|s| {
+            let rows: Vec<StoredGroupMessage> = sql_query(format!(
+                "SELECT {GROUP_COLUMNS} FROM group_messages \
+                 WHERE seq_signer IS NULL OR seq_signature IS NULL ORDER BY group_id, id"
+            ))
+            .load(&mut s.conn)?;
+            for row in &rows {
+                let proof = seq::sign_row(
+                    signer.as_ref(),
+                    &row.group_id,
+                    row.id as u64,
+                    row.created_ns as u64,
+                    &row.data,
+                )?;
+                sql_query(
+                    "UPDATE group_messages SET seq_signer = ?, seq_signature = ? \
+                     WHERE group_id = ? AND id = ?",
+                )
+                .bind::<Binary, _>(&proof.signer)
+                .bind::<Binary, _>(&proof.signature)
+                .bind::<Binary, _>(&row.group_id)
+                .bind::<BigInt, _>(row.id)
+                .execute(&mut s.conn)?;
+            }
+            s.seq.count_signed(rows.len() as u64);
+            Ok(rows.len() as u64)
+        })
+    }
+
+    /// The stored row `(group_id, id)`, if any.
+    pub fn sequenced_at(
+        &mut self,
+        group_id: &[u8],
+        id: i64,
+    ) -> Result<Option<StoredGroupMessage>, MeshError> {
+        let rows: Vec<StoredGroupMessage> = sql_query(format!(
+            "SELECT {GROUP_COLUMNS} FROM group_messages WHERE group_id = ? AND id = ?"
+        ))
+        .bind::<Binary, _>(group_id)
+        .bind::<BigInt, _>(id)
+        .load(&mut self.conn)?;
+        Ok(rows.into_iter().next())
+    }
+
+    /// Every stored row's signer in the group, by ascending id.
+    pub fn seq_signers(&mut self, group_id: &[u8]) -> Result<Vec<Option<Vec<u8>>>, MeshError> {
+        let rows: Vec<OptBlobRow> = sql_query(
+            "SELECT seq_signer AS v FROM group_messages WHERE group_id = ? ORDER BY id ASC",
+        )
+        .bind::<Binary, _>(group_id)
+        .load(&mut self.conn)?;
+        Ok(rows.into_iter().map(|r| r.v).collect())
+    }
+
+    /// Keep `e` as proof (the first one seen per `(group_id, id, signer)`),
+    /// then drop the oldest beyond [`MAX_EQUIVOCATIONS`].
+    pub fn record_equivocation(&mut self, e: &Equivocation, now_ns: i64) -> Result<(), MeshError> {
+        self.transaction(|s| {
+            sql_query(
+                "INSERT OR IGNORE INTO equivocations \
+                 (group_id, id, signer, record_a, signature_a, record_b, signature_b, seen_ns) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind::<Binary, _>(&e.group_id)
+            .bind::<BigInt, _>(e.id)
+            .bind::<Binary, _>(&e.signer)
+            .bind::<Binary, _>(&e.record_a)
+            .bind::<Binary, _>(&e.signature_a)
+            .bind::<Binary, _>(&e.record_b)
+            .bind::<Binary, _>(&e.signature_b)
+            .bind::<BigInt, _>(now_ns)
+            .execute(&mut s.conn)?;
+            sql_query(
+                "DELETE FROM equivocations WHERE rowid IN \
+                 (SELECT rowid FROM equivocations ORDER BY seen_ns DESC, rowid DESC LIMIT -1 OFFSET ?)",
+            )
+            .bind::<BigInt, _>(MAX_EQUIVOCATIONS)
+            .execute(&mut s.conn)?;
+            Ok(())
+        })
+    }
+
+    /// The group's kept equivocations, by ascending id.
+    pub fn equivocations(&mut self, group_id: &[u8]) -> Result<Vec<Equivocation>, MeshError> {
+        let rows: Vec<EquivocationRow> = sql_query(
+            "SELECT group_id, id, signer, record_a, signature_a, record_b, signature_b \
+             FROM equivocations WHERE group_id = ? ORDER BY id ASC, signer ASC",
+        )
+        .bind::<Binary, _>(group_id)
+        .load(&mut self.conn)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| Equivocation {
+                group_id: r.group_id,
+                id: r.id,
+                signer: r.signer,
+                record_a: r.record_a,
+                signature_a: r.signature_a,
+                record_b: r.record_b,
+                signature_b: r.signature_b,
+            })
+            .collect())
     }
 
     // ---- pending (awaiting the sequencer) ----

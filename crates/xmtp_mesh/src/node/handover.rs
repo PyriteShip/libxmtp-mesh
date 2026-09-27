@@ -398,6 +398,8 @@ mod tests {
                     sender_hmac: vec![],
                     should_push: false,
                     is_commit: false,
+                    seq_signer: None,
+                    seq_signature: None,
                 })
                 .unwrap();
             store

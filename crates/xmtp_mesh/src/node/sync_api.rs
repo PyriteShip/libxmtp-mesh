@@ -439,6 +439,8 @@ impl MeshNode {
                     sender_hmac: v1.sender_hmac,
                     should_push: v1.should_push,
                     is_commit: v1.is_commit,
+                    seq_signer: None,
+                    seq_signature: None,
                 };
                 // Our own pending copy (if any, e.g. published again after
                 // it was sequenced) is settled in the same transaction.

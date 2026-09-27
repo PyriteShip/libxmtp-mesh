@@ -4,6 +4,7 @@ mod handover;
 mod identity;
 mod key_packages;
 pub(crate) mod paths;
+pub(crate) mod sequencing;
 mod streams;
 mod sync_api;
 #[cfg(test)]
@@ -89,6 +90,8 @@ pub(crate) struct NodeInner {
     /// them up (the peer still thinks we relay). Lock order: `sessions`,
     /// then this, then `relay`.
     pub(crate) relay_links: Mutex<HashMap<PeerId, (Vec<u8>, String)>>,
+    /// Signed-sequencing counters, shared with the store (§B13).
+    pub(crate) seq: Arc<crate::sync::seq::SeqCounters>,
 }
 
 /// Default time an authenticated peer has to prove inbox membership.
@@ -174,6 +177,7 @@ pub enum NodeEvent {
 impl MeshNode {
     pub fn new(store: MeshStore) -> Self {
         let (events, _) = broadcast::channel(1024);
+        let seq = store.seq_counters();
         Self {
             inner: Arc::new(NodeInner {
                 store: Mutex::new(store),
@@ -196,6 +200,7 @@ impl MeshNode {
                 sync_lifecycle: Mutex::new(()),
                 relay: Mutex::new(None),
                 relay_links: Mutex::new(HashMap::new()),
+                seq,
             }),
         }
     }
@@ -327,6 +332,21 @@ impl MeshNode {
         // concurrent `stop_sync` can't interleave between the identity task
         // swap and the `sync` config write.
         let _lifecycle = self.inner.sync_lifecycle.lock();
+        // §B13: sign rows as they are sequenced from now on, and sign every
+        // stored row that has none (sequenced while sync was stopped, or
+        // stored before signed sequencing) before a session, the relay or
+        // the handover below can serve it.
+        {
+            let mut store = self.inner.store.lock();
+            store.set_seq_signer(signer.clone());
+            let signed = store.sign_unsigned_rows()?;
+            if signed > 0 {
+                tracing::info!(
+                    signed,
+                    "signed stored rows that had no sequencing proof (§B13)"
+                );
+            }
+        }
         let task = self.spawn_identity_task(&runtime, membership.clone());
         if let Some(old) = self.inner.identity_task.lock().replace(task) {
             old.abort();
