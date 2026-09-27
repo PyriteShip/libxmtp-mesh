@@ -96,6 +96,7 @@ pub use node::{MeshNode, MeshStream, NodeEvent, Resolution, ResyncOutcome, Verif
 pub use relay::{ClientRelayExporter, RelayConfig, RelayExporter, RelayStats};
 pub use store::{InsertOutcome, MeshStore, NewGroupMessage, StoredGroupMessage, StoredWelcome};
 pub use sync::frames::MAX_FRAME_LEN;
+pub use sync::seq::{Equivocation, MeshStats, SeqProof, SeqRecord, SeqReject};
 pub use sync::{
     ClientGroupMembership, ClientHelloSigner, GroupMembership, HelloSigner, LinkOp, LinkProfile,
     LoopbackHub, MeshTransport, PeerId, churn_schedule, frames, random_topology,

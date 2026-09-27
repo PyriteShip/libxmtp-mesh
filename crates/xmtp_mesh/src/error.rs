@@ -52,6 +52,10 @@ pub enum MeshError {
     /// The local libxmtp client failed a call the node made for it.
     #[error("local client: {0}")]
     LocalClient(String),
+    /// A sequenced row failed its signed sequencing record check (§B13).
+    /// Fatal to a sync session; a relayed payload carrying it is dropped.
+    #[error("sequencing rejected: {0}")]
+    SequencingRejected(crate::sync::seq::SeqReject),
 }
 
 impl MeshError {
@@ -78,6 +82,9 @@ impl MeshError {
 
     /// Errors after which a sync session must drop the peer.
     pub fn is_fatal(&self) -> bool {
-        matches!(self, MeshError::AuthFailed(_) | MeshError::PeerNotMember)
+        matches!(
+            self,
+            MeshError::AuthFailed(_) | MeshError::PeerNotMember | MeshError::SequencingRejected(_)
+        )
     }
 }

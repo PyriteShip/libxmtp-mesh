@@ -2,6 +2,7 @@ pub(crate) mod auth;
 pub mod frames;
 mod loopback;
 mod membership;
+pub mod seq;
 pub(crate) mod session;
 mod transport;
 
