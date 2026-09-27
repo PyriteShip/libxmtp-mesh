@@ -9,6 +9,10 @@ impl MeshNode {
         self.inner.seq.snapshot()
     }
 
+    pub(crate) fn seq_counters(&self) -> &crate::sync::seq::SeqCounters {
+        &self.inner.seq
+    }
+
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn sequenced_rows_for_test(

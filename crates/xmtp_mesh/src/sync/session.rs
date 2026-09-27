@@ -333,12 +333,21 @@ impl Session {
             inbox_id: self.node.local_inbox().ok().flatten().unwrap_or_default(),
             challenge: self.challenge.to_vec(),
             relay: if self.self_relay { frames::RELAY_V1 } else { 0 },
+            seq: frames::SEQ_V1,
         }));
     }
 
     fn on_hello(&mut self, hello: Hello) -> Result<(), MeshError> {
         if hello.installation_key.len() != 32 || hello.challenge.len() != 32 {
             return Err(MeshError::AuthFailed("malformed hello".into()));
+        }
+        if hello.seq < frames::SEQ_V1 {
+            self.node.seq_counters().count_rejected_version();
+            return Err(MeshError::IncompatibleVersion(format!(
+                "peer speaks signed sequencing {} (this node needs {})",
+                hello.seq,
+                frames::SEQ_V1
+            )));
         }
         let own_key = self.signer.installation_key();
         if hello.installation_key == own_key {

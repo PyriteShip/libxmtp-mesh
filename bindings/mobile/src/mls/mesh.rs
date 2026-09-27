@@ -14,7 +14,7 @@ use tokio::sync::broadcast::error::RecvError;
 use xmtp_api_d14n::ClientBundle;
 use xmtp_mesh::{
     ClientGroupMembership, ClientHelloSigner, ClientRelayExporter, MAX_FRAME_LEN, MeshError,
-    MeshNode, MeshTransport, NodeEvent, PeerId, RelayStats, ResyncOutcome, VerifiedPeer,
+    MeshNode, MeshStats, MeshTransport, NodeEvent, PeerId, RelayStats, ResyncOutcome, VerifiedPeer,
 };
 use xmtp_mls::client::ClientError;
 use xmtp_mls::identity::IdentityError;
@@ -342,6 +342,33 @@ impl From<RelayStats> for FfiRelayStats {
     }
 }
 
+/// Signed-sequencing counters (DESIGN.md §B13) and peers refused for an
+/// older protocol version, since the node was opened. A snapshot.
+#[derive(uniffi::Record, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FfiMeshStats {
+    pub seq_rows_signed: u64,
+    pub seq_rows_verified: u64,
+    pub seq_rejected_missing_proof: u64,
+    pub seq_rejected_bad_signature: u64,
+    pub seq_rejected_wrong_signer: u64,
+    pub seq_equivocations: u64,
+    pub peers_rejected_version: u64,
+}
+
+impl From<MeshStats> for FfiMeshStats {
+    fn from(s: MeshStats) -> Self {
+        Self {
+            seq_rows_signed: s.seq_rows_signed,
+            seq_rows_verified: s.seq_rows_verified,
+            seq_rejected_missing_proof: s.seq_rejected_missing_proof,
+            seq_rejected_bad_signature: s.seq_rejected_bad_signature,
+            seq_rejected_wrong_signer: s.seq_rejected_wrong_signer,
+            seq_equivocations: s.seq_equivocations,
+            peers_rejected_version: s.peers_rejected_version,
+        }
+    }
+}
+
 /// Error a foreign mesh callback may return (in Kotlin: throw). The mesh
 /// logs it and carries on; it never propagates. Any other exception thrown
 /// by foreign code arrives here too, via `UnexpectedUniFFICallbackError`,
@@ -557,6 +584,10 @@ impl FfiMeshNode {
 
     pub fn relay_stats(&self) -> FfiRelayStats {
         self.node.relay_stats().into()
+    }
+
+    pub fn mesh_stats(&self) -> FfiMeshStats {
+        self.node.mesh_stats().into()
     }
 
     /// The radio opened a new connection `peer_id` (fresh, never reused).
@@ -1574,6 +1605,16 @@ mod tests {
         assert_eq!(node.relay_stats(), FfiRelayStats::default());
         node.disable_relay();
         assert!(!node.relay_enabled());
+        node.stop_sync();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mesh_stats_start_at_zero() {
+        let (client, node) = registered_mesh_client().await;
+        node.start_sync(client, Arc::new(NullTransport))
+            .await
+            .unwrap();
+        assert_eq!(node.mesh_stats(), FfiMeshStats::default());
         node.stop_sync();
     }
 }

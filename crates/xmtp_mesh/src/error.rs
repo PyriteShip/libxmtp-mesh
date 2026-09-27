@@ -56,6 +56,9 @@ pub enum MeshError {
     /// Fatal to a sync session; a relayed payload carrying it is dropped.
     #[error("sequencing rejected: {0}")]
     SequencingRejected(crate::sync::seq::SeqReject),
+    /// The peer's Hello speaks an older signed-sequencing version (§B13).
+    #[error("incompatible peer: {0}")]
+    IncompatibleVersion(String),
 }
 
 impl MeshError {
@@ -84,7 +87,10 @@ impl MeshError {
     pub fn is_fatal(&self) -> bool {
         matches!(
             self,
-            MeshError::AuthFailed(_) | MeshError::PeerNotMember | MeshError::SequencingRejected(_)
+            MeshError::AuthFailed(_)
+                | MeshError::PeerNotMember
+                | MeshError::SequencingRejected(_)
+                | MeshError::IncompatibleVersion(_)
         )
     }
 }

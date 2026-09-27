@@ -11,6 +11,10 @@ pub const FRAME_VERSION: u32 = 1;
 /// Relay protocol version (§R5.2, §R7).
 pub const RELAY_V1: u32 = 1;
 
+/// Signed-sequencing version (§B13). A peer whose Hello says less is
+/// refused: mesh.10 syncs only with mesh.10.
+pub const SEQ_V1: u32 = 1;
+
 /// Largest encoded frame a node sends or accepts.
 pub const MAX_FRAME_LEN: usize = 1024 * 1024;
 
@@ -149,6 +153,9 @@ pub struct Hello {
     /// Relay protocol version the sender speaks (0: none; [`RELAY_V1`]).
     #[prost(uint32, tag = "4")]
     pub relay: u32,
+    /// Signed-sequencing version the sender speaks (0: none; [`SEQ_V1`]).
+    #[prost(uint32, tag = "5")]
+    pub seq: u32,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
@@ -431,5 +438,30 @@ mod tests {
         ] {
             assert_eq!(decode(&encode(body.clone())).unwrap(), body);
         }
+    }
+
+    /// A mesh.9 Hello (fields 1–4) reads as `seq` 0: refused (§B13).
+    #[test]
+    fn hello_without_seq_field_decodes_as_zero() {
+        #[derive(Clone, PartialEq, prost::Message)]
+        struct Mesh9Hello {
+            #[prost(bytes = "vec", tag = "1")]
+            installation_key: Vec<u8>,
+            #[prost(string, tag = "2")]
+            inbox_id: String,
+            #[prost(bytes = "vec", tag = "3")]
+            challenge: Vec<u8>,
+            #[prost(uint32, tag = "4")]
+            relay: u32,
+        }
+        let old = Mesh9Hello {
+            installation_key: vec![1; 32],
+            inbox_id: "i".into(),
+            challenge: vec![2; 32],
+            relay: RELAY_V1,
+        };
+        let hello = Hello::decode(old.encode_to_vec().as_slice()).unwrap();
+        assert_eq!((hello.relay, hello.seq), (RELAY_V1, 0));
+        assert!(MeshError::IncompatibleVersion("seq 0".into()).is_fatal());
     }
 }

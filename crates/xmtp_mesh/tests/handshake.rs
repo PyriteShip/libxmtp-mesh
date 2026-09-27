@@ -190,6 +190,7 @@ fn hello(installation_key: Vec<u8>, challenge: [u8; 32]) -> Vec<u8> {
         inbox_id: String::new(),
         challenge: challenge.to_vec(),
         relay: 0,
+        seq: frames::SEQ_V1,
     }))
 }
 
@@ -378,4 +379,36 @@ async fn hello_is_resent_while_handshaking_and_bounded() {
     })
     .await;
     assert_eq!(hellos(), 1 + 3);
+}
+
+/// §B13 hard cut: a Hello without signed sequencing (a mesh.9 phone) ends
+/// the session before any Auth, and is counted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hello_without_signed_sequencing_is_refused() {
+    let hub = LoopbackHub::new();
+    let (a, _a_key, recorder) = recorded_node(&hub).await;
+    let old = ClientHelloSigner(build_client(&MeshNode::in_memory().unwrap()).await);
+    hub.inject(
+        "old",
+        "a",
+        frames::encode(Body::Hello(Hello {
+            installation_key: old.installation_key(),
+            inbox_id: String::new(),
+            challenge: vec![7; 32],
+            relay: 0,
+            seq: 0,
+        })),
+    );
+    eventually("a disconnects the mesh.9 peer", || async {
+        recorder.disconnected("old")
+    })
+    .await;
+    assert_eq!(a.mesh_stats().peers_rejected_version, 1);
+    assert!(
+        !recorder
+            .sent_to("old")
+            .iter()
+            .any(|b| matches!(b, Body::Auth(_))),
+        "no Auth answers a mesh.9 Hello"
+    );
 }
