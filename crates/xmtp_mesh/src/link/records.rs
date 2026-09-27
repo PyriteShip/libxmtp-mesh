@@ -126,7 +126,7 @@ impl State {
         if self.partial.len() + chunk.len() > MAX_FRAME_LEN {
             return Err(rejected("frame over MAX_FRAME_LEN"));
         }
-        self.partial.extend_from_slice(chunk);
+        self.append(chunk);
         match *flag {
             LAST => Ok(Some(std::mem::take(&mut self.partial))),
             MORE => Ok(None),
@@ -134,8 +134,24 @@ impl State {
         }
     }
 
+    /// Grows `partial` by hand so no reallocation leaves a plaintext copy
+    /// behind: the old buffer is zeroized before it is freed.
+    fn append(&mut self, chunk: &[u8]) {
+        let need = self.partial.len() + chunk.len();
+        if need > self.partial.capacity() {
+            let capacity = need
+                .max(self.partial.capacity().saturating_mul(2))
+                .min(MAX_FRAME_LEN.max(need));
+            let mut grown = Vec::with_capacity(capacity);
+            grown.extend_from_slice(&self.partial);
+            self.partial.zeroize();
+            self.partial = grown;
+        }
+        self.partial.extend_from_slice(chunk);
+    }
+
     fn seal_one(&mut self, flag: u8, chunk: &[u8]) -> Result<Vec<u8>, MeshError> {
-        let mut plain = Vec::with_capacity(chunk.len() + 1);
+        let mut plain = Zeroizing::new(Vec::with_capacity(chunk.len() + 1));
         plain.push(flag);
         plain.extend_from_slice(chunk);
         let mut sealed = vec![0u8; plain.len() + TAG_LEN];
@@ -171,7 +187,7 @@ mod tests {
         assert_eq!(b.open(&records[0]).unwrap(), Some(b"hello".to_vec()));
     }
 
-    /// Spec §10 "1 MiB frame".
+    /// A 1 MiB frame.
     #[test]
     fn a_one_mib_frame_is_split_into_records_and_reassembled() {
         let (a, b) = pair();
@@ -187,7 +203,7 @@ mod tests {
         assert_eq!(b.open(last).unwrap(), Some(frame));
     }
 
-    /// Spec §10 "tampered ciphertext / reordered records".
+    /// Tampered, reordered and replayed records.
     #[test]
     fn tampered_reordered_or_replayed_records_are_rejected() {
         let (a, b) = pair();
