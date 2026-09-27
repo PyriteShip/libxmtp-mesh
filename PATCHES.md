@@ -1,0 +1,59 @@
+# xmtp-mesh patches on libxmtp
+
+This fork adds xmtp-mesh (serverless XMTP v3 over a Bluetooth mesh) to libxmtp.
+See `docs/xmtp-mesh/README.md` for an overview and `docs/xmtp-mesh/DESIGN.md` for the
+design; section ids like §C4.3 below refer to DESIGN.md.
+
+Most of the fork is new files. The table below lists every change to a file that
+already exists upstream, so a rebase knows where conflicts can come from.
+
+Base tag: android-4.10.0-rc2
+Base commit: da3a7eff05445b0dde5a4ea4f68ec5e9a22bab27
+
+- The fork has two layers: the **Rust core** (the `xmtp_mesh` crate plus the small
+  `xmtp_db`/`xmtp_mls`/`xmtp_id` edits it needs) and the **Android bindings/SDK** (the
+  uniffi FFI, the Kotlin BLE radio and AAR publishing), which depends on the core. The
+  "Layer" column below says which layer(s) a file belongs to. The current published
+  version is `4.10.0-rc2-mesh.9`.
+- Regenerate the file lists with `git diff --name-status <Base commit> HEAD`.
+  `.github/xmtp-mesh/check-patches.sh PATCHES.md` fails if an edited upstream file is
+  missing from the table below. The weekly upstream-drift workflow runs it.
+
+## Edits to upstream files
+
+| File | Layer | Purpose |
+|---|---|---|
+| `Cargo.lock` | Rust core, Android bindings/SDK | Adds the `xmtp_mesh` package (core). Adds `bytes`, `http` and `xmtp_mesh` to `xmtpv3`'s dependencies (Android bindings). Adds `aes-gcm`, `hkdf` and `hmac` to `xmtp_mesh`'s dependencies (core and Android bindings; multi-hop relay). Let cargo regenerate it; don't hand-merge it. |
+| `crates/xmtp_common/src/logging.rs` | Android bindings/SDK | Adds `xmtp_mesh={level}` to `filter_directive`, so mesh and relay logs reach logcat at the configured level. |
+| `crates/xmtp_db/src/encrypted_store/association_state.rs` | Rust core, Android bindings/SDK | `batch_read_from_cache` keeps only the requested (inbox_id, sequence_id) pairs, plus a regression test. Upstream fixed the same bug in #3802 (0645b16b9, in android-4.11.0-rc1 and later), so drop this edit when rebasing onto such a tag. |
+| `crates/xmtp_db/src/encrypted_store/identity_update.rs` | Rust core, Android bindings/SDK | `QueryIdentityUpdates::replace_identity_log` (atomically deletes an inbox's `identity_updates` and `association_state` rows and inserts the winning log, one transaction, refuses a gap or a mismatched-inbox row), `write_to_cache_if_current` (caches an association state only if its source row is still current, one write transaction) and `insert_identity_updates_if_current` (conditional insert guarded by a caller-read cursor), plus their tests. Restore convergence, §C4.3. |
+| `crates/xmtp_db/src/mock.rs` | Rust core, Android bindings/SDK | Mocks `replace_identity_log`, `write_to_cache_if_current` and `insert_identity_updates_if_current`. |
+| `crates/xmtp_id/src/associations/unverified.rs` | Rust core, Android bindings/SDK | `UnverifiedIdentityUpdate::signature_text` made `pub`: lets a caller rank or compare two identity-log origins on exactly the signed content, not on unsigned bytes such as `client_timestamp_ns`'s sub-second digits. Restore convergence, §C4.1 (D24). |
+| `crates/xmtp_mls/src/groups/group_membership.rs` | Rust core, Android bindings/SDK | `MembershipDiffWithKeyPackages::reconcile_with_leaves` (leaf-aware diff, §C4.6). Candidate to send upstream. |
+| `crates/xmtp_mls/src/groups/members.rs` | Rust core, Android bindings/SDK | `MlsGroup::leaf_installation_ids` (the mesh sequencer handover, §C4.7). |
+| `crates/xmtp_mls/src/groups/mls_sync/update_group_membership.rs` | Rust core, Android bindings/SDK | Calls `reconcile_with_leaves` before building the commit (§C4.6). Candidate to send upstream. |
+| `crates/xmtp_mls/src/groups/tests/mod.rs` | Rust core, Android bindings/SDK | Registers `test_expected_diff_matches_commit`. |
+| `crates/xmtp_mls/src/groups/validated_commit.rs` | Rust core, Android bindings/SDK | `expected_diff_matches_commit` compares removals only against current leaves and excuses only non-leaf `failed_installations` entries (a stale or forged entry no longer excuses a live leaf's revoke, §C4.6); made `pub(super)` for its tests. `CommitValidationError::UnexpectedInstallationsRemoved` changed from a tuple variant to a struct variant. Candidate to send upstream. |
+| `crates/xmtp_mls/src/identity_updates.rs` | Rust core, Android bindings/SDK | `resync_identity_log` (drops a replaced inbox's cached log and state, one transaction, then reloads) and `rebase_installation_signature_request` (§C4.3–§C4.4). `load_identity_updates` now reads each inbox's current cursor row before its network fetch and writes through `insert_identity_updates_if_current` (a per-inbox read plus write transaction added to this upstream hot path), so a concurrent `resync_identity_log` replace can't have a stale fetch's rows land on top of the winner. `get_association_state_with_verifier` and `get_association_state_diff` now write their computed state through `write_to_cache_if_current` instead of the unconditional cache write (one more read of the source row per cache write, in one write transaction, on this upstream hot path), so a state computed from a log a concurrent replace just purged is never cached over the winner. |
+| `bindings/mobile/Cargo.toml` | Android bindings/SDK | Adds the `xmtp_mesh` (path), `bytes` and `http` dependencies. |
+| `bindings/mobile/src/mls.rs` | Android bindings/SDK | `pub mod mesh;` |
+| `nix/lib/filesets.nix` | Android bindings/SDK | Adds `crates/xmtp_mesh/migrations` to the Nix source fileset. |
+| `sdks/android/gradle.properties` | Android bindings/SDK | `version=4.10.0-rc2-mesh.9`. |
+| `sdks/android/library/build.gradle` | Android bindings/SDK | Adds the Robolectric and androidx.test:core unit-test dependencies and `includeAndroidResources`. Signs the publication only when `SIGN_KEY` is set, so local mesh builds are unsigned. |
+| `sdks/android/library/src/main/AndroidManifest.xml` | Android bindings/SDK | Adds the BLE, foreground-service and notification permissions, and declares `MeshForegroundService`. |
+| `sdks/android/library/src/main/java/org/xmtp/android/library/Client.kt` | Android bindings/SDK | Adds `ClientOptions.Api.mesh`, the `XMTPEnvironment.MESH` backend via `connectToMesh`, and `meshCanMessage`. Turns device sync off under MESH. Exposes `ffiClientForMesh`. Adds meshRebaseInstallation (restore convergence, §C4.4). |
+| `sdks/android/library/src/main/java/org/xmtp/android/library/XMTPEnvironment.kt` | Android bindings/SDK | Adds `MESH("mesh")` with host `mesh://local` and no gRPC host. |
+
+## New files
+
+| Path | Files | Layer | What |
+|---|---|---|---|
+| `crates/xmtp_mesh/` | 68 | Rust core, Android bindings/SDK | The mesh node crate: store, v3 API endpoints, peer sync, tests. Restore convergence (§C4.1–§C4.4, §C4.7) adds `node/convergence.rs`, `node/handover.rs`, `node/test_logs.rs`, `tests/convergence.rs`, `tests/rebase.rs`, `tests/restore_membership.rs` and the `migrations/2026-09-25-000000_pending_resyncs/` migration (`up.sql`, `down.sql`), which persists client resyncs still owed after a replace. Multi-hop relay phase 1 adds the `relay/` module (`config.rs`, `dm.rs`, `engine.rs`, `envelope.rs`, `inner.rs`, `keys.rs`, `mod.rs`, `spool.rs`), `store/relay.rs`, the `migrations/2026-10-01-000000_relay/` migration (`up.sql`, `down.sql`) and `tests/relay_dm.rs`, `tests/relay_links.rs`, `tests/relay_sim.rs` (14 files). |
+| `crates/xmtp_mls/src/groups/tests/test_expected_diff_matches_commit.rs` | 1 | Rust core, Android bindings/SDK | §C4.6 validator tests. |
+| `bindings/mobile/src/mls/mesh.rs` | 1 | Android bindings/SDK | The mesh FFI. Restore convergence adds `stream_identity` (identity-resync events to the app) and `FfiXmtpClient::mesh_rebase_signature_request`. Multi-hop relay phase 1 adds `FfiRelayStats` and `FfiMeshNode::{enable_relay, disable_relay, relay_enabled, relay_stats}`. |
+| `sdks/android/dev/` (`bindings-local`, `mesh-env`, `mesh-two-device-test`, `publish-mesh-local`) | 4 | Android bindings/SDK | Dev build, two-phone test and mavenLocal publish scripts. |
+| `sdks/android/library/src/main/java/org/xmtp/android/library/mesh/` | 39 | Android bindings/SDK | The Kotlin BLE radio: link, policy, ble, MeshRadio, the service and Mesh. Restore convergence adds `MeshIdentityEvents.kt`. Multi-hop relay phase 1 adds `MeshRelay.kt` (the userEnabled/pausedForBattery/active switch and its policy) and `MeshBatteryWatch.kt` (the battery broadcast receiver behind the pause). |
+| `sdks/android/library/src/test/java/org/xmtp/android/library/` (`mesh/`, `MeshEnvironmentTest.kt`) | 34 | Android bindings/SDK | Unit tests. Multi-hop relay phase 1 adds `MeshRelayPolicyTest.kt`, `MeshStartRelayOrderTest.kt`. |
+| `sdks/android/library/src/androidTest/java/org/xmtp/android/library/mesh/` | 4 | Android bindings/SDK | Instrumented tests. |
+| `docs/xmtp-mesh/` (`README.md`, `DESIGN.md`) | 2 | Android bindings/SDK | The fork's overview and its public design document. |
+| `PATCHES.md`, `.github/xmtp-mesh/`, `.github/workflows/upstream-drift.yml` | 14 | Android bindings/SDK | This file and the weekly upstream-drift check: `newest-tag.sh`, `drift.sh`, `report-issue.sh`, `resolve-android-target.sh` (resolves the drift target from the newest xmtp-react-native release's `android/build.gradle` pin, not the newest libxmtp `android-*` tag), `resolve-target.sh` (wraps it so a failed resolution reports "unresolved" through the normal issue path instead of crashing the job), each with a test, plus the workflow. |

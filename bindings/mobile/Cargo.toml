@@ -10,9 +10,13 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 async-trait.workspace = true
+bytes.workspace = true
 chrono.workspace = true
 futures.workspace = true
 hex.workspace = true
+# version pinned to match xmtp_proto's own declaration (crates/xmtp_proto/Cargo.toml),
+# needed for the mesh Client/IsConnectedCheck impl in mls/mesh.rs.
+http = "1.2"
 parking_lot.workspace = true
 prost.workspace = true
 serde_json.workspace = true
@@ -37,6 +41,8 @@ xmtp_cryptography.workspace = true
 xmtp_db.workspace = true
 xmtp_id.workspace = true
 xmtp_mls.workspace = true
+# xmtp-mesh fork. Never add features = ["test-utils"] here or under [dev-dependencies].
+xmtp_mesh = { path = "../../crates/xmtp_mesh" }
 xmtp_proto.workspace = true
 
 # Bench

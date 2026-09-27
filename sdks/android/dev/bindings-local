@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Build Android native libs + Kotlin bindings without Nix (cargo-ndk).
+# Usage: sdks/android/dev/bindings-local [--fast]
+#   --fast        arm64-v8a only (physical phones). Same as MESH_ABIS=arm64-v8a.
+#   MESH_ABIS     space-separated Android ABI names to build (env var).
+#                 Default: all four (arm64-v8a armeabi-v7a x86_64 x86).
+#                 Recognized values: arm64-v8a armeabi-v7a x86_64 x86
+# Output (same layout as `nix build .#android-libs`): sdks/android/.build/bindings/
+# Builds with default features only: never add --features (xmtp_mesh/test-utils must stay off).
+set -euo pipefail
+
+ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+SDK_ROOT="$ROOT/sdks/android"
+# shellcheck source=/dev/null
+source "$SDK_ROOT/dev/mesh-env"
+
+declare -A TARGET_FOR_ABI=(
+  [arm64-v8a]=aarch64-linux-android
+  [armeabi-v7a]=armv7-linux-androideabi
+  [x86_64]=x86_64-linux-android
+  [x86]=i686-linux-android
+)
+
+if [[ "${1:-}" == "--fast" ]]; then
+  ABIS=(arm64-v8a)
+else
+  # shellcheck disable=SC2206 # word-splitting is intentional here
+  ABIS=(${MESH_ABIS:-arm64-v8a armeabi-v7a x86_64 x86})
+fi
+
+TARGETS=()
+declare -A ABI=()
+for A in "${ABIS[@]}"; do
+  T="${TARGET_FOR_ABI[$A]:-}"
+  if [[ -z "$T" ]]; then
+    echo "bindings-local: unknown ABI '$A' (expected one of: ${!TARGET_FOR_ABI[*]})" >&2
+    exit 1
+  fi
+  TARGETS+=("$T")
+  ABI[$T]="$A"
+done
+
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
+cd "$ROOT"
+
+for T in "${TARGETS[@]}"; do
+  echo "==> $T"
+  cargo ndk --platform 23 -t "$T" --manifest-path ./bindings/mobile/Cargo.toml \
+    -o "$STAGE/jniLibs" -- build --release
+  mv "$STAGE/jniLibs/${ABI[$T]}/libxmtpv3.so" "$STAGE/jniLibs/${ABI[$T]}/libuniffi_xmtpv3.so"
+done
+
+echo "==> Kotlin bindings (host)"
+cargo build --release -p xmtpv3
+TARGET_DIR="$(cargo metadata --format-version 1 --no-deps | jq -r .target_directory)"
+HOST_LIB="$TARGET_DIR/release/libxmtpv3.so"
+[[ "$(uname)" == "Darwin" ]] && HOST_LIB="$TARGET_DIR/release/libxmtpv3.dylib"
+cargo run --release -p xmtpv3 --bin ffi-uniffi-bindgen --features uniffi/cli -- \
+  generate --library "$HOST_LIB" --out-dir "$STAGE/kotlin" --language kotlin
+KT="$STAGE/kotlin/uniffi/xmtpv3/xmtpv3.kt"
+sed -i \
+  -e 's/return "xmtpv3"/return "uniffi_xmtpv3"/' \
+  -e 's/value\.forEach { (k, v) ->/value.iterator().forEach { (k, v) ->/g' \
+  -e 's/@file:Suppress("NAME_SHADOWING")/@file:Suppress("NAME_SHADOWING", "NewApi")/' \
+  "$KT"
+
+OUT="$SDK_ROOT/.build/bindings"
+rm -rf "$OUT"   # may be a read-only Nix out-link
+mkdir -p "$OUT/java/uniffi/xmtpv3"
+cp -r "$STAGE/jniLibs" "$OUT/jniLibs"
+cp "$KT" "$OUT/java/uniffi/xmtpv3/xmtpv3.kt"
+{
+  echo "Version: $(git -C "$ROOT" rev-parse --short HEAD) (xmtp-mesh fork, cargo-ndk)"
+  echo "Date: $(date -u +%Y-%m-%d)"
+} > "$OUT/libxmtp-version.txt"
+
+echo "Built: $(cd "$OUT/jniLibs" && ls -d */ | tr -d / | tr '\n' ' ')"

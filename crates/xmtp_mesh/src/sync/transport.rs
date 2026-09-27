@@ -1,0 +1,31 @@
+/// Opaque, radio-assigned id for one connection to a peer.
+pub type PeerId = String;
+
+/// The radio, as the node sees it (BLE in sub-project 2). The radio does
+/// chunking and reassembly; the node always sends whole frames.
+///
+/// Contract a transport must keep:
+/// - Each `PeerId` names ONE reliable, ordered byte pipe. Ids are
+///   connection-scoped: a transport MUST use a fresh `PeerId` for every new
+///   connection (for example `"<shortid>#<n>"`), even to the same device, and
+///   never reuses an id after reporting `on_peer_lost` for it.
+/// - `MeshNode::on_peer_connected(p)` means a new pipe `p` is up; the node
+///   starts a fresh sync session for it (replacing any session it holds for `p`).
+/// - `MeshNode::on_frame(p, ..)` delivers whole frames in order. A frame may
+///   arrive just before `on_peer_connected(p)`; the node then creates the
+///   session on the first frame.
+/// - `MeshNode::on_peer_lost(p)` means the pipe is gone.
+/// - `send` must not block (queue and return); `disconnect` asks the radio to
+///   drop the pipe and later report `on_peer_lost`.
+///
+/// A session that does not authenticate its peer within the handshake
+/// deadline (15 s) is disconnected, so stray frames and devices that never
+/// speak the protocol cannot hold a session (or a radio slot) forever.
+///
+/// [`LoopbackHub`](super::LoopbackHub) reuses node names as `PeerId`s across
+/// re-links for test readability; the node tolerates that (a re-link starts a
+/// fresh session), but real transports must not rely on it.
+pub trait MeshTransport: Send + Sync {
+    fn send(&self, peer: &PeerId, frame: Vec<u8>);
+    fn disconnect(&self, peer: &PeerId);
+}

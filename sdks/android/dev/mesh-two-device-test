@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# Two-phone BLE ping/pong, then a Mesh.start -> stop -> start reconnect on both phones.
+# Usage: dev/mesh-two-device-test <serial-alpha> <serial-bravo>
+# Both phones: Bluetooth on, screen unlocked, within ~2 m for the first run.
+# Set SKIP_BUILD=1 to reuse the last built test APK.
+set -euo pipefail
+A="${1:?usage: mesh-two-device-test <serial-alpha> <serial-bravo>}"
+B="${2:?usage: mesh-two-device-test <serial-alpha> <serial-bravo>}"
+SDK_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$SDK_ROOT"
+
+[[ "${SKIP_BUILD:-0}" == 1 ]] || ./gradlew :library:assembleDebugAndroidTest
+APK="library/build/outputs/apk/androidTest/debug/library-debug-androidTest.apk"
+PKG="org.xmtp.android.library.test"
+RUNNER="$PKG/androidx.test.runner.AndroidJUnitRunner"
+CLASS="org.xmtp.android.library.mesh.MeshTwoDeviceTest"
+TAGS=(MeshTwoDeviceTest MeshRadio MeshScanner MeshAdvertiser MeshGattClient MeshGattServer MeshForegroundService)
+
+for S in "$A" "$B"; do
+  # -g grants the runtime permissions (Nearby devices; location on API <= 30; notifications on 33+).
+  adb -s "$S" install -r -t -g "$APK"
+done
+
+LOGS="$(mktemp -d)"
+ok=1
+# Both phones run the same test method at the same moment; each run is a fresh process.
+# A pass needs "OK (1 test)" from both phones AND each phone's final log mark, so a run
+# where the test body never executed (e.g. an assumption-skip because meshRole did not
+# arrive) cannot report PASS.
+run_both() {
+  local method="$1" mark_a="$2" mark_b="$3"
+  for S in "$A" "$B"; do adb -s "$S" logcat -c; done
+  local start=$SECONDS
+  timeout 600 adb -s "$A" shell am instrument -w -r -e meshRole alpha -e class "$CLASS#$method" "$RUNNER" > "$LOGS/$method-alpha.txt" &
+  local pa=$!
+  timeout 600 adb -s "$B" shell am instrument -w -r -e meshRole bravo -e class "$CLASS#$method" "$RUNNER" > "$LOGS/$method-bravo.txt" &
+  local pb=$!
+  wait "$pa" || true
+  wait "$pb" || true
+  for S in "$A" "$B"; do adb -s "$S" logcat -d -s "${TAGS[@]}" > "$LOGS/$method-logcat-$S.txt"; done
+  if grep -q "OK (1 test)" "$LOGS/$method-alpha.txt" && grep -q "OK (1 test)" "$LOGS/$method-bravo.txt" \
+    && grep -q "$mark_a" "$LOGS/$method-logcat-$A.txt" && grep -q "$mark_b" "$LOGS/$method-logcat-$B.txt"; then
+    echo "PASS: $method ($((SECONDS - start)) s)"
+  else
+    echo "FAIL: $method ($((SECONDS - start)) s)"
+    ok=0
+  fi
+  for S in "$A" "$B"; do grep " MeshTwoDeviceTest: " "$LOGS/$method-logcat-$S.txt" | sed "s/^/  $S /" || true; done
+}
+
+run_both pingPongOverBle "pong received" "pong published"
+run_both meshRestartReconnects "verified after restart" "verified after restart"
+
+echo "logs: $LOGS"
+[[ "$ok" == 1 ]] && echo "PASS: ping/pong over BLE; Mesh restart reconnects" || { echo "FAIL (see logs)"; exit 1; }

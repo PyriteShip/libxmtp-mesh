@@ -35,6 +35,9 @@ android {
     }
     testOptions {
         animationsDisabled = true
+        unitTests {
+            includeAndroidResources = true
+        }
     }
     kotlinOptions {
         jvmTarget = '17'
@@ -95,6 +98,8 @@ dependencies {
 
     testImplementation 'junit:junit:4.13.2'
     testImplementation 'androidx.test:monitor:1.7.2'
+    testImplementation 'org.robolectric:robolectric:4.16.1'
+    testImplementation 'androidx.test:core:1.7.0'
     androidTestImplementation 'app.cash.turbine:turbine:1.1.0'
     androidTestImplementation 'org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.0'
     androidTestImplementation 'androidx.test.ext:junit:1.1.5'
@@ -141,10 +146,12 @@ afterEvaluate {
             }
         }
     }
-    signing {
-        def signingKey = System.getenv("SIGN_KEY")
-        def signingPassword = System.getenv("SIGN_PASSWORD")
-        useInMemoryPgpKeys(signingKey, signingPassword)
-        sign publishing.publications.release
+    // Local mesh builds are unsigned; CI releases still sign when SIGN_KEY is set.
+    def signingKey = System.getenv("SIGN_KEY")
+    if (signingKey != null) {
+        signing {
+            useInMemoryPgpKeys(signingKey, System.getenv("SIGN_PASSWORD"))
+            sign publishing.publications.release
+        }
     }
 }

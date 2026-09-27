@@ -5,6 +5,7 @@ enum class XMTPEnvironment(
 ) {
     DEV("grpc.dev.xmtp.network"),
     PRODUCTION("grpc.production.xmtp.network"),
+    MESH("mesh"),
     LOCAL("10.0.2.2") {
         override fun withValue(value: String): XMTPEnvironment = LOCAL.apply { customValue = value }
     }, ;
@@ -26,6 +27,7 @@ enum class XMTPEnvironment(
         when (this) {
             DEV -> "https://${getValue()}:443"
             PRODUCTION -> "https://${getValue()}:443"
+            MESH -> "mesh://local"
             LOCAL -> "http://${getValue()}:5556"
         }
 
@@ -34,5 +36,6 @@ enum class XMTPEnvironment(
             PRODUCTION -> "https://message-history.production.ephemera.network"
             LOCAL -> "http://10.0.2.2:5558"
             DEV -> "https://message-history.dev.ephemera.network"
+            MESH -> ""
         }
 }

@@ -10203,6 +10203,45 @@ dependencies = [
 ]
 
 [[package]]
+name = "xmtp_mesh"
+version = "1.10.0"
+dependencies = [
+ "aes-gcm",
+ "alloy",
+ "async-trait",
+ "bytes",
+ "const-hex",
+ "diesel",
+ "diesel_migrations",
+ "futures",
+ "hkdf",
+ "hmac",
+ "http 1.4.0",
+ "libsqlite3-sys",
+ "openmls",
+ "openmls_rust_crypto",
+ "parking_lot 0.12.5",
+ "prost",
+ "rand 0.10.0",
+ "sha2",
+ "thiserror 2.0.17",
+ "tokio",
+ "tonic",
+ "tracing",
+ "xmtp-workspace-hack",
+ "xmtp_api_d14n",
+ "xmtp_api_grpc",
+ "xmtp_common",
+ "xmtp_configuration",
+ "xmtp_cryptography",
+ "xmtp_db",
+ "xmtp_id",
+ "xmtp_mesh",
+ "xmtp_mls",
+ "xmtp_proto",
+]
+
+[[package]]
 name = "xmtp_mls"
 version = "1.10.0"
 dependencies = [
@@ -10352,12 +10391,14 @@ version = "1.10.0"
 dependencies = [
  "alloy",
  "async-trait",
+ "bytes",
  "chrono",
  "const-hex",
  "criterion",
  "ctor",
  "fdlimit",
  "futures",
+ "http 1.4.0",
  "paranoid-android",
  "parking_lot 0.12.5",
  "prost",
@@ -10385,6 +10426,7 @@ dependencies = [
  "xmtp_db",
  "xmtp_id",
  "xmtp_macro",
+ "xmtp_mesh",
  "xmtp_mls",
  "xmtp_proto",
 ]

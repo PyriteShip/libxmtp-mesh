@@ -1,0 +1,267 @@
+# Weekly: replay the xmtp-mesh stack onto the libxmtp android release that the newest
+# xmtp-react-native release actually pins (not just the newest libxmtp android-*
+# tag: the RN fork can't consume a newer AAR until upstream RN moves to it), then run
+# the mesh, xmtp_db and xmtpv3 checks. A conflict or a failure opens or updates ONE
+# issue labelled upstream-drift. Scripts and their tests live in .github/xmtp-mesh/.
+#
+# TODO: extend "Run the tests" below to also run
+#   cargo test -p xmtp_mls --lib test_expected_diff_matches_commit
+#   cargo test -p xmtp_db --lib purge_identity_log
+# Restore convergence patches upstream xmtp_mls/xmtp_db files that this job
+# today only compiles (via cargo check -p xmtpv3), never tests.
+name: upstream-drift
+
+on:
+  schedule:
+    - cron: '23 5 * * 1' # Mondays 05:23 UTC
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Upstream tag to replay onto (empty = resolved from the newest xmtp-react-native release's android/build.gradle pin)
+        type: string
+        default: ''
+      toolchain:
+        description: Rust toolchain (empty = rust-toolchain.toml if it pins a version, else 1.92.0)
+        type: string
+        default: ''
+      force:
+        description: Run even if this tag and stack tip were already checked
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-drift
+  cancel-in-progress: false
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      UPSTREAM_URL: https://github.com/xmtp/libxmtp.git
+      RN_URL: https://github.com/xmtp/xmtp-react-native.git
+      TAG_PREFIX: android-
+      KEEP_UPSTREAM: Cargo.lock sdks/android/gradle.properties
+      DEFAULT_TOOLCHAIN: 1.92.0
+      CARGO_INCREMENTAL: '0'
+      CARGO_TERM_COLOR: never
+      GH_TOKEN: ${{ github.token }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      TAG_INPUT: ${{ inputs.tag }}
+      TOOLCHAIN_INPUT: ${{ inputs.toolchain }}
+      FORCE: ${{ inputs.force && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 64
+
+      - name: Resolve the tag, base and stack tip
+        id: plan
+        run: |
+          set -euo pipefail
+          cp -r .github/xmtp-mesh "$RUNNER_TEMP/xm"
+          base=$(sed -n 's/^Base commit: \([0-9a-f]\{40\}\)$/\1/p' PATCHES.md)
+          base_tag=$(sed -n 's/^Base tag: \(.*\)$/\1/p' PATCHES.md)
+          [ -n "$base" ] || { echo "::error::PATCHES.md has no Base commit line"; exit 1; }
+          git cat-file -e "$base^{commit}" 2>/dev/null || git fetch -q --deepen=200 origin
+          tag=$TAG_INPUT
+          skip=false
+          resolved=true
+          reason=
+          if [ -n "$tag" ]; then
+            [[ $tag =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::bad tag input"; exit 1; }
+          else
+            # The target is the org.xmtp:android pin in the newest xmtp-react-native
+            # release's android/build.gradle, not the newest libxmtp android-* tag. A
+            # failure anywhere in this lookup (an unreachable RN_URL, no v* tags, a
+            # moved/renamed build.gradle, an unparseable pin) must not crash the job
+            # before an issue is filed: gather what we can, without ever letting a
+            # failed command trip `set -e` here, and hand the result to
+            # resolve-target.sh, which always exits 0 and reports "unresolved" instead
+            # of aborting.
+            rn_tag=$(git ls-remote --tags --refs "$RN_URL" 'refs/tags/v*' \
+              | sed 's|.*refs/tags/||' | "$RUNNER_TEMP/xm/newest-tag.sh" v) || rn_tag=unknown
+            gradle=""
+            if [ "$rn_tag" != unknown ] \
+                && git fetch -q --no-tags --depth=1 "$RN_URL" "refs/tags/$rn_tag:refs/rn-pin/$rn_tag" 2>/dev/null; then
+              gradle=$(git show "refs/rn-pin/$rn_tag:android/build.gradle" 2>/dev/null || true)
+              git update-ref -d "refs/rn-pin/$rn_tag" 2>/dev/null || true
+            fi
+            result=$(printf '%s' "$gradle" | "$RUNNER_TEMP/xm/resolve-target.sh" "$TAG_PREFIX" "$base_tag" "$rn_tag")
+            resolved=$(sed -n 's/^resolved=//p' <<< "$result")
+            if [ "$resolved" = true ]; then
+              tag=$(sed -n 's/^tag=//p' <<< "$result")
+              skip=$(sed -n 's/^skip=//p' <<< "$result")
+              if [ "$skip" = true ]; then
+                echo "::notice::No drift: xmtp-react-native's newest release, $rn_tag, still pins $tag, our base."
+              fi
+            else
+              reason=$(sed -n 's/^reason=//p' <<< "$result")
+              echo "::error::upstream-drift: could not resolve the target ($reason)"
+            fi
+          fi
+          {
+            echo "tag=$tag"
+            echo "base=$base"
+            echo "stack=$(git rev-parse HEAD)"
+            echo "skip=$skip"
+            echo "resolved=$resolved"
+            echo "reason=$reason"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Look for an earlier check of this tag and stack tip
+        id: marker
+        if: steps.plan.outputs.resolved == 'true' && steps.plan.outputs.skip != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .drift-marker
+          key: drift-${{ steps.plan.outputs.tag }}-${{ steps.plan.outputs.stack }}
+          lookup-only: true
+
+      - name: Decide whether to run
+        id: gate
+        env:
+          RESOLVED: ${{ steps.plan.outputs.resolved }}
+          SKIP: ${{ steps.plan.outputs.skip }}
+          HIT: ${{ steps.marker.outputs.cache-hit }}
+        run: |
+          if [ "$RESOLVED" != true ]; then run=false
+          elif [ "$SKIP" = true ]; then run=false
+          elif [ "$HIT" = true ] && [ "$FORCE" != true ]; then
+            echo "::notice::This tag and stack tip were already checked. Dispatch with force to re-run."
+            run=false
+          else run=true; fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+
+      - name: Check that PATCHES.md lists every edited upstream file
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          "$RUNNER_TEMP/xm/check-patches.sh" PATCHES.md HEAD > "$RUNNER_TEMP/patches.txt" 2>&1 \
+            && rm "$RUNNER_TEMP/patches.txt" || true
+
+      - name: Replay the stack onto the upstream tag
+        id: replay
+        if: steps.gate.outputs.run == 'true'
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+          BASE: ${{ steps.plan.outputs.base }}
+          STACK: ${{ steps.plan.outputs.stack }}
+        run: |
+          set -euo pipefail
+          git config user.name "xmtp-mesh drift"
+          git config user.email "drift@users.noreply.github.com"
+          git fetch -q --no-tags --depth=1 "$UPSTREAM_URL" "refs/tags/$TAG:refs/tags/$TAG"
+          rc=0
+          "$RUNNER_TEMP/xm/drift.sh" "$BASE" "$STACK" "refs/tags/$TAG" "$RUNNER_TEMP/report.md" || rc=$?
+          case $rc in
+            0) echo "status=applied" >> "$GITHUB_OUTPUT" ;;
+            2) echo "status=conflict" >> "$GITHUB_OUTPUT" ;;
+            *) echo "status=error" >> "$GITHUB_OUTPUT"; exit "$rc" ;;
+          esac
+
+      - name: Free disk space for the Rust build
+        if: steps.replay.outputs.status == 'applied'
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup || true
+
+      - name: Install the Rust toolchain
+        if: steps.replay.outputs.status == 'applied'
+        run: |
+          set -euo pipefail
+          tc=$TOOLCHAIN_INPUT
+          if [ -z "$tc" ]; then
+            tc=$(sed -n 's/^channel *= *"\([0-9][0-9.]*\)".*/\1/p' rust-toolchain.toml 2>/dev/null || true)
+          fi
+          tc=${tc:-$DEFAULT_TOOLCHAIN}
+          rustup toolchain install "$tc" --profile minimal --no-self-update
+          echo "RUSTUP_TOOLCHAIN=$tc" >> "$GITHUB_ENV"
+          echo "Using Rust $tc"
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.replay.outputs.status == 'applied'
+        with:
+          shared-key: drift
+          cache-on-failure: true
+
+      - name: Build the tests
+        id: build
+        if: steps.replay.outputs.status == 'applied'
+        run: |
+          rc=0
+          timeout 30m bash -c 'cargo test -p xmtp_mesh --no-run && cargo test -p xmtp_db --lib --no-run && cargo check -p xmtpv3' \
+            > "$RUNNER_TEMP/build.log" 2>&1 || rc=$?
+          case $rc in 0) s=ok ;; 124) s=timeout ;; *) s=failed ;; esac
+          echo "status=$s" >> "$GITHUB_OUTPUT"
+
+      - name: Run the tests
+        id: tests
+        if: steps.build.outputs.status == 'ok'
+        env:
+          MESH_TEST_TIMEOUT_SCALE: 3
+        run: |
+          a=0; b=0
+          timeout 10m cargo test -p xmtp_mesh > "$RUNNER_TEMP/mesh-tests.log" 2>&1 || a=$?
+          timeout 5m cargo test -p xmtp_db --lib association_state > "$RUNNER_TEMP/db-tests.log" 2>&1 || b=$?
+          if [ "$a" -eq 0 ] && [ "$b" -eq 0 ]; then s=ok; else s=failed; fi
+          echo "status=$s" >> "$GITHUB_OUTPUT"
+
+      - name: Report
+        id: report
+        if: always() && (steps.gate.outputs.run == 'true' || steps.plan.outputs.resolved == 'false')
+        env:
+          TAG: ${{ steps.plan.outputs.tag }}
+          RESOLVED: ${{ steps.plan.outputs.resolved }}
+          REASON: ${{ steps.plan.outputs.reason }}
+          REPLAY: ${{ steps.replay.outputs.status }}
+          BUILD: ${{ steps.build.outputs.status }}
+          TESTS: ${{ steps.tests.outputs.status }}
+        run: |
+          set -euo pipefail
+          if [ "$RESOLVED" != true ]; then status=test-failure
+          elif [ "$REPLAY" = conflict ]; then status=conflict
+          elif [ "$REPLAY" != applied ]; then status=test-failure
+          elif [ "$BUILD" = timeout ]; then status=timeout
+          elif [ "$BUILD" != ok ] || [ "$TESTS" != ok ]; then status=test-failure
+          else status=ok; fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          body="$RUNNER_TEMP/body.md"
+          {
+            if [ "$RESOLVED" != true ]; then
+              echo "**Target unresolved:** $REASON"
+              echo
+              echo "The weekly upstream-drift job could not determine which libxmtp android release to replay onto (the target is resolved from the newest xmtp-react-native release's android/build.gradle org.xmtp:android pin). No replay was attempted."
+            elif [ -s "$RUNNER_TEMP/report.md" ]; then cat "$RUNNER_TEMP/report.md"
+            else echo "The run stopped before the replay finished (replay: ${REPLAY:-not run})."; fi
+            echo
+            echo "Build (xmtp_mesh, xmtp_db, cargo check -p xmtpv3): ${BUILD:-not run}. Tests: ${TESTS:-not run}."
+            if [ -s "$RUNNER_TEMP/patches.txt" ]; then
+              echo; echo '### PATCHES.md is stale'; echo '```'; cat "$RUNNER_TEMP/patches.txt"; echo '```'
+            fi
+            for l in build mesh-tests db-tests; do
+              f="$RUNNER_TEMP/$l.log"
+              if [ -s "$f" ]; then
+                echo; echo "<details><summary>$l.log (last 120 lines)</summary>"; echo
+                echo '```'; tail -n 120 "$f"; echo '```'; echo '</details>'
+              fi
+            done
+            echo; echo "Run: $RUN_URL"
+          } | head -c 60000 > "$body"
+          cat "$body" >> "$GITHUB_STEP_SUMMARY"
+          "$RUNNER_TEMP/xm/report-issue.sh" "$status" "${TAG:-unresolved}" "$body"
+          case $status in ok|timeout) exit 0 ;; *) exit 1 ;; esac
+
+      - name: Write the marker
+        if: always() && steps.plan.outputs.resolved == 'true' && steps.report.outputs.status != '' && steps.report.outputs.status != 'timeout'
+        env:
+          STATUS: ${{ steps.report.outputs.status }}
+        run: echo "$STATUS" > .drift-marker
+
+      - name: Remember this tag and stack tip
+        if: always() && steps.plan.outputs.resolved == 'true' && steps.report.outputs.status != '' && steps.report.outputs.status != 'timeout'
+        uses: actions/cache/save@v4
+        with:
+          path: .drift-marker
+          key: drift-${{ steps.plan.outputs.tag }}-${{ steps.plan.outputs.stack }}

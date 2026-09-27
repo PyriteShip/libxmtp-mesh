@@ -1,0 +1,12 @@
+# Source this file (do not execute): environment for the non-Nix Android build.
+# Used by dev/bindings-local and dev/publish-mesh-local.
+export ANDROID_HOME="${ANDROID_HOME:-$HOME/android-sdk}"
+export ANDROID_SDK_ROOT="$ANDROID_HOME"
+export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-$ANDROID_HOME/ndk/27.1.12297006}"
+export ANDROID_NDK_ROOT="$ANDROID_NDK_HOME"
+
+for tool in cargo cargo-ndk java jq; do
+  command -v "$tool" >/dev/null || { echo "mesh-env: missing $tool" >&2; return 1 2>/dev/null || exit 1; }
+done
+[[ -d "$ANDROID_NDK_HOME" ]] || { echo "mesh-env: NDK not found at $ANDROID_NDK_HOME" >&2; return 1 2>/dev/null || exit 1; }
+java -version 2>&1 | grep -q '"17' || echo "mesh-env: warning: JDK 17 expected (library/build.gradle targets 17)" >&2

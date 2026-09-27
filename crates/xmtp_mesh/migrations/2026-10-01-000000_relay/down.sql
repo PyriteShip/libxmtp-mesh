@@ -1,0 +1,10 @@
+ALTER TABLE group_messages DROP COLUMN from_peer;
+DROP TABLE relay_dm;
+DROP TABLE relay_keys;
+DROP INDEX relay_seen_forget_at;
+DROP INDEX relay_seen_short;
+DROP TABLE relay_seen;
+DROP INDEX relay_spool_from;
+DROP INDEX relay_spool_short;
+DROP INDEX relay_spool_drop_at;
+DROP TABLE relay_spool;

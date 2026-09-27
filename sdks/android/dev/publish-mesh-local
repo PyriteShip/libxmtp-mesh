@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Build all 4 ABIs and publish org.xmtp:android:<version> to ~/.m2 for the RN SDK fork.
+set -euo pipefail
+ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+SDK_ROOT="$ROOT/sdks/android"
+
+"$SDK_ROOT/dev/bindings-local"
+
+cd "$SDK_ROOT"
+VERSION="$(grep '^version=' gradle.properties | cut -d= -f2)"
+./gradlew --no-daemon :library:testDebugUnitTest :library:publishToMavenLocal
+
+AAR="$HOME/.m2/repository/org/xmtp/android/$VERSION/android-$VERSION.aar"
+fail() { echo "publish-mesh-local: $*" >&2; exit 1; }
+[[ -f "$AAR" ]] || fail "missing $AAR"
+
+n="$(unzip -l "$AAR" | grep -cE 'jni/(arm64-v8a|armeabi-v7a|x86|x86_64)/libuniffi_xmtpv3\.so$' || true)"
+# shellcheck disable=SC2206 # word-splitting is intentional here (mirrors bindings-local)
+EXPECTED_ABIS=(${MESH_ABIS:-arm64-v8a armeabi-v7a x86_64 x86})
+EXPECTED_N="${#EXPECTED_ABIS[@]}"
+[[ "$n" == "$EXPECTED_N" ]] || fail "expected $EXPECTED_N native libraries in the AAR, found $n"
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+unzip -q -o "$AAR" classes.jar AndroidManifest.xml -d "$TMP"
+# Capture the listing once: with `set -o pipefail`, `unzip -l | grep -q` is racy —
+# grep -q exits on the first match and can SIGPIPE unzip before it finishes writing,
+# which pipefail then reports as a pipeline failure even though grep matched.
+CLASSES_LISTING="$(unzip -l "$TMP/classes.jar")"
+grep -q 'uniffi/xmtpv3/FfiMeshNode.class' <<<"$CLASSES_LISTING" || fail "FfiMeshNode missing"
+grep -q 'uniffi/xmtpv3/FfiVerifiedPeer.class' <<<"$CLASSES_LISTING" || fail "FfiVerifiedPeer (presence) missing"
+grep -q 'org/xmtp/android/library/mesh/MeshRadio.class' <<<"$CLASSES_LISTING" || fail "MeshRadio missing"
+grep -q 'org/xmtp/android/library/mesh/MeshNodeFiles.class' <<<"$CLASSES_LISTING" || fail "MeshNodeFiles missing"
+grep -q 'org/xmtp/android/library/mesh/MeshForeground.class' <<<"$CLASSES_LISTING" || fail "MeshForeground missing"
+grep -q 'org/xmtp/android/library/mesh/IdentityLogCarrier.class' <<<"$CLASSES_LISTING" || fail "IdentityLogCarrier (reset carry) missing"
+unzip -q -o "$AAR" jni/arm64-v8a/libuniffi_xmtpv3.so -d "$TMP"
+# grep -c on the file itself (no pipe, so no SIGPIPE under pipefail).
+[[ "$(grep -a -c 'uniffi_xmtpv3_fn_func_carry_mesh_identity_log' "$TMP/jni/arm64-v8a/libuniffi_xmtpv3.so" || true)" -ge 1 ]] \
+  || fail "carry_mesh_identity_log missing from the native library"
+grep -q 'org/xmtp/android/library/mesh/MeshIdentityEvents.class' <<<"$CLASSES_LISTING" || fail "MeshIdentityEvents (restore convergence) missing"
+grep -q 'org/xmtp/android/library/mesh/MeshRelayState.class' <<<"$CLASSES_LISTING" || fail "MeshRelayState (relay switch) missing"
+grep -q 'uniffi/xmtpv3/FfiRelayStats.class' <<<"$CLASSES_LISTING" || fail "FfiRelayStats missing"
+for sym in uniffi_xmtpv3_fn_method_ffimeshnode_stream_identity uniffi_xmtpv3_fn_method_ffixmtpclient_mesh_rebase_signature_request uniffi_xmtpv3_fn_method_ffimeshnode_enable_relay uniffi_xmtpv3_fn_method_ffimeshnode_disable_relay uniffi_xmtpv3_fn_method_ffimeshnode_relay_enabled uniffi_xmtpv3_fn_method_ffimeshnode_relay_stats; do
+  [[ "$(grep -a -c "$sym" "$TMP/jni/arm64-v8a/libuniffi_xmtpv3.so" || true)" -ge 1 ]] \
+    || fail "$sym missing from the native library"
+done
+grep -q 'BLUETOOTH_SCAN' "$TMP/AndroidManifest.xml" || fail "BLE permissions missing from manifest"
+grep -q 'MeshForegroundService' "$TMP/AndroidManifest.xml" || fail "foreground service missing from manifest"
+
+echo "Published org.xmtp:android:$VERSION -> $AAR"

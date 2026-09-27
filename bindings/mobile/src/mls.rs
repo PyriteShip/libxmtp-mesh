@@ -110,6 +110,7 @@ pub mod device_sync;
 pub mod gateway_auth;
 #[cfg(any(test, feature = "bench"))]
 pub mod inbox_owner;
+pub mod mesh;
 #[cfg(any(test, feature = "bench"))]
 pub mod test_utils;
 

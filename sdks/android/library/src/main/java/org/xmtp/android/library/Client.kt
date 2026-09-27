@@ -2,6 +2,7 @@ package org.xmtp.android.library
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
@@ -17,6 +18,8 @@ import org.xmtp.android.library.libxmtp.InboxState
 import org.xmtp.android.library.libxmtp.PublicIdentity
 import org.xmtp.android.library.libxmtp.SignatureRequest
 import org.xmtp.android.library.libxmtp.toFfi
+import org.xmtp.android.library.mesh.Mesh
+import org.xmtp.android.library.mesh.MeshOptions
 import uniffi.xmtpv3.DbOptions
 import uniffi.xmtpv3.FfiClientMode
 import uniffi.xmtpv3.FfiDeviceSyncMode
@@ -31,6 +34,7 @@ import uniffi.xmtpv3.FfiXmtpClient
 import uniffi.xmtpv3.XmtpApiClient
 import uniffi.xmtpv3.applySignatureRequest
 import uniffi.xmtpv3.connectToBackend
+import uniffi.xmtpv3.connectToMesh
 import uniffi.xmtpv3.createClient
 import uniffi.xmtpv3.enterDebugWriter
 import uniffi.xmtpv3.exitDebugWriter
@@ -63,6 +67,8 @@ data class ClientOptions(
         val isSecure: Boolean = true,
         val appVersion: String? = null,
         val gatewayHost: String? = null,
+        /** Required when [env] is [XMTPEnvironment.MESH]. */
+        val mesh: MeshOptions? = null,
     )
 }
 
@@ -117,6 +123,12 @@ class Client(
         XMTPDebugInformation(ffiClient = libXMTPClient)
     val libXMTPVersion: String = getVersionInfo()
     private val ffiClient: FfiXmtpClient = libXMTPClient
+
+    /**
+     * For [org.xmtp.android.library.mesh.Mesh.start]: the mesh node signs hellos with this
+     * installation and scopes group traffic by this client's group membership.
+     */
+    internal val ffiClientForMesh: FfiXmtpClient get() = ffiClient
 
     companion object {
         private const val TAG = "Client"
@@ -197,6 +209,7 @@ class Client(
         }
 
         suspend fun connectToApiBackend(api: ClientOptions.Api): XmtpApiClient {
+            if (api.env == XMTPEnvironment.MESH) return connectToMeshBackend(api)
             val cacheKey = api.toCacheKey()
             return cacheLock.withLock {
                 val cached = apiClientCache[cacheKey]
@@ -222,6 +235,7 @@ class Client(
         }
 
         suspend fun connectToSyncApiBackend(api: ClientOptions.Api): XmtpApiClient {
+            if (api.env == XMTPEnvironment.MESH) return connectToMeshBackend(api)
             val cacheKey = api.toCacheKey()
             return syncCacheLock.withLock {
                 val cached = syncApiClientCache[cacheKey]
@@ -244,6 +258,18 @@ class Client(
                 syncApiClientCache[cacheKey] = newClient
                 return@withLock newClient
             }
+        }
+
+        internal fun requireMeshOptions(api: ClientOptions.Api): MeshOptions =
+            api.mesh ?: throw XMTPException(
+                "XMTPEnvironment.MESH requires ClientOptions.Api(mesh = MeshOptions(...))",
+            )
+
+        /** The mesh node is shared per path by the Rust registry, so no cache is needed. */
+        private fun connectToMeshBackend(api: ClientOptions.Api): XmtpApiClient {
+            val mesh = requireMeshOptions(api)
+            mesh.ensureParentDir()
+            return connectToMesh(mesh.dbPath, mesh.encryptionKey)
         }
 
         suspend fun getOrCreateInboxId(
@@ -524,7 +550,7 @@ class Client(
                         nonce = 0.toULong(),
                         legacySignedPrivateKeyProto = null,
                         deviceSyncMode =
-                            if (!options.deviceSyncEnabled) {
+                            if (!options.deviceSyncEnabled || options.api.env == XMTPEnvironment.MESH) {
                                 FfiDeviceSyncMode.DISABLED
                             } else {
                                 FfiDeviceSyncMode.ENABLED
@@ -605,6 +631,29 @@ class Client(
             }
         }
 
+    /**
+     * xmtp-mesh restore convergence: after the mesh node replaced this inbox's identity log with an
+     * older one that does not list this installation ([org.xmtp.android.library.mesh.MeshIdentityOutcome.REBASE_NEEDED]),
+     * adds this installation to it, signed by [signingKey] (the inbox's wallet). Returns false when
+     * nothing was needed. When the log is full it throws an exception for which
+     * [org.xmtp.android.library.mesh.isMeshTooManyInstallations] is true. On success, clears
+     * [org.xmtp.android.library.mesh.Mesh.identityEvents]'s replayed event so a late collector
+     * doesn't keep seeing the now-resolved outcome -- but only up to the
+     * generation recorded when this call started resolving it, so a fresher event that races the
+     * clear survives (compare-and-clear). A failed or no-op re-base leaves the
+     * replay untouched.
+     */
+    suspend fun meshRebaseInstallation(signingKey: SigningKey): Boolean =
+        withContext(Dispatchers.IO) {
+            val resolvedGeneration = Mesh.identityEventGeneration()
+            val request = ffiClient.meshRebaseSignatureRequest() ?: return@withContext false
+            val signatureRequest = SignatureRequest(request)
+            handleSignature(signatureRequest, signingKey)
+            ffiApplySignatureRequest(signatureRequest)
+            Mesh.clearIdentityEvent(resolvedGeneration)
+            true
+        }
+
     @DelicateApi(
         "This function is delicate and should be used with caution. Adding a identity already associated with an inboxId will cause the identity to lose access to that inbox. See: inboxIdFromIdentity(publicIdentity)",
     )
@@ -658,6 +707,28 @@ class Client(
 
             result.mapKeys { (ffiIdentifier, _) ->
                 ffiIdentifier.identifier
+            }
+        }
+
+    /**
+     * Whether this client's API (under `XMTPEnvironment.MESH`, the local mesh node) holds a
+     * valid key package for [installationId], e.g. `FfiVerifiedPeer.installationId` from
+     * [org.xmtp.android.library.mesh.MeshRadio.verifiedPeers]. On the mesh, wait until a peer
+     * is verified **and** this returns true before `conversations.findOrCreateDm`: a DM
+     * created before the key package arrives never includes the peer, and a retry returns
+     * that same DM. Errors read as false (not yet).
+     */
+    suspend fun meshCanMessage(installationId: ByteArray): Boolean =
+        withContext(Dispatchers.IO) {
+            try {
+                ffiClient
+                    .getKeyPackageStatusesForInstallationIds(listOf(installationId))
+                    .values
+                    .any { it.validationError == null }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                false
             }
         }
 

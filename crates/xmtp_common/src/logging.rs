@@ -6,7 +6,7 @@ pub fn filter_directive(level: &str) -> EnvFilter {
         xmtp_api={level},xmtp_api_grpc={level},xmtp_proto={level},\
         xmtp_common={level},xmtp_api_d14n={level},\
         xmtp_content_types={level},xmtp_cryptography={level},\
-        xmtp_user_preferences={level},xmtpv3={level},xmtp_db={level},\
+        xmtp_user_preferences={level},xmtpv3={level},xmtp_db={level},xmtp_mesh={level},\
         bindings_wasm={level},bindings_node={level}"
     );
     EnvFilter::builder().parse_lossy(filter)

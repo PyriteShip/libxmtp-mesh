@@ -1,0 +1,9 @@
+DROP TABLE outbound_welcomes;
+DROP TABLE welcomes;
+DROP TABLE pending_group_messages;
+DROP TABLE group_messages;
+DROP TABLE groups;
+DROP TABLE key_packages;
+DROP TABLE inbox_identifiers;
+DROP TABLE identity_updates;
+DROP TABLE node_meta;
