@@ -2,6 +2,8 @@
 //! the account key, rotating advert tokens, Noise handshakes and sealed
 //! records.
 pub mod keys;
+pub(crate) mod noise;
+pub(crate) mod records;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -12,6 +14,7 @@ pub use keys::{
     ADVERT_LEN, ADVERT_VERSION, FLAG_PAIRING, FLAG_RELAY, TOKEN_LEN, Token, WINDOW_SECS,
     advert_token, parse_service_data, service_data, window_at,
 };
+pub use noise::short_code;
 
 use crate::sync::seq::MeshStats;
 
