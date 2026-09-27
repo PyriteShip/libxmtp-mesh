@@ -40,11 +40,18 @@ unzip -q -o "$AAR" jni/arm64-v8a/libuniffi_xmtpv3.so -d "$TMP"
 grep -q 'org/xmtp/android/library/mesh/MeshIdentityEvents.class' <<<"$CLASSES_LISTING" || fail "MeshIdentityEvents (restore convergence) missing"
 grep -q 'org/xmtp/android/library/mesh/MeshRelayState.class' <<<"$CLASSES_LISTING" || fail "MeshRelayState (relay switch) missing"
 grep -q 'uniffi/xmtpv3/FfiRelayStats.class' <<<"$CLASSES_LISTING" || fail "FfiRelayStats missing"
-for sym in uniffi_xmtpv3_fn_method_ffimeshnode_stream_identity uniffi_xmtpv3_fn_method_ffixmtpclient_mesh_rebase_signature_request uniffi_xmtpv3_fn_method_ffimeshnode_enable_relay uniffi_xmtpv3_fn_method_ffimeshnode_disable_relay uniffi_xmtpv3_fn_method_ffimeshnode_relay_enabled uniffi_xmtpv3_fn_method_ffimeshnode_relay_stats; do
+grep -q 'uniffi/xmtpv3/FfiMeshStats.class' <<<"$CLASSES_LISTING" || fail "FfiMeshStats (signed sequencing) missing"
+for sym in uniffi_xmtpv3_fn_method_ffimeshnode_stream_identity uniffi_xmtpv3_fn_method_ffixmtpclient_mesh_rebase_signature_request uniffi_xmtpv3_fn_method_ffimeshnode_enable_relay uniffi_xmtpv3_fn_method_ffimeshnode_disable_relay uniffi_xmtpv3_fn_method_ffimeshnode_relay_enabled uniffi_xmtpv3_fn_method_ffimeshnode_relay_stats uniffi_xmtpv3_fn_method_ffimeshnode_mesh_stats; do
   [[ "$(grep -a -c "$sym" "$TMP/jni/arm64-v8a/libuniffi_xmtpv3.so" || true)" -ge 1 ]] \
     || fail "$sym missing from the native library"
 done
 grep -q 'BLUETOOTH_SCAN' "$TMP/AndroidManifest.xml" || fail "BLE permissions missing from manifest"
 grep -q 'MeshForegroundService' "$TMP/AndroidManifest.xml" || fail "foreground service missing from manifest"
+
+# DESIGN.md §B13: a mesh.10 AAR must carry signed sequencing; a stale .build/bindings would not.
+[[ "$(grep -a -c 'xmtp-mesh-seq-v1:' "$TMP/jni/arm64-v8a/libuniffi_xmtpv3.so" || true)" -ge 1 ]] \
+  || fail "signed sequencing (xmtp-mesh-seq-v1) missing from the native library"
+[[ "$(grep -a -c 'xmtp-mesh-seq-attest-v1:' "$TMP/jni/arm64-v8a/libuniffi_xmtpv3.so" || true)" -ge 1 ]] \
+  || fail "signed sequencing attestations (xmtp-mesh-seq-attest-v1) missing from the native library"
 
 echo "Published org.xmtp:android:$VERSION -> $AAR"

@@ -59,7 +59,7 @@ sdks/android/dev/publish-mesh-local
 
 A React Native app consumes the result through the companion React Native SDK
 fork, which depends on `org.xmtp:android` at the version in
-`sdks/android/gradle.properties` (for example `4.10.0-rc2-mesh.9`), resolved
+`sdks/android/gradle.properties` (for example `4.10.0-rc2-mesh.10`), resolved
 from the local Maven repository that `publish-mesh-local` writes.
 
 ## Testing

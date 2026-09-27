@@ -14,7 +14,7 @@ Base commit: da3a7eff05445b0dde5a4ea4f68ec5e9a22bab27
   `xmtp_db`/`xmtp_mls`/`xmtp_id` edits it needs) and the **Android bindings/SDK** (the
   uniffi FFI, the Kotlin BLE radio and AAR publishing), which depends on the core. The
   "Layer" column below says which layer(s) a file belongs to. The current published
-  version is `4.10.0-rc2-mesh.9`.
+  version is `4.10.0-rc2-mesh.10`.
 - Regenerate the file lists with `git diff --name-status <Base commit> HEAD`.
   `.github/xmtp-mesh/check-patches.sh PATCHES.md` fails if an edited upstream file is
   missing from the table below. The weekly upstream-drift workflow runs it.
@@ -38,7 +38,7 @@ Base commit: da3a7eff05445b0dde5a4ea4f68ec5e9a22bab27
 | `bindings/mobile/Cargo.toml` | Android bindings/SDK | Adds the `xmtp_mesh` (path), `bytes` and `http` dependencies. |
 | `bindings/mobile/src/mls.rs` | Android bindings/SDK | `pub mod mesh;` |
 | `nix/lib/filesets.nix` | Android bindings/SDK | Adds `crates/xmtp_mesh/migrations` to the Nix source fileset. |
-| `sdks/android/gradle.properties` | Android bindings/SDK | `version=4.10.0-rc2-mesh.9`. |
+| `sdks/android/gradle.properties` | Android bindings/SDK | `version=4.10.0-rc2-mesh.10`. |
 | `sdks/android/library/build.gradle` | Android bindings/SDK | Adds the Robolectric and androidx.test:core unit-test dependencies and `includeAndroidResources`. Signs the publication only when `SIGN_KEY` is set, so local mesh builds are unsigned. |
 | `sdks/android/library/src/main/AndroidManifest.xml` | Android bindings/SDK | Adds the BLE, foreground-service and notification permissions, and declares `MeshForegroundService`. |
 | `sdks/android/library/src/main/java/org/xmtp/android/library/Client.kt` | Android bindings/SDK | Adds `ClientOptions.Api.mesh`, the `XMTPEnvironment.MESH` backend via `connectToMesh`, and `meshCanMessage`. Turns device sync off under MESH. Exposes `ffiClientForMesh`. Adds meshRebaseInstallation (restore convergence, §C4.4). |
@@ -51,7 +51,7 @@ Base commit: da3a7eff05445b0dde5a4ea4f68ec5e9a22bab27
 | `crates/xmtp_mesh/` | 73 | Rust core, Android bindings/SDK | The mesh node crate: store, v3 API endpoints, peer sync, tests. Restore convergence (§C4.1–§C4.4, §C4.7) adds `node/convergence.rs`, `node/handover.rs`, `node/test_logs.rs`, `tests/convergence.rs`, `tests/rebase.rs`, `tests/restore_membership.rs` and the `migrations/2026-09-25-000000_pending_resyncs/` migration (`up.sql`, `down.sql`), which persists client resyncs still owed after a replace. Multi-hop relay phase 1 adds the `relay/` module (`config.rs`, `dm.rs`, `engine.rs`, `envelope.rs`, `inner.rs`, `keys.rs`, `mod.rs`, `spool.rs`), `store/relay.rs`, the `migrations/2026-10-01-000000_relay/` migration (`up.sql`, `down.sql`) and `tests/relay_dm.rs`, `tests/relay_links.rs`, `tests/relay_sim.rs` (14 files). Signed sequencing records (§B13) add `sync/seq.rs`, `node/sequencing.rs`, the `migrations/2026-10-02-000000_signed_sequencing/` migration (`up.sql`, `down.sql`) and `tests/signed_sequencing.rs`. |
 | `crates/xmtp_mls/src/groups/tests/test_expected_diff_matches_commit.rs` | 1 | Rust core, Android bindings/SDK | §C4.6 validator tests. |
 | `bindings/mobile/src/mls/mesh.rs` | 1 | Android bindings/SDK | The mesh FFI. Restore convergence adds `stream_identity` (identity-resync events to the app) and `FfiXmtpClient::mesh_rebase_signature_request`. Multi-hop relay phase 1 adds `FfiRelayStats` and `FfiMeshNode::{enable_relay, disable_relay, relay_enabled, relay_stats}`. Signed sequencing adds `FfiMeshStats` and `FfiMeshNode::mesh_stats`. |
-| `sdks/android/dev/` (`bindings-local`, `mesh-env`, `mesh-two-device-test`, `publish-mesh-local`) | 4 | Android bindings/SDK | Dev build, two-phone test and mavenLocal publish scripts. |
+| `sdks/android/dev/` (`bindings-local`, `mesh-env`, `mesh-two-device-test`, `publish-mesh-local`) | 4 | Android bindings/SDK | Dev build, two-phone test and mavenLocal publish scripts. `publish-mesh-local` also checks the signed-sequencing symbols. |
 | `sdks/android/library/src/main/java/org/xmtp/android/library/mesh/` | 39 | Android bindings/SDK | The Kotlin BLE radio: link, policy, ble, MeshRadio, the service and Mesh. Restore convergence adds `MeshIdentityEvents.kt`. Multi-hop relay phase 1 adds `MeshRelay.kt` (the userEnabled/pausedForBattery/active switch and its policy) and `MeshBatteryWatch.kt` (the battery broadcast receiver behind the pause). Signed sequencing adds `Mesh.stats()` (the §B13 counters) to `Mesh.kt`. |
 | `sdks/android/library/src/test/java/org/xmtp/android/library/` (`mesh/`, `MeshEnvironmentTest.kt`) | 39 | Android bindings/SDK | Unit tests. Multi-hop relay phase 1 adds `MeshRelayPolicyTest.kt`, `MeshStartRelayOrderTest.kt`. Signed sequencing adds `MeshStatsTest.kt`. |
 | `sdks/android/library/src/androidTest/java/org/xmtp/android/library/mesh/` | 4 | Android bindings/SDK | Instrumented tests. |
