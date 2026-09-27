@@ -84,6 +84,7 @@
 //! sequencer is re-pinned. The seen-set is capped by entry count
 //! (`max_seen`); its entries expire with the envelope's own expiry.
 mod error;
+pub mod link;
 mod mls_parse;
 pub mod node;
 mod relay;

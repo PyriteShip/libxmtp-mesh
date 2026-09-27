@@ -31,10 +31,14 @@ parking_lot.workspace = true
 prost = { workspace = true, features = ["derive", "std"] }
 rand = { workspace = true }
 sha2.workspace = true
+# Noise links (DESIGN.md §B14). No `std`/default features: snow's `std`
+# feature pulls in its optional `ring` and `blake2` dependencies.
+snow = { version = "=0.10.0", default-features = false, features = ["use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom"] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tonic = { workspace = true }
 tracing.workspace = true
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 xmtp-workspace-hack = { version = "0.1", path = "../xmtp-workspace-hack" }
 xmtp_api_grpc.workspace = true
 xmtp_common.workspace = true
@@ -42,6 +46,7 @@ xmtp_configuration.workspace = true
 xmtp_id.workspace = true
 xmtp_mls.workspace = true
 xmtp_proto.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 # The integration tests use the crate's test-only hooks.

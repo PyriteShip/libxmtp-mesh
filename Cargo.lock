@@ -7502,6 +7502,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7c388c1b5e93756d0c740965c41e8822f866621d41acbdf6336a6a168f8840c"
 
 [[package]]
+name = "snow"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "599b506ccc4aff8cf7844bc42cf783009a434c1e26c964432560fb6d6ad02d82"
+dependencies = [
+ "chacha20poly1305",
+ "curve25519-dalek",
+ "getrandom 0.3.4",
+ "rustc_version 0.4.1",
+ "sha2",
+ "subtle",
+]
+
+[[package]]
 name = "socket2"
 version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7734,7 +7748,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0136791f7c95b1f6dd99f9cc786b91bb81c3800b639b3478e561ddb7be95e5f1"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.1",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -10224,10 +10238,12 @@ dependencies = [
  "prost",
  "rand 0.10.0",
  "sha2",
+ "snow",
  "thiserror 2.0.17",
  "tokio",
  "tonic",
  "tracing",
+ "x25519-dalek",
  "xmtp-workspace-hack",
  "xmtp_api_d14n",
  "xmtp_api_grpc",
@@ -10239,6 +10255,7 @@ dependencies = [
  "xmtp_mesh",
  "xmtp_mls",
  "xmtp_proto",
+ "zeroize",
 ]
 
 [[package]]
