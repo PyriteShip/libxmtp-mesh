@@ -3,6 +3,7 @@ mod group_messages;
 mod handover;
 mod identity;
 mod key_packages;
+mod links;
 pub(crate) mod paths;
 pub(crate) mod sequencing;
 mod streams;
@@ -90,6 +91,8 @@ pub(crate) struct NodeInner {
     /// them up (the peer still thinks we relay). Lock order: `sessions`,
     /// then this, then `relay`.
     pub(crate) relay_links: Mutex<HashMap<PeerId, (Vec<u8>, String)>>,
+    /// Link keys, pairing mode, counters (DESIGN.md §B14).
+    pub(crate) link: crate::link::LinkState,
     /// Signed-sequencing counters, shared with the store (§B13).
     pub(crate) seq: Arc<crate::sync::seq::SeqCounters>,
     /// Test only: the order `stop_sync`'s teardown steps ran in.
@@ -203,6 +206,7 @@ impl MeshNode {
                 sync_lifecycle: Mutex::new(()),
                 relay: Mutex::new(None),
                 relay_links: Mutex::new(HashMap::new()),
+                link: Default::default(),
                 seq,
                 #[cfg(test)]
                 stop_sync_order: Mutex::new(Vec::new()),

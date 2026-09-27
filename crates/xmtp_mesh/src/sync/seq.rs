@@ -215,7 +215,8 @@ pub struct Equivocation {
     pub attested_b: bool,
 }
 
-/// Signed-sequencing counters since the node was opened (§B13). A snapshot.
+/// Signed-sequencing (§B13) and link (§B14) counters since the node was
+/// opened. A snapshot.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MeshStats {
     pub seq_rows_signed: u64,
@@ -225,6 +226,16 @@ pub struct MeshStats {
     pub seq_rejected_wrong_signer: u64,
     pub seq_equivocations: u64,
     pub peers_rejected_version: u64,
+    /// Links opened, by kind (§B14.3).
+    pub links_contact: u64,
+    pub links_relay: u64,
+    pub links_pairing: u64,
+    /// Noise handshakes that failed or timed out.
+    pub handshake_failed: u64,
+    /// Links closed for a record that failed authentication, a frame not
+    /// allowed on the link type, or a card or Hello that does not match it.
+    pub link_frame_rejected: u64,
+    pub discovery_resets: u64,
 }
 
 #[derive(Debug, Default)]
@@ -271,6 +282,7 @@ impl SeqCounters {
             seq_rejected_wrong_signer: get(&self.wrong_signer),
             seq_equivocations: get(&self.equivocations),
             peers_rejected_version: get(&self.rejected_version),
+            ..MeshStats::default()
         }
     }
 }
@@ -664,6 +676,7 @@ mod tests {
                 seq_rejected_wrong_signer: 1,
                 seq_equivocations: 1,
                 peers_rejected_version: 1,
+                ..MeshStats::default()
             }
         );
     }

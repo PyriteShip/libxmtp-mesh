@@ -52,6 +52,13 @@ pub enum MeshError {
     /// The local libxmtp client failed a call the node made for it.
     #[error("local client: {0}")]
     LocalClient(String),
+    /// `set_account_key` was not called: the node has no link keys (§B14.1).
+    #[error("no account key: call set_account_key before start_sync")]
+    NoAccountKey,
+    /// A Noise handshake, a record's authentication, or the link-type rules
+    /// failed (§B14.3). Fatal: the link is closed.
+    #[error("link authentication failed: {0}")]
+    LinkAuthFailed(String),
     /// A sequenced row failed its signed sequencing record check (§B13).
     /// Fatal to a sync session; a relayed payload carrying it is dropped.
     #[error("sequencing rejected: {0}")]
@@ -75,10 +82,13 @@ impl MeshError {
             | MeshError::IdentityRejected(_)
             | MeshError::Decode(_) => Status::invalid_argument(msg),
             MeshError::IdentityConflict { .. } => Status::aborted(msg),
-            MeshError::NotRegistered | MeshError::SyncNotStarted | MeshError::NoRuntime => {
-                Status::failed_precondition(msg)
+            MeshError::NotRegistered
+            | MeshError::SyncNotStarted
+            | MeshError::NoRuntime
+            | MeshError::NoAccountKey => Status::failed_precondition(msg),
+            MeshError::AuthFailed(_) | MeshError::PeerNotMember | MeshError::LinkAuthFailed(_) => {
+                Status::permission_denied(msg)
             }
-            MeshError::AuthFailed(_) | MeshError::PeerNotMember => Status::permission_denied(msg),
             _ => Status::internal(msg),
         }
     }
@@ -91,6 +101,7 @@ impl MeshError {
                 | MeshError::PeerNotMember
                 | MeshError::SequencingRejected(_)
                 | MeshError::IncompatibleVersion(_)
+                | MeshError::LinkAuthFailed(_)
         )
     }
 }

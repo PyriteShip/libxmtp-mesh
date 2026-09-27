@@ -222,7 +222,9 @@ impl MeshNode {
 
     /// Signed-sequencing counters since this node was opened (§B13).
     pub fn mesh_stats(&self) -> MeshStats {
-        self.inner.seq.snapshot()
+        let mut stats = self.inner.seq.snapshot();
+        self.inner.link.counters.fill(&mut stats);
+        stats
     }
 
     pub(crate) fn seq_counters(&self) -> &SeqCounters {

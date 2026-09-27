@@ -116,7 +116,7 @@ pub struct Frame {
     pub hops: u32,
     #[prost(
         oneof = "frame::Body",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25"
     )]
     pub body: Option<frame::Body>,
 }
@@ -157,6 +157,9 @@ pub mod frame {
         RelayKeyOffer(super::RelayKeyOffer),
         #[prost(message, tag = "24")]
         RelayKeyAck(super::RelayKeyAck),
+        /// A contact's discovery card (§B14.4). Contact and pairing links only.
+        #[prost(message, tag = "25")]
+        ContactCard(super::ContactCard),
     }
 }
 
@@ -291,6 +294,33 @@ pub struct RelayKeyOffer {
 pub struct RelayKeyAck {
     #[prost(bytes = "vec", tag = "1")]
     pub group_id: Vec<u8>,
+}
+
+/// What a phone needs to recognise and dial a contact (§B14.4): its Noise
+/// static key and its discovery key at `generation`. `Debug` omits the
+/// discovery key: it is a shared secret between contacts.
+#[derive(Clone, PartialEq, prost::Message)]
+#[prost(skip_debug)]
+pub struct ContactCard {
+    #[prost(string, tag = "1")]
+    pub inbox_id: String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub noise_static_pub: Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub discovery_key: Vec<u8>,
+    #[prost(uint32, tag = "4")]
+    pub generation: u32,
+}
+
+impl std::fmt::Debug for ContactCard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContactCard")
+            .field("inbox_id", &self.inbox_id)
+            .field("noise_static_pub", &hex::encode(&self.noise_static_pub))
+            .field("discovery_key", &"<redacted>")
+            .field("generation", &self.generation)
+            .finish()
+    }
 }
 
 pub fn encode(body: frame::Body) -> Vec<u8> {
@@ -582,5 +612,22 @@ mod tests {
         let hello = Hello::decode(old.encode_to_vec().as_slice()).unwrap();
         assert_eq!((hello.relay, hello.seq), (RELAY_V1, 0));
         assert!(MeshError::IncompatibleVersion("seq 0".into()).is_fatal());
+    }
+
+    #[test]
+    fn contact_cards_round_trip_as_tag_25() {
+        let body = frame::Body::ContactCard(ContactCard {
+            inbox_id: "i".into(),
+            noise_static_pub: vec![1; 32],
+            discovery_key: vec![2; 32],
+            generation: 3,
+        });
+        let bytes = encode(body.clone());
+        assert_eq!(decode(&bytes).unwrap(), body);
+        // Frame field 25, wire type 2: varint key (25 << 3) | 2 = 202 = 0xca 0x01.
+        assert_eq!(&bytes[..2], &[0x08, 0x01], "version first");
+        assert!(bytes.windows(2).any(|w| w == [0xca, 0x01]));
+        assert!(MeshError::LinkAuthFailed("x".into()).is_fatal());
+        assert!(!MeshError::NoAccountKey.is_fatal());
     }
 }

@@ -93,9 +93,13 @@ pub mod sync;
 mod verifier;
 
 pub use error::MeshError;
+pub use link::{AdvertMatch, AdvertState, LinkKeyInfo, LinkKind};
 pub use node::{MeshNode, MeshStream, NodeEvent, Resolution, ResyncOutcome, VerifiedPeer};
 pub use relay::{ClientRelayExporter, RelayConfig, RelayExporter, RelayStats};
-pub use store::{InsertOutcome, MeshStore, NewGroupMessage, StoredGroupMessage, StoredWelcome};
+pub use store::{
+    Contact, ContactUpdate, InsertOutcome, MeshStore, NewGroupMessage, StoredGroupMessage,
+    StoredWelcome,
+};
 pub use sync::frames::MAX_FRAME_LEN;
 pub use sync::seq::{Equivocation, MeshStats, SeqProof, SeqRecord, SeqReject};
 pub use sync::{

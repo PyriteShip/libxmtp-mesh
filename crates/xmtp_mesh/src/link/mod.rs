@@ -3,7 +3,135 @@
 //! records.
 pub mod keys;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+
+use parking_lot::Mutex;
+
 pub use keys::{
     ADVERT_LEN, ADVERT_VERSION, FLAG_PAIRING, FLAG_RELAY, TOKEN_LEN, Token, WINDOW_SECS,
     advert_token, parse_service_data, service_data, window_at,
 };
+
+use crate::sync::seq::MeshStats;
+
+/// The kind of an open link (§B14.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkKind {
+    /// Noise IK between contacts: full sync.
+    Contact,
+    /// Noise NN with a stranger: relay frames only.
+    Relay,
+    /// Noise XX in pairing mode: full sync, cards wait for confirmation.
+    Pairing,
+}
+
+/// Public facts about the keys `set_account_key` derived.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkKeyInfo {
+    pub noise_static_pub: [u8; 32],
+    pub generation: u32,
+}
+
+/// What the radio needs for one discovery window (§B14.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdvertState {
+    pub window: u64,
+    /// The service data to advertise: `2 ‖ flags ‖ own_token`.
+    pub service_data: [u8; ADVERT_LEN],
+    pub own_token: Token,
+    /// Every live contact's tokens for windows `window - 1 ..= window + 1`.
+    pub contact_tokens: Vec<(Token, String)>,
+    /// Unix second at which the next window starts: restart advertising then.
+    pub next_window_at: u64,
+    /// Changes whenever the token map or our own token changes.
+    pub contacts_version: u64,
+}
+
+/// What a seen advert is (§B14.2). `dial_first`: our token is the lower
+/// one, so we dial now; otherwise we dial only as the §B7.2 fallback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AdvertMatch {
+    /// Not a version-2 advert.
+    Invalid,
+    /// Our own advert.
+    Own,
+    Contact {
+        inbox_id: String,
+        dial_first: bool,
+    },
+    Stranger {
+        relay_offered: bool,
+        dial_first: bool,
+    },
+    /// Both phones are in pairing mode.
+    Pairing {
+        dial_first: bool,
+    },
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct LinkCounters {
+    contact: AtomicU64,
+    relay: AtomicU64,
+    pairing: AtomicU64,
+    handshake_failed: AtomicU64,
+    frame_rejected: AtomicU64,
+    discovery_resets: AtomicU64,
+}
+
+impl LinkCounters {
+    pub(crate) fn count_link(&self, kind: LinkKind) {
+        let counter = match kind {
+            LinkKind::Contact => &self.contact,
+            LinkKind::Relay => &self.relay,
+            LinkKind::Pairing => &self.pairing,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn count_handshake_failed(&self) {
+        self.handshake_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn count_frame_rejected(&self) {
+        self.frame_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn count_discovery_reset(&self) {
+        self.discovery_resets.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn fill(&self, stats: &mut MeshStats) {
+        let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        stats.links_contact = get(&self.contact);
+        stats.links_relay = get(&self.relay);
+        stats.links_pairing = get(&self.pairing);
+        stats.handshake_failed = get(&self.handshake_failed);
+        stats.link_frame_rejected = get(&self.frame_rejected);
+        stats.discovery_resets = get(&self.discovery_resets);
+    }
+}
+
+/// The node's link state (§B14). Keys live in memory only and are zeroized
+/// on drop. Lock order: `prk`, then the store, then `keys`.
+#[derive(Default)]
+pub(crate) struct LinkState {
+    pub(crate) prk: Mutex<Option<keys::AccountPrk>>,
+    pub(crate) keys: Mutex<Option<Arc<keys::MeshKeys>>>,
+    pub(crate) pairing_mode: AtomicBool,
+    pub(crate) counters: LinkCounters,
+    contacts_version: AtomicU64,
+    /// Test only: seconds added to the wall clock.
+    pub(crate) clock_offset_secs: AtomicI64,
+}
+
+impl LinkState {
+    pub(crate) fn bump_contacts_version(&self) {
+        self.contacts_version.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn contacts_version(&self) -> u64 {
+        self.contacts_version.load(Ordering::Relaxed)
+    }
+}

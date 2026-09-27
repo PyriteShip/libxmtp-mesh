@@ -145,15 +145,34 @@ fn meta_and_key_packages() {
     assert_eq!(s.key_package(b"me").unwrap(), Some(b"kp2".to_vec()));
 }
 
+/// The welcome-era `contacts` table (installation_key, kind) was dropped;
+/// the name now holds the private-discovery contacts (§B14.4).
 #[test]
-fn fresh_database_has_no_contacts_table() {
+fn fresh_database_has_only_the_discovery_contacts_table() {
     let mut s = MeshStore::open_in_memory().unwrap();
-    let rows: Vec<I64Row> = sql_query(
-        "SELECT COUNT(*) AS v FROM sqlite_master WHERE type = 'table' AND name = 'contacts'",
-    )
-    .load(&mut s.conn)
-    .unwrap();
-    assert_eq!(rows[0].v, 0);
+    let count = |s: &mut MeshStore, column: &str| -> i64 {
+        let rows: Vec<I64Row> =
+            sql_query("SELECT COUNT(*) AS v FROM pragma_table_info('contacts') WHERE name = ?")
+                .bind::<Text, _>(column)
+                .load(&mut s.conn)
+                .unwrap();
+        rows[0].v
+    };
+    assert_eq!(
+        count(&mut s, "installation_key"),
+        0,
+        "the old table is gone"
+    );
+    for column in [
+        "inbox_id",
+        "noise_static_pub",
+        "discovery_key",
+        "generation",
+        "updated_ns",
+        "removed_ns",
+    ] {
+        assert_eq!(count(&mut s, column), 1, "{column}");
+    }
 }
 
 #[test]
@@ -477,4 +496,101 @@ fn equivocations_keep_the_newest_1024() {
         (true, false),
         "each record's attested flag is kept"
     );
+}
+
+fn card(inbox: &str, key: u8, generation: u32) -> crate::sync::frames::ContactCard {
+    crate::sync::frames::ContactCard {
+        inbox_id: inbox.into(),
+        noise_static_pub: vec![key; 32],
+        discovery_key: vec![key.wrapping_add(100); 32],
+        generation,
+    }
+}
+
+#[test]
+fn contacts_insert_update_and_ignore_older_generations() {
+    let mut s = MeshStore::open_in_memory().unwrap();
+    assert_eq!(
+        s.upsert_contact(&card("i", 1, 0), 10, false).unwrap(),
+        ContactUpdate::Inserted
+    );
+    assert_eq!(
+        s.upsert_contact(&card("i", 1, 0), 11, false).unwrap(),
+        ContactUpdate::Unchanged
+    );
+    let mut newer = card("i", 1, 1);
+    newer.discovery_key = vec![7; 32];
+    assert_eq!(
+        s.upsert_contact(&newer, 12, false).unwrap(),
+        ContactUpdate::Updated
+    );
+    assert_eq!(
+        s.upsert_contact(&card("i", 1, 0), 13, false).unwrap(),
+        ContactUpdate::Stale
+    );
+    assert_eq!(
+        s.upsert_contact(&card("i", 2, 5), 14, false).unwrap(),
+        ContactUpdate::Stale,
+        "another static key for the inbox needs a pairing"
+    );
+    let c = s.contact("i").unwrap().unwrap();
+    assert_eq!(
+        (c.generation, c.discovery_key, c.updated_ns, c.removed),
+        (1, [7; 32], 12, false)
+    );
+    assert_eq!(
+        s.upsert_contact(&card("i", 2, 0), 15, true).unwrap(),
+        ContactUpdate::Updated,
+        "a confirmed pairing replaces the card"
+    );
+    let c = s.contact("i").unwrap().unwrap();
+    assert_eq!((c.noise_static_pub, c.generation), ([2; 32], 0));
+    assert_eq!(s.contacts().unwrap().len(), 1);
+}
+
+#[test]
+fn a_removed_contact_stays_removed_until_it_is_paired_again() {
+    let mut s = MeshStore::open_in_memory().unwrap();
+    s.upsert_contact(&card("i", 1, 0), 10, false).unwrap();
+    assert!(s.remove_contact("i", 11).unwrap());
+    assert!(!s.remove_contact("i", 12).unwrap(), "already removed");
+    assert!(!s.remove_contact("unknown", 12).unwrap());
+    assert!(s.contacts().unwrap().is_empty());
+    let tomb = s.contact_by_static(&[1; 32]).unwrap().unwrap();
+    assert!(
+        tomb.removed,
+        "the static key of a removed contact is still known"
+    );
+    assert_eq!(
+        s.upsert_contact(&card("i", 1, 3), 13, false).unwrap(),
+        ContactUpdate::Removed
+    );
+    assert_eq!(
+        s.upsert_contact(&card("i", 1, 0), 14, true).unwrap(),
+        ContactUpdate::Updated
+    );
+    assert!(!s.contact("i").unwrap().unwrap().removed);
+}
+
+#[test]
+fn malformed_contact_cards_are_refused() {
+    let mut s = MeshStore::open_in_memory().unwrap();
+    let mut short = card("i", 1, 0);
+    short.noise_static_pub.pop();
+    assert!(matches!(
+        s.upsert_contact(&short, 1, false),
+        Err(MeshError::InvalidRequest(_))
+    ));
+    assert!(matches!(
+        s.upsert_contact(&card("", 1, 0), 1, false),
+        Err(MeshError::InvalidRequest(_))
+    ));
+}
+
+#[test]
+fn the_discovery_generation_starts_at_zero_and_persists() {
+    let mut s = MeshStore::open_in_memory().unwrap();
+    assert_eq!(s.discovery_generation().unwrap(), 0);
+    s.set_discovery_generation(3).unwrap();
+    assert_eq!(s.discovery_generation().unwrap(), 3);
 }
