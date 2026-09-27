@@ -630,7 +630,11 @@ impl RelayEngine {
             return false; // not for us: just relayed
         };
         if let Err(e) = self.deliver(gid, key, sealed, since).await {
-            tracing::debug!(error = %e, "relay: envelope not delivered");
+            if deliver_error_level(&e) == tracing::Level::WARN {
+                tracing::warn!(error = %e, "relay: envelope not delivered");
+            } else {
+                tracing::debug!(error = %e, "relay: envelope not delivered");
+            }
         }
         true
     }
@@ -747,6 +751,19 @@ impl RelayEngine {
     }
 }
 
+/// The level `deliver_logged` reports an undelivered envelope's error at.
+/// A `SequencingRejected` is a security event even over the relay path and
+/// is reported at `warn`, as the direct session path already does;
+/// everything else here is ordinary noise (a stale key, a torn seal,
+/// membership not yet known).
+fn deliver_error_level(e: &MeshError) -> tracing::Level {
+    if matches!(e, MeshError::SequencingRejected(_)) {
+        tracing::Level::WARN
+    } else {
+        tracing::Level::DEBUG
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -755,6 +772,34 @@ mod tests {
     use crate::store::{NewGroupMessage, sha256};
     use crate::sync::HelloSigner;
     use crate::sync::seq::{KeySigner, SeqProof, SeqReject, attested_row, sign_row, signed_row};
+
+    /// A `SequencingRejected` on the relay path is a security event and
+    /// must be visible at `warn`, as the direct session path already
+    /// reports a rejected frame; everything else `deliver` can fail with
+    /// here is ordinary noise, kept at `debug`.
+    #[test]
+    fn sequencing_rejections_are_logged_at_warn_not_debug() {
+        assert_eq!(
+            deliver_error_level(&MeshError::SequencingRejected(SeqReject::WrongSigner)),
+            tracing::Level::WARN
+        );
+        assert_eq!(
+            deliver_error_level(&MeshError::SequencingRejected(SeqReject::BadSignature)),
+            tracing::Level::WARN
+        );
+        assert_eq!(
+            deliver_error_level(&MeshError::SequencingRejected(SeqReject::MissingProof)),
+            tracing::Level::WARN
+        );
+        assert_eq!(
+            deliver_error_level(&MeshError::Relay("stale key".into())),
+            tracing::Level::DEBUG
+        );
+        assert_eq!(
+            deliver_error_level(&MeshError::NotRegistered),
+            tracing::Level::DEBUG
+        );
+    }
 
     fn full(id: u64, data: &[u8]) -> RelayRow {
         RelayRow {
