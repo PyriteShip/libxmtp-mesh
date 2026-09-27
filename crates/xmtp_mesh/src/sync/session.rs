@@ -488,6 +488,11 @@ impl Session {
                     if let Err(e) = self.on_inbound(inbound).await {
                         tracing::warn!(peer = %self.peer, error = %e, "mesh frame rejected");
                         if e.is_fatal() {
+                            // A stranger whose frame closed its relay link
+                            // waits out the back-off too (§B14.3).
+                            if self.state == State::RelayOnly {
+                                self.node.back_off_relay_peer(&self.peer);
+                            }
                             if !self.is_cancelled() {
                                 self.transport.disconnect(&self.peer);
                             }

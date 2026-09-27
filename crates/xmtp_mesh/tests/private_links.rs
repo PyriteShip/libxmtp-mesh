@@ -7,11 +7,11 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use common::peer_on;
 use common::{
     ClientGroupMembership, ClientHelloSigner, TestPeer, build_client, eventually,
     fast_relay_config, pair_dm, peer, recorded_peer, relay_peer, relay_peer_with, send_and_see,
 };
+use common::{app_payloads, eventually_for, peer_on, relay_keys_confirmed};
 use xmtp_cryptography::utils::generate_local_wallet;
 use xmtp_db::group::GroupQueryArgs;
 use xmtp_mesh::frames::{self, Auth, Hello, Interest, KeyPackage, SpoolWant, frame::Body};
@@ -171,6 +171,8 @@ async fn a_relay_link_carries_relay_frames_only() {
     let hub = LoopbackHub::new();
     let (a, _) = relay_peer(&hub, "a").await;
     let (b, _) = relay_peer(&hub, "b").await;
+    // Relinked at once after each close below.
+    b.node.set_relay_backoff_for_test(Duration::ZERO);
     hub.set_strangers("a", "b");
     hub.link("a", "b");
     eventually("a relay link", || async {
@@ -1673,5 +1675,91 @@ async fn malformed_digest_ids_do_not_keep_a_relay_link_open() {
             stats.relay_links_force_closed
         ),
         (1, 0)
+    );
+}
+
+/// §B14.3: a stranger whose frame closed its relay link is backed off
+/// too, counted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_frame_on_a_relay_link_backs_off_the_peer() {
+    let hub = LoopbackHub::new();
+    let (_a, b) = relay_strangers(&hub, Duration::from_secs(60), Duration::from_secs(600)).await;
+    hub.inject("a", "b", frames::encode(interest(b"g")));
+    eventually("b closes the link", || async { !hub.is_linked("a", "b") }).await;
+    assert_eq!(b.node.mesh_stats().link_frame_rejected, 1);
+    hub.link_as("a", "b", DialIntent::Relay);
+    eventually("b refuses a", || async {
+        b.node.mesh_stats().relay_links_backoff_refused == 1
+    })
+    .await;
+    eventually("closed", || async { !hub.is_linked("a", "b") }).await;
+    assert_eq!(b.node.mesh_stats().links_relay, 1);
+}
+
+async fn send_dm(dm: &common::MeshGroup, text: &[u8]) {
+    use xmtp_mls::groups::GroupError;
+    use xmtp_mls::groups::send_message_opts::SendMessageOpts;
+    match dm.send_message(text, SendMessageOpts::default()).await {
+        Ok(_) | Err(GroupError::SyncFailedToWait(_)) => {}
+        Err(e) => panic!("send failed: {e:?}"),
+    }
+}
+
+/// §R5.4: a stranger link that meets the spent window still hands this
+/// phone its own message; it is only kept out of the spool.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_recipient_gets_its_message_past_the_stranger_window() {
+    let hub = LoopbackHub::new();
+    let cfg = RelayConfig {
+        max_entries: 64,
+        neighbour_envelopes_per_min: 1,
+        stranger_window_factor: 1,
+        ..fast_relay_config()
+    };
+    let (a, _) = relay_peer(&hub, "a").await;
+    let (_b, _) = relay_peer(&hub, "b").await;
+    let (c, _) = relay_peer(&hub, "c").await;
+    let (d, _) = relay_peer_with(&hub, "d", cfg.clone()).await;
+    let (a_dm, d_dm) = pair_dm(&hub, &a, &d).await;
+    relay_keys_confirmed(&a, &d, &a_dm.group_id).await;
+    hub.unlink("a", "d");
+    // Pin d a few seconds into a window, so the test never straddles one.
+    let now = d.node.unix_now();
+    d.node
+        .set_clock_offset_for_test((WINDOW_SECS - now % WINDOW_SECS) as i64 + 5);
+    hub.set_strangers("b", "d");
+    hub.set_strangers("c", "d");
+    // c spends the whole window (its own link's burst is the same size).
+    hub.link("c", "d");
+    eventually("c linked", || async {
+        d.node.mesh_stats().links_relay == 1
+    })
+    .await;
+    for _ in 0..cfg.share_cap() {
+        c.node.originate_random_for_test(100, 5);
+    }
+    eventually("the window is spent", || async {
+        d.node.relay_stats().accepted == cfg.share_cap() as u64
+    })
+    .await;
+    hub.link("b", "d");
+    eventually("b linked", || async {
+        d.node.mesh_stats().links_relay == 2
+    })
+    .await;
+    let before = d.node.relay_stats();
+    hub.link("a", "b");
+    send_dm(&a_dm, b"past the window").await;
+    eventually_for("d gets it anyway", 30, || async {
+        d_dm.sync().await.ok();
+        app_payloads(&d_dm).contains(&b"past the window".to_vec())
+    })
+    .await;
+    let after = d.node.relay_stats();
+    assert_eq!(after.accepted, before.accepted, "nothing more was spooled");
+    assert!(after.dropped_rate > before.dropped_rate, "{after:?}");
+    assert!(
+        after.delivered_unspooled > before.delivered_unspooled,
+        "{after:?}"
     );
 }

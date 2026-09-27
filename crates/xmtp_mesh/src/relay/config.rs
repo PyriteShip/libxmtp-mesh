@@ -89,4 +89,9 @@ impl RelayConfig {
     pub fn stranger_share_cap(&self) -> usize {
         self.stranger_window_factor as usize * self.share_cap()
     }
+
+    /// Most spool bytes all strangers together may hold.
+    pub fn stranger_share_bytes(&self) -> usize {
+        self.stranger_window_factor as usize * self.share_cap_bytes()
+    }
 }

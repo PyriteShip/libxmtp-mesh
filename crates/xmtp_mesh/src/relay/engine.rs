@@ -30,6 +30,9 @@ pub struct RelayStats {
     /// envelope (newest wins, §R5.4); nothing is refused for the share.
     pub dropped_share: u64,
     pub dropped_rate: u64,
+    /// Stranger envelopes refused because only contacts' entries were left
+    /// to displace (§R5.4).
+    pub dropped_full: u64,
     pub pushed: u64,
     pub originated: u64,
     /// Relay DM payloads applied here (every delivery, spooled or not).
@@ -52,9 +55,10 @@ pub(crate) struct Link {
     next_offer: Instant,
 }
 
-/// Rate budget of one neighbour phone, shared by all its links (D18). It
-/// outlives the phone's links until it has refilled, so reconnecting does
-/// not reset it.
+/// Rate budget of one relay source (D18, §R5.4): a contact's phone, shared
+/// by all its links, or one stranger link. A contact's budget outlives its
+/// links until it has refilled, so reconnecting does not reset it; a
+/// stranger link's goes with the link (its id is never used again).
 struct Neighbour {
     envelopes: TokenBucket,
     bytes: TokenBucket,
@@ -92,6 +96,15 @@ impl StrangerWindow {
         self.envelopes += 1;
         self.bytes = self.bytes.saturating_add(len);
     }
+
+    /// Give back what `take` charged for an envelope that did not enter
+    /// the spool, if its window is still the current one.
+    pub(crate) fn refund(&mut self, window: u64, len: u64) {
+        if window == self.window {
+            self.envelopes = self.envelopes.saturating_sub(1);
+            self.bytes = self.bytes.saturating_sub(len);
+        }
+    }
 }
 
 /// Most neighbour budgets kept; beyond it the fullest unlinked one goes.
@@ -99,7 +112,7 @@ const MAX_NEIGHBOURS: usize = 256;
 
 pub(crate) struct EngineState {
     pub(crate) links: HashMap<String, Link>,
-    /// Keyed by verified installation key.
+    /// Keyed by verified installation key, or by a stranger link's source id.
     neighbours: HashMap<Vec<u8>, Neighbour>,
     global_envelopes: TokenBucket,
     global_bytes: TokenBucket,
@@ -342,8 +355,8 @@ impl RelayEngine {
             .spawn(async move { engine.offer_keys(&peer).await });
     }
 
-    /// The phone's rate budget stays (pruned on tick once refilled), so a
-    /// reconnect does not reset it (D18).
+    /// A contact phone's rate budget stays (pruned on tick once refilled),
+    /// so a reconnect does not reset it (D18); a stranger link's goes.
     fn link_down(&self, peer: &str) {
         let mut st = self.state.lock();
         if let Some(link) = st.links.remove(peer)
@@ -422,7 +435,8 @@ impl RelayEngine {
                 }
             }
         }
-        // Ask once per phone: skip what a sibling link already asked for.
+        // Ask once per source (a contact's phone; a stranger link has no
+        // siblings): skip what a sibling link already asked for.
         let want: Vec<Vec<u8>> = {
             let mut st = self.state.lock();
             let Some(installation) = st.installation_of(peer) else {
@@ -457,8 +471,9 @@ impl RelayEngine {
             let Ok(short) = <[u8; 8]>::try_from(id.as_slice()) else {
                 continue;
             };
-            // Once per phone: a sibling link's want (or an earlier push)
-            // already covers it. Checked and marked in one step.
+            // Once per source (a contact's phone; a stranger link has no
+            // siblings): a sibling link's want (or an earlier push) already
+            // covers it. Checked and marked in one step.
             {
                 let mut st = self.state.lock();
                 let Some(installation) = st.installation_of(peer) else {
@@ -496,7 +511,7 @@ impl RelayEngine {
             .node()
             .map(|n| crate::link::window_at(n.unix_now()))
             .unwrap_or(0);
-        let within_rate = {
+        let (within_rate, charged) = {
             let now = Instant::now();
             let mut st = self.state.lock();
             let EngineState {
@@ -539,7 +554,15 @@ impl RelayEngine {
             } else {
                 stats.dropped_rate += 1;
             }
-            ok
+            (ok, ok && stranger)
+        };
+        // What strangers pushed only counts against their window if it
+        // entered the spool: junk costs a stranger its own link's budget,
+        // never the other strangers' window (§R5.4).
+        let refund = || {
+            if charged {
+                self.state.lock().strangers.refund(window, len as u64);
+            }
         };
         if !within_rate {
             // Not stored or pushed, but a recipient never misses its own
@@ -547,13 +570,16 @@ impl RelayEngine {
             self.deliver_unspooled(&hash, &env.sealed).await;
             return Ok(false);
         }
-        let from = match self.state.lock().links.get(peer) {
-            Some(l) => l.installation.clone(),
-            None => return Ok(false),
+        let from = self
+            .state
+            .lock()
+            .links
+            .get(peer)
+            .map(|l| l.installation.clone());
+        let (Some(from), Some(node)) = (from, self.node()) else {
+            refund();
+            return Ok(false);
         };
-        let node = self
-            .node()
-            .ok_or_else(|| MeshError::Relay("node gone".into()))?;
         let outcome = {
             let mut store = node.inner.store.lock();
             spool::accept(
@@ -563,8 +589,12 @@ impl RelayEngine {
                 &env.sealed,
                 &from,
                 now_secs(),
-            )?
+            )
         };
+        if !matches!(outcome, Ok(Accept::New { .. })) {
+            refund();
+        }
+        let outcome = outcome?;
         {
             let mut st = self.state.lock();
             match outcome {
@@ -575,6 +605,7 @@ impl RelayEngine {
                 Accept::Duplicate => st.stats.duplicate += 1,
                 Accept::Dropped(DropReason::Invalid) => st.stats.dropped_invalid += 1,
                 Accept::Dropped(DropReason::Expired) => st.stats.dropped_expired += 1,
+                Accept::Dropped(DropReason::Full) => st.stats.dropped_full += 1,
             }
         }
         match outcome {
@@ -1685,6 +1716,70 @@ mod tests {
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(offers_to("stranger"), 0);
+        node.disable_relay();
+    }
+
+    /// A node with `cfg` whose clock sits a few seconds into a discovery
+    /// window, so a test never straddles one.
+    fn window_node(cfg: RelayConfig) -> (MeshNode, Arc<Sent>) {
+        let (node, sent) = relay_node(cfg);
+        let w = crate::link::WINDOW_SECS;
+        let now = node.unix_now();
+        node.set_clock_offset_for_test((w - now % w) as i64 + 5);
+        (node, sent)
+    }
+
+    fn one_share_window() -> RelayConfig {
+        RelayConfig {
+            max_entries: 16,
+            neighbour_envelopes_per_min: 1,
+            stranger_window_factor: 1,
+            ..quiet()
+        }
+    }
+
+    /// §R5.4: duplicates (or anything else that stays out of the spool)
+    /// cost a stranger its own link's budget, never the shared window.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn junk_from_one_stranger_does_not_use_up_the_window() {
+        let (node, _) = window_node(one_share_window());
+        node.relay_link_up("s1", crate::relay::stranger_source(), String::new());
+        node.relay_link_up("s2", crate::relay::stranger_source(), String::new());
+        let e = live_sealed();
+        for _ in 0..4 {
+            node.on_relay_frame("s1", relay(&e)).await;
+        }
+        for _ in 0..3 {
+            node.on_relay_frame("s2", relay(&live_sealed())).await;
+        }
+        let s = node.relay_stats();
+        assert_eq!(
+            (s.accepted, s.duplicate, s.dropped_rate),
+            (4, 3, 0),
+            "{s:?}"
+        );
+        node.on_relay_frame("s2", relay(&live_sealed())).await;
+        assert_eq!(node.relay_stats().dropped_rate, 1, "the window is 4");
+        node.disable_relay();
+    }
+
+    /// §R5.4: the stranger window never limits a contact link.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_contact_link_is_accepted_after_the_stranger_window_is_spent() {
+        let (node, _) = window_node(one_share_window());
+        node.relay_link_up("s1", crate::relay::stranger_source(), String::new());
+        node.relay_link_up("s2", crate::relay::stranger_source(), String::new());
+        node.relay_link_up("contact", vec![2; 32], "them".into());
+        for _ in 0..4 {
+            node.on_relay_frame("s1", relay(&live_sealed())).await;
+        }
+        node.on_relay_frame("s2", relay(&live_sealed())).await;
+        assert_eq!(node.relay_stats().dropped_rate, 1, "the window is spent");
+        for _ in 0..4 {
+            node.on_relay_frame("contact", relay(&live_sealed())).await;
+        }
+        let s = node.relay_stats();
+        assert_eq!((s.accepted, s.dropped_rate), (8, 1), "{s:?}");
         node.disable_relay();
     }
 }

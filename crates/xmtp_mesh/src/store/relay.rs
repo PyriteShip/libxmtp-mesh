@@ -198,6 +198,16 @@ impl MeshStore {
         Ok(rows[0].v)
     }
 
+    /// Entries and bytes in the spool that arrived over stranger links.
+    pub fn spool_stranger_totals(&mut self) -> Result<(i64, i64), MeshError> {
+        let rows: Vec<TotalsRow> = sql_query(format!(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(length(sealed)), 0) AS bytes FROM relay_spool \
+             WHERE length(from_installation) = {STRANGER_SOURCE_LEN}"
+        ))
+        .load(&mut self.conn)?;
+        Ok((rows[0].n, rows[0].bytes))
+    }
+
     /// Spool entries that arrived over stranger links.
     pub fn spool_count_strangers(&mut self) -> Result<i64, MeshError> {
         let rows: Vec<I64Row> = sql_query(format!(

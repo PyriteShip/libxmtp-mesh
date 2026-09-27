@@ -262,8 +262,9 @@ impl MeshNode {
         *self.inner.link.dialers.write() = dialers;
     }
 
-    /// This phone closed `peer`'s relay link (idle, at the lifetime cap, or
-    /// relay off): refuse it as a stranger for the back-off (§B14.3), so
+    /// This phone closed `peer`'s relay link (idle, at the lifetime cap, for
+    /// a rejected frame, or relay off): refuse it as a stranger for the
+    /// back-off (§B14.3), so
     /// reconnecting cannot hold a radio slot.
     pub(crate) fn back_off_relay_peer(&self, peer: &str) {
         let now = std::time::Instant::now();

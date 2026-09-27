@@ -1,6 +1,8 @@
 //! Spool admission (§R5.1, §R5.4, §R8): validate, dedup, cap one
 //! neighbour's share (newest wins: a full share evicts its own soonest-drop
-//! entry), evict soonest-drop when full. Rate limits are the engine's
+//! entry), cap all strangers together the same way, evict soonest-drop
+//! when full (a stranger's envelope only ever displaces strangers' entries).
+//! Rate limits are the engine's
 //! (in-memory [`TokenBucket`]s), checked before this runs.
 use tokio::time::Instant;
 
@@ -16,6 +18,9 @@ const MAX_AHEAD_SECS: i64 = 25 * 3600;
 pub(crate) enum DropReason {
     Invalid,
     Expired,
+    /// A stranger's envelope with no room left once only strangers'
+    /// entries may go (§R5.4): contacts' entries are never displaced.
+    Full,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,11 +83,32 @@ pub(crate) fn accept(
                 share_evicted += 1;
             }
         }
-        // All strangers together hold at most their joint share (§R5.4).
-        if crate::relay::is_stranger(from) {
-            while s.spool_count_strangers()? >= cfg.stranger_share_cap() as i64
-                && s.spool_evict_soonest_stranger()?
+        // All strangers together hold at most their joint share, in
+        // entries and bytes (§R5.4). A stranger's envelope makes room only
+        // by displacing strangers' entries: if contacts' entries alone
+        // leave no room, it is refused.
+        let stranger = crate::relay::is_stranger(from);
+        if stranger {
+            let (n, bytes) = s.spool_totals()?;
+            let (sn, sbytes) = s.spool_stranger_totals()?;
+            let len = sealed.len() as i64;
+            if n - sn >= cfg.max_entries as i64
+                || bytes - sbytes + len > cfg.max_bytes as i64
+                || len > cfg.stranger_share_bytes() as i64
+                || cfg.stranger_share_cap() == 0
             {
+                return Ok(Accept::Dropped(DropReason::Full));
+            }
+            loop {
+                let (sn, sbytes) = s.spool_stranger_totals()?;
+                if (sn as usize) < cfg.stranger_share_cap()
+                    && sbytes as usize + sealed.len() <= cfg.stranger_share_bytes()
+                {
+                    break;
+                }
+                if !s.spool_evict_soonest_stranger()? {
+                    break;
+                }
                 share_evicted += 1;
             }
         }
@@ -91,7 +117,12 @@ pub(crate) fn accept(
             if (n as usize) < cfg.max_entries && bytes as usize + sealed.len() <= cfg.max_bytes {
                 break;
             }
-            if !s.spool_evict_soonest()? {
+            let evicted = if stranger {
+                s.spool_evict_soonest_stranger()?
+            } else {
+                s.spool_evict_soonest()?
+            };
+            if !evicted {
                 break;
             }
         }
@@ -487,5 +518,92 @@ mod tests {
         }
         assert_eq!(s.spool_count_from(&contact).unwrap(), 4);
         assert_eq!(s.spool_count_strangers().unwrap(), 8);
+    }
+
+    /// §R5.4: strangers filling the spool's bytes never push out a
+    /// contact's entry, even one that would drop sooner than theirs.
+    #[test]
+    fn strangers_filling_bytes_never_displace_a_contacts_entry() {
+        let big = |exp| sealed(1000, exp);
+        let big_len = big((NOW + 2 * M) as u64).len();
+        let cfg = RelayConfig {
+            max_entries: 64,
+            max_bytes: 8 * big_len,
+            ..RelayConfig::default()
+        };
+        let mut s = MeshStore::open_in_memory().unwrap();
+        let contact = vec![9u8; 32];
+        let Accept::New { hash, .. } = accept(
+            &mut s,
+            &cfg,
+            3,
+            &sealed(10, (NOW + M) as u64),
+            &contact,
+            NOW,
+        )
+        .unwrap() else {
+            panic!("new")
+        };
+        for _ in 0..3 {
+            let src = crate::relay::stranger_source();
+            for _ in 0..5 {
+                accept(&mut s, &cfg, 3, &big((NOW + 2 * M) as u64), &src, NOW).unwrap();
+            }
+        }
+        assert!(
+            s.spool_get(&hash).unwrap().is_some(),
+            "the contact's entry stays"
+        );
+        let (n, bytes) = s.spool_totals().unwrap();
+        assert!(bytes as usize <= cfg.max_bytes);
+        assert_eq!(s.spool_count_strangers().unwrap(), n - 1);
+    }
+
+    /// §R5.4: strangers together keep to a byte cap too, and a stranger's
+    /// envelope is refused when only contacts' entries could make room.
+    #[test]
+    fn strangers_keep_to_a_byte_cap_and_are_refused_by_a_spool_full_of_contacts() {
+        let cfg = RelayConfig {
+            max_entries: 8,
+            max_bytes: 8 * 2048,
+            stranger_window_factor: 1,
+            ..RelayConfig::default()
+        };
+        let mut s = MeshStore::open_in_memory().unwrap();
+        let src = crate::relay::stranger_source();
+        for _ in 0..3 {
+            accept(&mut s, &cfg, 3, &sealed(1500, (NOW + M) as u64), &src, NOW).unwrap();
+        }
+        let (_, bytes) = s.spool_stranger_totals().unwrap();
+        assert!(bytes as usize <= cfg.stranger_share_bytes(), "{bytes}");
+
+        let mut s = MeshStore::open_in_memory().unwrap();
+        for c in 0..4u8 {
+            for _ in 0..2 {
+                accept(
+                    &mut s,
+                    &cfg,
+                    3,
+                    &sealed(10, (NOW + M) as u64),
+                    &[c; 32],
+                    NOW,
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(
+            accept(
+                &mut s,
+                &cfg,
+                3,
+                &sealed(10, (NOW + 2 * M) as u64),
+                &src,
+                NOW
+            )
+            .unwrap(),
+            Accept::Dropped(DropReason::Full)
+        );
+        assert_eq!(s.spool_totals().unwrap().0, 8);
+        assert_eq!(s.spool_count_strangers().unwrap(), 0);
     }
 }
