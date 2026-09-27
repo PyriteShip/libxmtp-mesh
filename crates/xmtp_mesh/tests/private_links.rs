@@ -1093,3 +1093,331 @@ async fn an_auth_over_the_unbound_v1_text_is_refused() {
     })
     .await;
 }
+
+// ---- Pairing (Noise XX) -------------------------------------------------
+
+/// `p`'s open pairing with `peer`, if any.
+fn pending_on(p: &TestPeer, peer: &str) -> Option<xmtp_mesh::PendingPairing> {
+    p.node
+        .pending_pairings()
+        .into_iter()
+        .find(|pp| pp.peer == peer)
+}
+
+/// Both phones in pairing mode; `a` dials `b` over Noise XX. Returns each
+/// side's pending pairing once both show a code.
+async fn open_pairing(
+    hub: &LoopbackHub,
+    a: &TestPeer,
+    b: &TestPeer,
+) -> (xmtp_mesh::PendingPairing, xmtp_mesh::PendingPairing) {
+    a.node.set_pairing_mode(true);
+    b.node.set_pairing_mode(true);
+    hub.link_as(&a.name, &b.name, DialIntent::Pairing);
+    eventually("both phones show a code", || async {
+        pending_on(a, &b.name).is_some() && pending_on(b, &a.name).is_some()
+    })
+    .await;
+    (
+        pending_on(a, &b.name).unwrap(),
+        pending_on(b, &a.name).unwrap(),
+    )
+}
+
+/// Both people confirm; wait until each phone stored the other's card.
+async fn confirm_both(a: &TestPeer, b: &TestPeer) {
+    a.node.confirm_pairing(&b.name).unwrap();
+    b.node.confirm_pairing(&a.name).unwrap();
+    eventually("both pairings done", || async {
+        pending_on(a, &b.name).is_none() && pending_on(b, &a.name).is_none()
+    })
+    .await;
+    for (p, q) in [(a, b), (b, a)] {
+        assert!(
+            p.node
+                .contact(&inbox(q))
+                .unwrap()
+                .is_some_and(|c| !c.removed)
+        );
+    }
+}
+
+/// A frame that names a phone, its keys or its groups.
+fn identifying(body: &Body) -> bool {
+    !matches!(body, Body::PairConfirm(_))
+}
+
+/// Spec §10 "pairing XX": one 6-digit code on both phones. Nothing that
+/// identifies either phone crosses until both people confirmed: the
+/// accepting phone, confirming first, says nothing at all until the
+/// dialer's confirmation (the dialer speaks first). Then both store the
+/// other's card and later reconnect as contacts.
+#[tokio::test(flavor = "multi_thread")]
+async fn pairing_shows_one_code_and_sends_nothing_identifying_until_both_confirm() {
+    let hub = LoopbackHub::new();
+    let (a, rec_a) = recorded_peer(&hub, "a").await;
+    let (b, rec_b) = recorded_peer(&hub, "b").await;
+    let (pa, pb) = open_pairing(&hub, &a, &b).await;
+    assert_eq!(pa.code, pb.code);
+    assert_eq!(pa.code.len(), 6);
+    assert!(pa.code.chars().all(|c| c.is_ascii_digit()));
+    assert!(!pa.confirmed && !pa.peer_confirmed);
+    b.node.confirm_pairing("a").unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        rec_a.sent_to("b").is_empty(),
+        "the dialer waits for its own person"
+    );
+    assert!(
+        rec_b.sent_to("a").is_empty(),
+        "the accepting side speaks only after the dialer's first record"
+    );
+    assert!(pending_on(&b, "a").unwrap().confirmed);
+    assert!(a.node.contacts().unwrap().is_empty() && b.node.contacts().unwrap().is_empty());
+    assert!(a.node.authenticated_peers().is_empty() && b.node.authenticated_peers().is_empty());
+    a.node.confirm_pairing("b").unwrap();
+    eventually("both cards stored", || async {
+        a.node.contact(&inbox(&b)).unwrap().is_some()
+            && b.node.contact(&inbox(&a)).unwrap().is_some()
+    })
+    .await;
+    for (rec, to) in [(&rec_a, "b"), (&rec_b, "a")] {
+        let sent = rec.sent_to(to);
+        assert!(matches!(sent[0], Body::PairConfirm(_)), "{:?}", sent[0]);
+        assert!(identifying(&sent[1]));
+    }
+    eventually("the pairing is done on both phones", || async {
+        a.node.pending_pairings().is_empty() && b.node.pending_pairings().is_empty()
+    })
+    .await;
+    assert_eq!(a.node.mesh_stats().links_pairing, 1);
+    hub.unlink("a", "b");
+    for p in [&a, &b] {
+        p.node.set_pairing_mode(false);
+    }
+    hub.link_as(
+        "a",
+        "b",
+        DialIntent::Contact {
+            inbox_id: inbox(&b),
+        },
+    );
+    verified_pair(&a, &b).await;
+    assert_eq!(a.node.mesh_stats().links_contact, 1);
+}
+
+/// Only one person confirmed: the dialer sends its confirmation and
+/// nothing else, nothing is stored, and the pairing closes at its timeout
+/// (counted as an unfinished pairing).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pairing_confirmed_on_one_phone_only_leaks_nothing_and_times_out() {
+    let hub = LoopbackHub::new();
+    let (a, rec_a) = recorded_peer(&hub, "a").await;
+    let (b, rec_b) = recorded_peer(&hub, "b").await;
+    for p in [&a, &b] {
+        p.node
+            .set_pairing_timeout_for_test(Duration::from_millis(800));
+    }
+    open_pairing(&hub, &a, &b).await;
+    a.node.confirm_pairing("b").unwrap();
+    eventually("b hears a's confirmation", || async {
+        pending_on(&b, "a").is_some_and(|p| p.peer_confirmed && !p.confirmed)
+    })
+    .await;
+    eventually("the pairing times out", || async {
+        !hub.is_linked("a", "b")
+    })
+    .await;
+    let from_a = rec_a.sent_to("b");
+    assert_eq!(from_a.len(), 1);
+    assert!(matches!(from_a[0], Body::PairConfirm(_)));
+    assert!(rec_b.sent_to("a").is_empty());
+    assert!(a.node.contacts().unwrap().is_empty() && b.node.contacts().unwrap().is_empty());
+    eventually("nothing pending", || async {
+        a.node.pending_pairings().is_empty() && b.node.pending_pairings().is_empty()
+    })
+    .await;
+    assert!(
+        a.node.pairing_mode() && b.node.pairing_mode(),
+        "one failure is under the cap"
+    );
+}
+
+/// A Hello (or anything but a confirmation) before both people confirmed
+/// closes the pairing link.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hello_before_both_confirmed_closes_the_pairing() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    open_pairing(&hub, &a, &b).await;
+    assert!(a.node.send_frame_for_test(
+        "b",
+        Body::Hello(Hello {
+            installation_key: a.installation(),
+            inbox_id: inbox(&a),
+            challenge: vec![2; 32],
+            seq: frames::SEQ_V1,
+            link: frames::LINK_V1,
+            ..Default::default()
+        })
+    ));
+    eventually("b closes the link", || async { !hub.is_linked("a", "b") }).await;
+    assert_eq!(b.node.mesh_stats().link_frame_rejected, 1);
+    assert!(b.node.authenticated_peers().is_empty());
+    assert!(b.node.contacts().unwrap().is_empty());
+}
+
+/// Spec §10: a middle phone relaying the pairing runs two handshakes, so
+/// the two people see different codes (and confirming a mismatch is what
+/// the people must not do).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relaying_middle_phone_shows_different_codes() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let m = peer(&hub, "m").await;
+    let b = peer(&hub, "b").await;
+    let (a_side, m_left) = open_pairing(&hub, &a, &m).await;
+    let (m_right, b_side) = open_pairing(&hub, &m, &b).await;
+    assert_eq!(a_side.code, m_left.code);
+    assert_eq!(m_right.code, b_side.code);
+    assert_ne!(a_side.code, b_side.code);
+    assert_eq!(m.node.pending_pairings().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_pairing_stores_nothing_and_closes() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    let (pa, _) = open_pairing(&hub, &a, &b).await;
+    b.node.confirm_pairing("a").unwrap();
+    a.node.reject_pairing(&pa.peer);
+    assert!(a.node.pending_pairings().is_empty());
+    eventually("the pairing link closes", || async {
+        !hub.is_linked("a", "b")
+    })
+    .await;
+    eventually("b forgets it too", || async {
+        b.node.pending_pairings().is_empty()
+    })
+    .await;
+    assert!(a.node.contacts().unwrap().is_empty() && b.node.contacts().unwrap().is_empty());
+    assert!(matches!(
+        a.node.confirm_pairing(&pa.peer),
+        Err(MeshError::NotFound(_))
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pairing_needs_pairing_mode_on_both_phones() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    a.node.set_pairing_mode(true);
+    hub.link_as("a", "b", DialIntent::Pairing);
+    eventually("b refuses", || async { !hub.is_linked("a", "b") }).await;
+    assert_eq!(b.node.mesh_stats().handshake_failed, 1);
+    assert!(a.node.pending_pairings().is_empty());
+}
+
+/// Review focus: re-pairing in person replaces a card a contact link could
+/// not (an older generation).
+#[tokio::test(flavor = "multi_thread")]
+async fn pairing_replaces_a_stale_card() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    hub.link("a", "b");
+    verified_pair(&a, &b).await;
+    hub.unlink("a", "b");
+    b.node.reset_discovery_key().unwrap();
+    hub.link_as(
+        "b",
+        "a",
+        DialIntent::Contact {
+            inbox_id: inbox(&a),
+        },
+    );
+    eventually("a holds generation 1", || async {
+        a.node
+            .contact(&inbox(&b))
+            .unwrap()
+            .is_some_and(|c| c.generation == 1)
+    })
+    .await;
+    hub.unlink("a", "b");
+    b.node.set_discovery_generation_for_test(0).unwrap();
+    open_pairing(&hub, &a, &b).await;
+    confirm_both(&a, &b).await;
+    eventually("a holds generation 0 again", || async {
+        a.node
+            .contact(&inbox(&b))
+            .unwrap()
+            .is_some_and(|c| c.generation == 0)
+    })
+    .await;
+}
+
+/// Re-pairing in person brings back a removed contact, and the new contact
+/// may dial in over IK at once (the allowed-dialer set is refreshed).
+#[tokio::test(flavor = "multi_thread")]
+async fn pairing_re_adds_a_removed_contact_who_may_then_dial_in() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    hub.make_contacts("a", "b");
+    assert!(a.node.remove_contact(&inbox(&b)).unwrap());
+    open_pairing(&hub, &a, &b).await;
+    confirm_both(&a, &b).await;
+    assert!(
+        a.node
+            .contact(&inbox(&b))
+            .unwrap()
+            .is_some_and(|c| !c.removed)
+    );
+    hub.unlink("a", "b");
+    for p in [&a, &b] {
+        p.node.set_pairing_mode(false);
+    }
+    hub.link_as(
+        "b",
+        "a",
+        DialIntent::Contact {
+            inbox_id: inbox(&a),
+        },
+    );
+    verified_pair(&a, &b).await;
+    assert_eq!(a.node.mesh_stats().links_contact, 1);
+}
+
+/// An online guesser gets few tries: after the cap of unfinished pairing
+/// handshakes the phone leaves pairing mode (counted) and refuses the next.
+#[tokio::test(flavor = "multi_thread")]
+async fn unfinished_pairings_end_pairing_mode_at_the_cap() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    b.node.set_pairing_mode(true);
+    for n in 1..=xmtp_mesh::MAX_UNFINISHED_PAIRINGS {
+        a.node.set_pairing_mode(true); // a fresh entry each time on the guesser
+        hub.link_as("a", "b", DialIntent::Pairing);
+        eventually("b shows a code", || async { pending_on(&b, "a").is_some() }).await;
+        b.node.reject_pairing("a");
+        eventually("closed", || async { !hub.is_linked("a", "b") }).await;
+        if n < xmtp_mesh::MAX_UNFINISHED_PAIRINGS {
+            assert!(b.node.pairing_mode(), "still pairing after {n}");
+        }
+    }
+    eventually("b left pairing mode", || async { !b.node.pairing_mode() }).await;
+    assert_eq!(b.node.mesh_stats().pairing_attempts_exhausted, 1);
+    let failed = b.node.mesh_stats().handshake_failed;
+    a.node.set_pairing_mode(true);
+    hub.link_as("a", "b", DialIntent::Pairing);
+    eventually("b refuses", || async { !hub.is_linked("a", "b") }).await;
+    assert_eq!(b.node.mesh_stats().handshake_failed, failed + 1);
+    // Entering pairing mode again starts a new count.
+    b.node.set_pairing_mode(true);
+    let (_, pb) = open_pairing(&hub, &a, &b).await;
+    assert_eq!(pb.peer, "a");
+}

@@ -336,6 +336,29 @@ impl From<FfiLinkRole> for LinkRole {
 }
 
 /// Public facts about the link keys derived from the account key.
+/// An open pairing link (DESIGN.md §B14.4).
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FfiPendingPairing {
+    pub peer_id: String,
+    /// The 6 digits both phones show.
+    pub code: String,
+    /// This phone's person confirmed.
+    pub confirmed: bool,
+    /// The other phone's person confirmed.
+    pub peer_confirmed: bool,
+}
+
+impl From<xmtp_mesh::PendingPairing> for FfiPendingPairing {
+    fn from(p: xmtp_mesh::PendingPairing) -> Self {
+        Self {
+            peer_id: p.peer,
+            code: p.code,
+            confirmed: p.confirmed,
+            peer_confirmed: p.peer_confirmed,
+        }
+    }
+}
+
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct FfiLinkKeyInfo {
     pub noise_static_pub: Vec<u8>,
@@ -582,9 +605,35 @@ impl FfiMeshNode {
         })
     }
 
-    /// Accept (and advertise) pairing links (DESIGN.md §B14.4).
+    /// Accept (and advertise) pairing links (DESIGN.md §B14.4). The node
+    /// leaves pairing mode by itself after too many unfinished pairings.
     pub fn set_pairing_mode(&self, on: bool) {
         self.node.set_pairing_mode(on);
+    }
+
+    pub fn pairing_mode(&self) -> bool {
+        self.node.pairing_mode()
+    }
+
+    /// Open pairing links and the code each shows (DESIGN.md §B14.4).
+    pub fn pending_pairings(&self) -> Vec<FfiPendingPairing> {
+        self.node
+            .pending_pairings()
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    /// The person compared the codes and they match. Nothing identifying
+    /// crosses until both people confirmed; then the phones exchange
+    /// identities, and the other phone appears as a contact.
+    pub fn confirm_pairing(&self, peer_id: String) -> Result<(), FfiError> {
+        self.node.confirm_pairing(&peer_id).map_err(mesh_error)
+    }
+
+    /// The codes differ, or the person declined: close the pairing link.
+    pub fn reject_pairing(&self, peer_id: String) {
+        self.node.reject_pairing(&peer_id);
     }
 
     /// Start syncing with peers. `client` must be the registered client whose
@@ -1008,11 +1057,34 @@ mod tests {
     }
 
     /// Link keys plus pairing mode: two test nodes with no contact cards can
-    /// link over a pairing (Noise XX) link, which syncs like a contact link.
+    /// link over a pairing (Noise XX) link, which syncs like a contact link
+    /// once both people confirmed the code ([`confirm_pairings`]).
     fn ready_to_pair(client: &FfiXmtpClient, node: &FfiMeshNode) {
         node.set_account_key(xmtp_mesh::store::sha256(&client.installation_id()))
             .unwrap();
         node.set_pairing_mode(true);
+    }
+
+    /// Both phones show the same code for the pairing between `a` (sees
+    /// `b_id`) and `b` (sees `a_id`); both people confirm it.
+    async fn confirm_pairings(a: &FfiMeshNode, b_id: &str, b: &FfiMeshNode, a_id: &str) {
+        let pending = |n: &FfiMeshNode, peer: &str| {
+            n.pending_pairings().into_iter().find(|p| p.peer_id == peer)
+        };
+        eventually("both phones show a code", || async {
+            pending(a, b_id).is_some() && pending(b, a_id).is_some()
+        })
+        .await;
+        let (pa, pb) = (pending(a, b_id).unwrap(), pending(b, a_id).unwrap());
+        assert_eq!(pa.code, pb.code);
+        assert!(!pa.confirmed && !pa.peer_confirmed);
+        assert!(
+            a.authenticated_peers().is_empty(),
+            "nothing before confirmation"
+        );
+        assert!(a.confirm_pairing("nobody".into()).is_err());
+        a.confirm_pairing(b_id.into()).unwrap();
+        b.confirm_pairing(a_id.into()).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1108,6 +1180,7 @@ mod tests {
         })
         .join()
         .unwrap();
+        confirm_pairings(&node_a, "b#1", &node_b, "a#1").await;
 
         eventually("mutual auth", || async {
             node_a.authenticated_peers() == vec!["b#1".to_string()]
@@ -1366,6 +1439,7 @@ mod tests {
         })
         .join()
         .unwrap();
+        confirm_pairings(&node_a, "b#1", &node_b, "a#1").await;
         eventually("good peer authenticates", || async {
             node_a.authenticated_peers() == vec!["b#1".to_string()]
                 && node_b.authenticated_peers() == vec!["a#1".to_string()]

@@ -4,7 +4,6 @@ use std::sync::atomic::Ordering;
 
 use super::MeshNode;
 use crate::MeshError;
-use crate::link::LinkRole;
 use crate::link::keys::{AccountPrk, MeshKeys};
 use crate::link::noise::{ReplayCache, ResponderContext};
 use crate::link::{
@@ -12,11 +11,12 @@ use crate::link::{
     FLAG_RELAY, LinkCounters, LinkKeyInfo, Token, WINDOW_SECS, advert_token, parse_service_data,
     service_data, window_at,
 };
+use crate::link::{LinkRole, MAX_UNFINISHED_PAIRINGS, PairingEntry, PendingPairing};
 use crate::store::{Contact, ContactUpdate};
+use crate::sync::MeshTransport;
 use crate::sync::frames::ContactCard;
 use crate::sync::frames::frame::Body;
 use crate::sync::session::{Inbound, LinkSetup};
-use crate::sync::MeshTransport;
 
 impl MeshNode {
     /// Derive this phone's link keys from the account key (the secp256k1
@@ -91,7 +91,13 @@ impl MeshNode {
             .max(0) as u64
     }
 
+    /// Advertise and accept pairing links (§B14.4). Each time it is turned
+    /// on, [`MAX_UNFINISHED_PAIRINGS`] unfinished pairings are allowed
+    /// before the phone leaves pairing mode by itself.
     pub fn set_pairing_mode(&self, on: bool) {
+        if on {
+            self.inner.link.pairing_failures.store(0, Ordering::Relaxed);
+        }
         self.inner.link.pairing_mode.store(on, Ordering::Relaxed);
         self.inner.link.bump_contacts_version();
     }
@@ -310,6 +316,116 @@ impl MeshNode {
             // No rival, or the same phone dialed both: leave it to the
             // radio (§B7.3).
             _ => ContactLinkOutcome::Kept { close: None },
+        }
+    }
+
+    /// Pairing link `peer` (session `session_id`) opened with `code`.
+    pub(crate) fn pairing_opened(&self, peer: &str, session_id: u64, code: String) {
+        let sessions = self.inner.sessions.lock();
+        if sessions.get(peer).is_some_and(|h| h.id == session_id) {
+            self.inner.link.pairings.lock().insert(
+                peer.to_string(),
+                PairingEntry {
+                    session_id,
+                    code,
+                    confirmed: false,
+                    peer_confirmed: false,
+                },
+            );
+        }
+    }
+
+    /// The other phone's person confirmed the pairing on `peer`.
+    pub(crate) fn pairing_peer_confirmed(&self, peer: &str, session_id: u64) {
+        let _sessions = self.inner.sessions.lock();
+        if let Some(entry) = self.inner.link.pairings.lock().get_mut(peer)
+            && entry.session_id == session_id
+        {
+            entry.peer_confirmed = true;
+        }
+    }
+
+    /// The pairing on `peer` stored the other phone's card: it is done.
+    pub(crate) fn pairing_completed(&self, peer: &str, session_id: u64) {
+        let _sessions = self.inner.sessions.lock();
+        let mut pairings = self.inner.link.pairings.lock();
+        if pairings
+            .get(peer)
+            .is_some_and(|e| e.session_id == session_id)
+        {
+            pairings.remove(peer);
+        }
+    }
+
+    /// A pairing handshake or link ended before the other phone's card was
+    /// stored. At [`MAX_UNFINISHED_PAIRINGS`] since pairing mode was turned
+    /// on, the phone leaves pairing mode (counted).
+    pub(crate) fn pairing_unfinished(&self) {
+        let failures = self
+            .inner
+            .link
+            .pairing_failures
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        if failures >= MAX_UNFINISHED_PAIRINGS
+            && self.inner.link.pairing_mode.swap(false, Ordering::Relaxed)
+        {
+            tracing::warn!(
+                failures,
+                "too many unfinished pairings; leaving pairing mode"
+            );
+            self.inner.link.counters.count_pairing_exhausted();
+            self.inner.link.bump_contacts_version();
+        }
+    }
+
+    /// Open pairing links waiting for the people to compare codes (or,
+    /// both confirmed, for the other phone's card), by peer.
+    pub fn pending_pairings(&self) -> Vec<PendingPairing> {
+        let mut out: Vec<PendingPairing> = self
+            .inner
+            .link
+            .pairings
+            .lock()
+            .iter()
+            .map(|(peer, e)| PendingPairing {
+                peer: peer.clone(),
+                code: e.code.clone(),
+                confirmed: e.confirmed,
+                peer_confirmed: e.peer_confirmed,
+            })
+            .collect();
+        out.sort_by(|a, b| a.peer.cmp(&b.peer));
+        out
+    }
+
+    /// This phone's person compared the codes and they match. Once the
+    /// other phone's person confirmed too, the phones exchange identities
+    /// and cards; the other phone's card then replaces any card or removal
+    /// stored for its inbox (§B14.4). Watch `contacts()` for it.
+    pub fn confirm_pairing(&self, peer: &str) -> Result<(), MeshError> {
+        let sessions = self.inner.sessions.lock();
+        let mut pairings = self.inner.link.pairings.lock();
+        let not_found = || MeshError::NotFound(format!("no pairing on {peer}"));
+        let entry = pairings.get_mut(peer).ok_or_else(not_found)?;
+        let handle = sessions
+            .get(peer)
+            .filter(|h| h.id == entry.session_id)
+            .ok_or_else(not_found)?;
+        entry.confirmed = true;
+        let _ = handle.tx.send(Inbound::Pairing { confirm: true });
+        Ok(())
+    }
+
+    /// The codes differ (or the person declined): forget the pairing and
+    /// close its link.
+    pub fn reject_pairing(&self, peer: &str) {
+        let sessions = self.inner.sessions.lock();
+        let Some(entry) = self.inner.link.pairings.lock().remove(peer) else {
+            return;
+        };
+        if let Some(handle) = sessions.get(peer).filter(|h| h.id == entry.session_id) {
+            let _ = handle.tx.send(Inbound::Pairing { confirm: false });
         }
     }
 

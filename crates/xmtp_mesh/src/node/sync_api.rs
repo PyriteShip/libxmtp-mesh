@@ -242,6 +242,17 @@ impl MeshNode {
         *self.inner.relay_idle_timeout.lock() = timeout;
     }
 
+    pub(crate) fn pairing_timeout(&self) -> Duration {
+        *self.inner.pairing_timeout.lock()
+    }
+
+    /// Applies to pairing links opened from now on.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn set_pairing_timeout_for_test(&self, timeout: Duration) {
+        *self.inner.pairing_timeout.lock() = timeout;
+    }
+
     pub(crate) fn relay_link_lifetime(&self) -> Duration {
         *self.inner.relay_link_lifetime.lock()
     }

@@ -8,7 +8,7 @@ pub(crate) mod tx;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::{Mutex, RwLock};
 
@@ -118,6 +118,7 @@ pub(crate) struct LinkCounters {
     discovery_resets: AtomicU64,
     relay_idle_closed: AtomicU64,
     relay_force_closed: AtomicU64,
+    pairing_exhausted: AtomicU64,
 }
 
 impl LinkCounters {
@@ -146,6 +147,10 @@ impl LinkCounters {
         self.relay_force_closed.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn count_pairing_exhausted(&self) {
+        self.pairing_exhausted.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn count_discovery_reset(&self) {
         self.discovery_resets.fetch_add(1, Ordering::Relaxed);
     }
@@ -160,6 +165,7 @@ impl LinkCounters {
         stats.discovery_resets = get(&self.discovery_resets);
         stats.relay_links_idle_closed = get(&self.relay_idle_closed);
         stats.relay_links_force_closed = get(&self.relay_force_closed);
+        stats.pairing_attempts_exhausted = get(&self.pairing_exhausted);
     }
 }
 
@@ -192,6 +198,34 @@ pub(crate) enum ContactLinkOutcome {
     Superseded,
 }
 
+/// Unfinished pairing handshakes (failed, rejected, timed out or dropped
+/// before both cards were stored) one entry into pairing mode allows; then
+/// the phone leaves pairing mode, so a nearby guesser gets few tries at
+/// the 6-digit code (§B14.4).
+pub const MAX_UNFINISHED_PAIRINGS: u32 = 5;
+
+/// An open pairing link, waiting for the people to compare codes
+/// (§B14.4). Nothing identifying crosses the link until both confirmed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingPairing {
+    pub peer: PeerId,
+    /// The 6 digits both phones show.
+    pub code: String,
+    /// This phone's person confirmed the code (`confirm_pairing`).
+    pub confirmed: bool,
+    /// The other phone's person confirmed it too. Once both did, the
+    /// phones exchange identities and cards, and the pairing leaves this
+    /// list when the other phone's card is stored.
+    pub peer_confirmed: bool,
+}
+
+pub(crate) struct PairingEntry {
+    pub(crate) session_id: u64,
+    pub(crate) code: String,
+    pub(crate) confirmed: bool,
+    pub(crate) peer_confirmed: bool,
+}
+
 /// The node's link state (§B14). Keys live in memory only and are zeroized
 /// on drop. Lock order: `prk`, then the store, then `keys`, then
 /// `dialers`.
@@ -210,6 +244,11 @@ pub(crate) struct LinkState {
     /// Verified contact links by peer. Lock order: the node's `sessions`,
     /// then this.
     pub(crate) contact_links: Mutex<HashMap<PeerId, ContactLinkEntry>>,
+    /// Open pairing links by peer. Lock order: the node's `sessions`, then
+    /// this.
+    pub(crate) pairings: Mutex<HashMap<PeerId, PairingEntry>>,
+    /// Unfinished pairings since pairing mode was last turned on.
+    pub(crate) pairing_failures: AtomicU32,
 }
 
 impl LinkState {

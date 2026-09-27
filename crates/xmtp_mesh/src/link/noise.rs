@@ -412,6 +412,14 @@ impl Handshake {
         }
     }
 
+    /// A pairing (XX) handshake past message 1: a code is at stake.
+    pub(crate) fn is_pairing(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::ResponderAwait3 { .. } | Phase::DialerAwait2 { na: Some(_), .. }
+        )
+    }
+
     /// Process one handshake message from the peer. Any error ends the
     /// handshake.
     pub(crate) fn read(&mut self, message: &[u8]) -> Result<Step, MeshError> {
@@ -908,6 +916,53 @@ mod tests {
             assert_eq!(open.remote_static, Some(m_pub));
             assert_eq!(open.pairing_code, Some(predicted));
         }
+    }
+
+    /// A middle phone between `a` and `b` (a dials m, m dials b) that
+    /// controls its message 3 to `b` cannot make the two codes match: `b`
+    /// takes only the committed `Na`, so `b`'s code is fixed at message 2,
+    /// before m can learn `a`'s code (a's `Na` arrives in a's message 3).
+    /// Each try costs m a whole handshake, shown to `b` as a failure.
+    #[test]
+    fn a_middle_phone_cannot_steer_message_3_to_match_the_codes() {
+        let (a, _) = keypair(1);
+        let (b, _) = keypair(2);
+        let (m, _) = keypair(3);
+        for _ in 0..8 {
+            let mut to_b = accept(&b, true, false);
+            let (mut hand, msg1) = HandDialer::start(&m);
+            let msg2 = to_b.read(&msg1).unwrap().reply.unwrap();
+            let (_, b_code) = hand.read2(&msg2);
+            let (a_side, m_left) =
+                run(dial(&DialTarget::Pairing, &a), accept(&m, true, false)).unwrap();
+            let a_code = a_side.pairing_code.unwrap();
+            assert_eq!(m_left.pairing_code.as_deref(), Some(a_code.as_str()));
+            // A message 3 other than the committed one fails (shown here on a
+            // second handshake); the committed one gives b_code.
+            let mut probe = pairing_past_msg2(&b, &m);
+            let mut forged = probe.1.na;
+            forged[0] ^= 1;
+            let bad = write(&mut probe.1.hs, &forged, "3").unwrap();
+            assert!(probe.0.read(&bad).is_err());
+            let na = hand.na;
+            let msg3 = write(&mut hand.hs, &na, "3").unwrap();
+            let open = to_b.read(&msg3).unwrap().open.unwrap();
+            assert_eq!(open.pairing_code.as_deref(), Some(b_code.as_str()));
+            if b_code != a_code {
+                return;
+            }
+            // A 1-in-a-million coincidence: try again.
+        }
+        panic!("the codes matched eight times in a row");
+    }
+
+    /// A responder for `b` past message 2 of a pairing from `m`, and m's side.
+    fn pairing_past_msg2(b: &[u8; 32], m: &[u8; 32]) -> (Handshake, HandDialer) {
+        let mut to_b = accept(b, true, false);
+        let (mut hand, msg1) = HandDialer::start(m);
+        let msg2 = to_b.read(&msg1).unwrap().reply.unwrap();
+        hand.read2(&msg2);
+        (to_b, hand)
     }
 
     #[test]

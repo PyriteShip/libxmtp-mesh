@@ -31,6 +31,8 @@ pub(crate) enum Inbound {
     /// Test only: a frame as if it had just been decrypted on this link.
     #[cfg(any(test, feature = "test-utils"))]
     Plain(Vec<u8>),
+    /// This phone's person confirmed (or rejected) the pairing code.
+    Pairing { confirm: bool },
 }
 
 /// How a session's link was opened.
@@ -140,6 +142,9 @@ impl Drop for SessionHandle {
 pub(crate) enum State {
     /// The Noise handshake is running (§B14.3).
     Handshake,
+    /// An open pairing link: the people compare the code. Only
+    /// confirmations cross until both confirmed (§B14.4).
+    AwaitConfirm,
     AwaitHello,
     AwaitAuth,
     Authenticated,
@@ -243,6 +248,20 @@ pub(crate) struct Session {
     /// Another contact link to the same phone was kept (§B14.3): this one
     /// is closing and ignores whatever still arrives.
     superseded: bool,
+    /// A pairing handshake ran (we dialed one, or answered message 1 of
+    /// one): unless it ends with the peer's card stored, it counts toward
+    /// leaving pairing mode (§B14.4).
+    pairing_attempt: bool,
+    /// Our person confirmed the pairing code.
+    pair_confirmed: bool,
+    /// We told the peer so.
+    pair_confirm_sent: bool,
+    /// The peer's person confirmed it.
+    pair_peer_confirmed: bool,
+    /// The peer's card from this pairing is stored.
+    paired: bool,
+    /// An open pairing link closes then unless both people confirmed.
+    pairing_deadline: Option<Instant>,
     /// An open relay link closes when no relay frame arrived by then.
     relay_idle_at: Option<Instant>,
     /// An open relay link closes then however busy it is, so a stranger
@@ -324,6 +343,12 @@ pub(crate) fn spawn(
         card_sent: false,
         pending_card: None,
         superseded: false,
+        pairing_attempt: false,
+        pair_confirmed: false,
+        pair_confirm_sent: false,
+        pair_peer_confirmed: false,
+        paired: false,
+        pairing_deadline: None,
         relay_idle_at: None,
         relay_ends_at: None,
         signer,
@@ -376,6 +401,9 @@ impl Session {
         mut wake: oneshot::Receiver<()>,
     ) {
         self.run_loop(&mut rx, &mut events, &mut wake).await;
+        if self.pairing_attempt && !self.paired {
+            self.node.pairing_unfinished();
+        }
         self.node.session_ended(&self.peer, self.id);
     }
 
@@ -405,6 +433,7 @@ impl Session {
                     (Some(idle), Some(end)) => Some(idle.min(end)),
                     (idle, end) => idle.or(end),
                 },
+                State::AwaitConfirm => self.pairing_deadline,
                 State::Handshake | State::AwaitHello | State::AwaitAuth => self.handshake_deadline,
             };
             let retry_at = self.retry_at;
@@ -426,6 +455,8 @@ impl Session {
                             self.node.link_counters().count_relay_idle_closed();
                             tracing::info!(peer = %self.peer, "relay link idle; closing it");
                         }
+                    } else if self.state == State::AwaitConfirm {
+                        tracing::info!(peer = %self.peer, "pairing code not confirmed in time; closing the link");
                     } else if self.state == State::Authenticated {
                         tracing::warn!(peer = %self.peer, "peer did not prove inbox membership in time");
                     } else {
@@ -488,6 +519,7 @@ impl Session {
                 }
                 self.on_frame(&frame).await
             }
+            Inbound::Pairing { confirm } => self.on_pairing_decision(confirm),
         }
     }
 
@@ -534,6 +566,7 @@ impl Session {
                 };
                 let window = window_at(self.node.unix_now());
                 let (handshake, first) = Handshake::dial(&target, &keys.noise_secret, window)?;
+                self.pairing_attempt = matches!(target, DialTarget::Pairing);
                 self.handshake = Some(handshake);
                 self.link.send_raw(first);
             }
@@ -584,6 +617,14 @@ impl Session {
                 return Err(e);
             }
         };
+        if handshake.is_pairing()
+            || step
+                .open
+                .as_ref()
+                .is_some_and(|o| o.kind == LinkKind::Pairing)
+        {
+            self.pairing_attempt = true;
+        }
         if let Some(reply) = step.reply {
             self.link.send_raw(reply);
         }
@@ -607,6 +648,13 @@ impl Session {
         if open.kind == LinkKind::Contact {
             self.contact_link_opened(&open)?;
         }
+        let pairing_code = open.pairing_code.clone();
+        if open.kind == LinkKind::Pairing && pairing_code.is_none() {
+            self.node.link_counters().count_handshake_failed();
+            return Err(MeshError::LinkAuthFailed(
+                "pairing link without a code".into(),
+            ));
+        }
         let records = Arc::new(Records::new(open.transport));
         self.link.open(records.clone(), open.kind);
         self.records = Some(records);
@@ -622,7 +670,16 @@ impl Session {
                 self.relay_idle_at = Some(now + self.node.relay_idle_timeout());
                 self.relay_ends_at = Some(now + self.node.relay_link_lifetime());
             }
-            LinkKind::Contact | LinkKind::Pairing => self.state = State::AwaitHello,
+            LinkKind::Contact => self.state = State::AwaitHello,
+            LinkKind::Pairing => {
+                // Nothing identifying until both people confirmed the code
+                // (§B14.4): the app shows it and waits.
+                self.state = State::AwaitConfirm;
+                self.handshake_deadline = None;
+                self.pairing_deadline = Some(Instant::now() + self.node.pairing_timeout());
+                self.node
+                    .pairing_opened(&self.peer, self.id, pairing_code.unwrap_or_default());
+            }
         }
         if open.initiator {
             self.peer_spoke = true;
@@ -704,8 +761,10 @@ impl Session {
                 "contact card for another inbox".into(),
             ));
         }
-        if self.link_kind != Some(LinkKind::Contact) {
-            return Ok(());
+        match self.link_kind {
+            Some(LinkKind::Contact) => {}
+            Some(LinkKind::Pairing) => return self.apply_pairing_card(card),
+            _ => return Ok(()),
         }
         match self.node.store_contact_card(&card, false)? {
             ContactUpdate::Inserted => self.send_own_card(),
@@ -717,12 +776,68 @@ impl Session {
         Ok(())
     }
 
+    /// Both people confirmed the code, so the verified peer's card replaces
+    /// any card or removal stored for its inbox (§B14.4); the pairing is
+    /// done.
+    fn apply_pairing_card(&mut self, card: ContactCard) -> Result<(), MeshError> {
+        if !(self.pair_confirmed && self.pair_peer_confirmed) {
+            return Ok(()); // unreachable: nothing but confirmations before that
+        }
+        self.node.store_contact_card(&card, true)?;
+        self.paired = true;
+        self.node.pairing_completed(&self.peer, self.id);
+        tracing::info!(peer = %self.peer, "paired");
+        Ok(())
+    }
+
+    /// Our person decided on the pairing code.
+    fn on_pairing_decision(&mut self, confirm: bool) -> Result<(), MeshError> {
+        if self.link_kind != Some(LinkKind::Pairing) || self.paired {
+            return Ok(());
+        }
+        if !confirm {
+            return Err(MeshError::LinkAuthFailed("pairing rejected".into()));
+        }
+        self.pair_confirmed = true;
+        self.send_pair_confirm();
+        Ok(())
+    }
+
+    /// Tell the peer our person confirmed, once we may speak (the dialer
+    /// speaks first, §B14.3); then start the identity exchange if the
+    /// peer's person confirmed too.
+    fn send_pair_confirm(&mut self) {
+        if self.state != State::AwaitConfirm
+            || !self.pair_confirmed
+            || !self.peer_spoke
+            || self.pair_confirm_sent
+        {
+            return;
+        }
+        self.pair_confirm_sent = self.try_send(Body::PairConfirm(frames::PairConfirm {}));
+        self.begin_identity_if_confirmed();
+    }
+
+    /// Both people confirmed and the peer knows ours: Hello/Auth, identity
+    /// logs and cards follow, as on a contact link.
+    fn begin_identity_if_confirmed(&mut self) {
+        if self.state != State::AwaitConfirm || !self.pair_confirm_sent || !self.pair_peer_confirmed
+        {
+            return;
+        }
+        self.state = State::AwaitHello;
+        self.pairing_deadline = None;
+        self.handshake_deadline = Some(Instant::now() + self.node.handshake_timeout());
+        self.send_hello();
+    }
+
     /// The link is open and we may speak: say Hello, or bring the relay
     /// link up; then the test frames that waited.
     async fn link_started(&mut self) -> Result<(), MeshError> {
         match self.link_kind {
             Some(LinkKind::Relay) => self.node.relay_stranger_link_up(&self.peer, self.id),
-            Some(LinkKind::Contact | LinkKind::Pairing) => self.send_hello(),
+            Some(LinkKind::Contact) => self.send_hello(),
+            Some(LinkKind::Pairing) => self.send_pair_confirm(),
             None => {}
         }
         for frame in std::mem::take(&mut self.early_plain) {
@@ -765,6 +880,19 @@ impl Session {
                 Ok(())
             }
             (State::Handshake, _) => Ok(()),
+            (State::AwaitConfirm, Body::PairConfirm(_)) => {
+                self.pair_peer_confirmed = true;
+                self.node.pairing_peer_confirmed(&self.peer, self.id);
+                self.begin_identity_if_confirmed();
+                Ok(())
+            }
+            (State::AwaitConfirm, _) => {
+                self.node.link_counters().count_frame_rejected();
+                Err(MeshError::LinkAuthFailed(
+                    "pairing link: a frame before both people confirmed the code".into(),
+                ))
+            }
+            (_, Body::PairConfirm(_)) => Ok(()),
             (_, Body::Hello(hello)) => self.on_hello(hello),
             (_, Body::ContactCard(card)) => self.on_contact_card(card).await,
             (State::AwaitAuth, Body::Auth(auth)) => self.on_auth(auth).await,
@@ -883,7 +1011,12 @@ impl Session {
         // bound to it) and the Hello named the contact the static key
         // belongs to: our card may go (§B14.4). A peer whose static key we
         // do not know gets it once its own card made it a contact.
-        if self.link_kind == Some(LinkKind::Contact) && self.expected_inbox.is_some() {
+        let card_due = match self.link_kind {
+            Some(LinkKind::Contact) => self.expected_inbox.is_some(),
+            Some(LinkKind::Pairing) => true,
+            _ => false,
+        };
+        if card_due {
             self.send_own_card();
         }
         self.on_authenticated().await

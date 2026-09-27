@@ -61,6 +61,8 @@ pub(crate) struct NodeInner {
     pub(crate) relay_idle_timeout: Mutex<Duration>,
     /// How long a relay link may stay open at all.
     pub(crate) relay_link_lifetime: Mutex<Duration>,
+    /// How long an open pairing link waits for both people to confirm.
+    pub(crate) pairing_timeout: Mutex<Duration>,
     /// Test only: never send our identity log to peers.
     pub(crate) suppress_identity_log: AtomicBool,
     /// Test only: sessions drop live GroupSequenced pushes (simulates a lagged stream).
@@ -123,6 +125,10 @@ pub(crate) const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Longest a relay (stranger) link stays open, busy or not (§B14.3).
 pub(crate) const RELAY_LINK_LIFETIME: Duration = Duration::from_secs(600);
+
+/// How long an open pairing link waits for both people to compare and
+/// confirm the code before it closes (§B14.4).
+pub(crate) const PAIRING_TIMEOUT: Duration = Duration::from_secs(120);
 
 pub(crate) struct SyncConfig {
     pub(crate) signer: Arc<dyn HelloSigner>,
@@ -218,6 +224,7 @@ impl MeshNode {
                 handshake_timeout: Mutex::new(HANDSHAKE_TIMEOUT),
                 relay_idle_timeout: Mutex::new(RELAY_IDLE_TIMEOUT),
                 relay_link_lifetime: Mutex::new(RELAY_LINK_LIFETIME),
+                pairing_timeout: Mutex::new(PAIRING_TIMEOUT),
                 suppress_identity_log: AtomicBool::new(false),
                 suppress_group_push: AtomicBool::new(false),
                 replaced_at: Mutex::new(HashMap::new()),
@@ -549,6 +556,7 @@ impl MeshNode {
     /// was verified. Callers hold `sessions`.
     pub(crate) fn forget_peer(&self, peer: &str) {
         self.inner.link.contact_links.lock().remove(peer);
+        self.inner.link.pairings.lock().remove(peer);
         self.relay_link_down(peer);
         self.inner.authenticated.lock().remove(peer);
         if self.inner.verified.lock().remove(peer).is_some() {

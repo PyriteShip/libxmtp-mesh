@@ -93,7 +93,10 @@ pub mod sync;
 mod verifier;
 
 pub use error::MeshError;
-pub use link::{AdvertMatch, AdvertState, DialIntent, LinkKeyInfo, LinkKind, LinkRole};
+pub use link::{
+    AdvertMatch, AdvertState, DialIntent, LinkKeyInfo, LinkKind, LinkRole, MAX_UNFINISHED_PAIRINGS,
+    PendingPairing,
+};
 pub use node::{MeshNode, MeshStream, NodeEvent, Resolution, ResyncOutcome, VerifiedPeer};
 pub use relay::{ClientRelayExporter, RelayConfig, RelayExporter, RelayStats};
 pub use store::{

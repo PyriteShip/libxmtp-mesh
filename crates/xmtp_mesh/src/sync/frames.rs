@@ -120,7 +120,7 @@ pub struct Frame {
     pub hops: u32,
     #[prost(
         oneof = "frame::Body",
-        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25"
+        tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26"
     )]
     pub body: Option<frame::Body>,
 }
@@ -164,6 +164,10 @@ pub mod frame {
         /// A contact's discovery card (§B14.4). Contact and pairing links only.
         #[prost(message, tag = "25")]
         ContactCard(super::ContactCard),
+        /// This phone's person confirmed the pairing code (§B14.4). The
+        /// only frame a pairing link carries until both people confirmed.
+        #[prost(message, tag = "26")]
+        PairConfirm(super::PairConfirm),
     }
 }
 
@@ -302,6 +306,11 @@ pub struct RelayKeyAck {
     #[prost(bytes = "vec", tag = "1")]
     pub group_id: Vec<u8>,
 }
+
+/// "My person confirmed the code" on a pairing link (§B14.4). Empty: the
+/// sealed link it travels on is what it confirms.
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct PairConfirm {}
 
 /// What a phone needs to recognise and dial a contact (§B14.4): its Noise
 /// static key and its discovery key at `generation`. `Debug` omits the
@@ -636,5 +645,14 @@ mod tests {
         assert!(bytes.windows(2).any(|w| w == [0xca, 0x01]));
         assert!(MeshError::LinkAuthFailed("x".into()).is_fatal());
         assert!(!MeshError::NoAccountKey.is_fatal());
+    }
+
+    #[test]
+    fn pair_confirm_round_trips_as_tag_26() {
+        let body = frame::Body::PairConfirm(PairConfirm {});
+        let bytes = encode(body.clone());
+        assert_eq!(decode(&bytes).unwrap(), body);
+        // Frame field 26, wire type 2, empty: 0xd2 0x01 0x00.
+        assert_eq!(&bytes[2..], &[0xd2, 0x01, 0x00]);
     }
 }

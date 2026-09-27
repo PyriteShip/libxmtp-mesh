@@ -242,6 +242,9 @@ pub struct MeshStats {
     /// Relay links closed while still in use: at the lifetime cap, or when
     /// relay was switched off.
     pub relay_links_force_closed: u64,
+    /// Times the phone left pairing mode after too many unfinished pairing
+    /// handshakes (§B14.4).
+    pub pairing_attempts_exhausted: u64,
 }
 
 #[derive(Debug, Default)]
