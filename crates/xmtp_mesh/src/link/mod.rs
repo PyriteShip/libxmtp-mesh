@@ -216,26 +216,31 @@ pub(crate) fn restore_window_open(until: u64, now: u64) -> bool {
 }
 
 /// A wall clock (unix seconds) that never runs backwards (§B14.7): the
-/// latest time seen, advanced by the process's monotonic clock. Setting
-/// the phone's clock back therefore neither reopens nor lengthens the
-/// restore window. Across restarts it resumes from the time persisted with
-/// the window (`restore_window_seen`).
+/// latest time seen, advanced by a clock that keeps counting while the
+/// phone sleeps (`CLOCK_BOOTTIME` on Linux and Android; the process's
+/// monotonic clock elsewhere). Setting the phone's clock back therefore
+/// neither reopens nor lengthens the restore window while the phone stays
+/// on. Across restarts it resumes from the time persisted with the window
+/// (`restore_window_seen`), so it can gain only time the phone spent
+/// powered off (or the app dead since the last persist) with its clock
+/// set back.
 #[derive(Default)]
 pub(crate) struct RestoreClock {
-    /// A wall-clock reading and when it was taken.
-    base: Mutex<Option<(u64, std::time::Instant)>>,
+    /// A wall-clock reading and the boot-clock second it was taken at.
+    base: Mutex<Option<(u64, u64)>>,
 }
 
 impl RestoreClock {
     /// The time now: the wall clock `wall`, or, if that is behind, the
-    /// latest time seen plus the monotonic time since.
+    /// latest time seen plus the boot-clock time since.
     pub(crate) fn now(&self, wall: u64) -> u64 {
+        let boot = boot_secs();
         let mut base = self.base.lock();
-        let projected = base.map(|(seen, at)| seen.saturating_add(at.elapsed().as_secs()));
+        let projected = base.map(|(seen, at)| seen.saturating_add(boot.saturating_sub(at)));
         match projected {
             Some(p) if p >= wall => p,
             _ => {
-                *base = Some((wall, std::time::Instant::now()));
+                *base = Some((wall, boot));
                 wall
             }
         }
@@ -243,12 +248,44 @@ impl RestoreClock {
 
     /// A time seen before (persisted): never run behind it.
     pub(crate) fn seen(&self, seen: u64) {
+        let boot = boot_secs();
         let mut base = self.base.lock();
-        let projected = base.map(|(s, at)| s.saturating_add(at.elapsed().as_secs()));
+        let projected = base.map(|(s, at)| s.saturating_add(boot.saturating_sub(at)));
         if projected.is_none_or(|p| p < seen) {
-            *base = Some((seen, std::time::Instant::now()));
+            *base = Some((seen, boot));
         }
     }
+}
+
+/// Seconds on a clock that never goes back and counts suspended time.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn boot_secs() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid, writable timespec; CLOCK_BOOTTIME exists on
+    // every Linux and Android kernel this runs on.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
+    if rc == 0 {
+        u64::try_from(ts.tv_sec).unwrap_or(0)
+    } else {
+        monotonic_secs()
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn boot_secs() -> u64 {
+    monotonic_secs()
+}
+
+/// The process's monotonic clock, in seconds since first use.
+fn monotonic_secs() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs()
 }
 
 /// A verified contact link, for resolving two links to one phone
@@ -335,5 +372,22 @@ impl LinkState {
 
     pub(crate) fn contacts_version(&self) -> u64 {
         self.contacts_version.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_restore_clock_never_runs_backwards() {
+        let clock = RestoreClock::default();
+        assert_eq!(clock.now(1_000), 1_000);
+        assert!(clock.now(10) >= 1_000, "a clock set back is ignored");
+        clock.seen(5_000);
+        assert!(clock.now(10) >= 5_000, "a persisted time is honoured");
+        assert_eq!(clock.now(9_000), 9_000, "a clock ahead is taken");
+        let a = boot_secs();
+        assert!(boot_secs() >= a);
     }
 }

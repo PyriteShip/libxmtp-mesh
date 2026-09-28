@@ -10231,6 +10231,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "http 1.4.0",
+ "libc",
  "libsqlite3-sys",
  "openmls",
  "openmls_rust_crypto",

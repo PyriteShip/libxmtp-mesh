@@ -48,6 +48,10 @@ xmtp_mls.workspace = true
 xmtp_proto.workspace = true
 zeroize.workspace = true
 
+# The restore window's clock counts suspended time (CLOCK_BOOTTIME, §B14.7).
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # The integration tests use the crate's test-only hooks.
 xmtp_mesh = { path = ".", features = ["test-utils"] }
