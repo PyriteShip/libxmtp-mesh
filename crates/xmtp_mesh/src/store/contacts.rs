@@ -77,6 +77,10 @@ pub enum ContactUpdate {
     Stale,
     /// The inbox is a removed contact: ignored.
     Removed,
+    /// The card's static key is on file under another inbox (a live or a
+    /// removed contact): refused, forced or not, so no card can take over
+    /// another contact's key (§B14.4).
+    StaticTaken,
 }
 
 #[derive(QueryableByName)]
@@ -202,6 +206,11 @@ impl MeshStore {
     ) -> Result<ContactUpdate, MeshError> {
         check_card(card)?;
         self.transaction(|s| {
+            if s.contact_by_static(&card.noise_static_pub)?
+                .is_some_and(|owner| owner.inbox_id != card.inbox_id)
+            {
+                return Ok(ContactUpdate::StaticTaken);
+            }
             let outcome = match s.contact(&card.inbox_id)? {
                 None => ContactUpdate::Inserted,
                 Some(_) if force => ContactUpdate::Updated,

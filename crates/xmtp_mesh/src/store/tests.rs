@@ -642,6 +642,36 @@ fn the_restore_window_persists_until_cleared() {
     assert_eq!(s.restore_window().unwrap(), None);
 }
 
+/// A static key names one contact: a card claiming a key on file under
+/// another inbox, live or removed, is refused, even forced.
+#[test]
+fn a_card_claiming_another_contacts_static_is_refused() {
+    let mut s = MeshStore::open_in_memory().unwrap();
+    s.upsert_contact(&card("c", 1, 0), 10, false).unwrap();
+    for force in [false, true] {
+        assert_eq!(
+            s.upsert_contact(&card("p", 1, 0), 11, force).unwrap(),
+            ContactUpdate::StaticTaken
+        );
+    }
+    assert!(s.contact("p").unwrap().is_none());
+    assert!(s.remove_contact("c", 12).unwrap());
+    assert_eq!(
+        s.upsert_contact(&card("p", 1, 0), 13, true).unwrap(),
+        ContactUpdate::StaticTaken,
+        "a removed contact's key too"
+    );
+    assert_eq!(
+        s.contact_by_static(&[1; 32]).unwrap().unwrap().inbox_id,
+        "c"
+    );
+    // The same inbox may re-key through a pairing.
+    assert_eq!(
+        s.upsert_contact(&card("c", 2, 0), 14, true).unwrap(),
+        ContactUpdate::Updated
+    );
+}
+
 #[test]
 fn malformed_contact_cards_are_refused() {
     let mut s = MeshStore::open_in_memory().unwrap();

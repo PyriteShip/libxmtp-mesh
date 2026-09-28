@@ -878,9 +878,19 @@ impl Session {
             ContactUpdate::Stale => {
                 tracing::debug!(peer = %self.peer, "an older contact card; kept ours");
             }
+            ContactUpdate::StaticTaken => return self.refuse_taken_static(),
             ContactUpdate::Updated | ContactUpdate::Unchanged | ContactUpdate::Removed => {}
         }
         Ok(())
+    }
+
+    /// The peer's card claims a static key on file under another contact
+    /// (§B14.4): the link closes, counted, and nothing is stored.
+    fn refuse_taken_static(&self) -> Result<(), MeshError> {
+        self.node.link_counters().count_frame_rejected();
+        Err(MeshError::LinkAuthFailed(
+            "contact card claims another contact's static key".into(),
+        ))
     }
 
     /// Both people confirmed the code, so the verified peer's card replaces
@@ -895,7 +905,9 @@ impl Session {
             // ignored.
             return Ok(());
         }
-        self.node.store_contact_card(&card, true)?;
+        if self.node.store_contact_card(&card, true)? == ContactUpdate::StaticTaken {
+            return self.refuse_taken_static();
+        }
         self.paired = true;
         self.node.pairing_completed(&self.peer, self.id);
         tracing::info!(peer = %self.peer, "paired");

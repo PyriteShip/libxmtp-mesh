@@ -11,4 +11,6 @@ CREATE TABLE contacts (
     removed_ns BIGINT,
     auto_added_ns BIGINT
 );
-CREATE INDEX contacts_static ON contacts (noise_static_pub);
+-- A static key names one contact: a card claiming another contact's key
+-- (live or removed) is refused (§B14.4).
+CREATE UNIQUE INDEX contacts_static ON contacts (noise_static_pub);

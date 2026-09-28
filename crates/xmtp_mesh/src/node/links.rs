@@ -651,12 +651,30 @@ impl MeshNode {
     /// This phone's own card, or `None` before `set_account_key`.
     pub(crate) fn own_contact_card(&self) -> Option<ContactCard> {
         let keys = self.mesh_keys()?;
+        #[cfg(any(test, feature = "test-utils"))]
+        let noise_static_pub = self
+            .inner
+            .link
+            .card_static_for_test
+            .lock()
+            .unwrap_or(keys.noise_public)
+            .to_vec();
+        #[cfg(not(any(test, feature = "test-utils")))]
+        let noise_static_pub = keys.noise_public.to_vec();
         Some(ContactCard {
             inbox_id: keys.inbox_id.clone(),
-            noise_static_pub: keys.noise_public.to_vec(),
+            noise_static_pub,
             discovery_key: keys.discovery_key.to_vec(),
             generation: keys.generation,
         })
+    }
+
+    /// Put `key` in this phone's own card instead of its static key: a
+    /// lying pairing partner.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn set_card_static_for_test(&self, key: Option<[u8; 32]>) {
+        *self.inner.link.card_static_for_test.lock() = key;
     }
 
     #[cfg(any(test, feature = "test-utils"))]

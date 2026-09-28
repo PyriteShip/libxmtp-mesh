@@ -1655,6 +1655,55 @@ async fn pairing_re_adds_a_removed_contact_who_may_then_dial_in() {
     assert_eq!(a.node.mesh_stats().links_contact, 1);
 }
 
+/// A confirmed pairing partner `p` whose card claims contact `c`'s static
+/// key is refused (a static names one contact, §B14.4): `a` stores
+/// nothing for `p`, closes the pairing, and still reaches `c` over IK.
+/// The same holds when `c` is a removed contact.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pairing_card_claiming_another_contacts_static_is_refused() {
+    for removed in [false, true] {
+        let hub = LoopbackHub::new();
+        let a = peer(&hub, "a").await;
+        let c = peer(&hub, "c").await;
+        let p = peer(&hub, "p").await;
+        hub.make_contacts("a", "c");
+        if removed {
+            assert!(a.node.remove_contact(&inbox(&c)).unwrap());
+        }
+        let c_static: [u8; 32] = c
+            .node
+            .own_contact_card_for_test()
+            .unwrap()
+            .noise_static_pub
+            .try_into()
+            .unwrap();
+        p.node.set_card_static_for_test(Some(c_static));
+        let rejected = a.node.mesh_stats().link_frame_rejected;
+        open_pairing(&hub, &p, &a).await;
+        p.node.confirm_pairing("a").unwrap();
+        a.node.confirm_pairing("p").unwrap();
+        eventually("a refuses p's card and closes", || async {
+            !hub.is_linked("p", "a")
+        })
+        .await;
+        assert!(a.node.contact(&inbox(&p)).unwrap().is_none());
+        assert_eq!(a.node.mesh_stats().link_frame_rejected, rejected + 1);
+        let owner = a.node.contact(&inbox(&c)).unwrap().unwrap();
+        assert_eq!(owner.noise_static_pub, c_static);
+        assert_eq!(owner.removed, removed);
+        if !removed {
+            hub.link_as(
+                "c",
+                "a",
+                DialIntent::Contact {
+                    inbox_id: inbox(&a),
+                },
+            );
+            verified_pair(&a, &c).await;
+        }
+    }
+}
+
 /// An online guesser gets few tries: after the cap of unfinished pairing
 /// handshakes the phone leaves pairing mode (counted) and refuses the next.
 #[tokio::test(flavor = "multi_thread")]

@@ -323,6 +323,9 @@ pub(crate) struct LinkState {
     pub(crate) pairings: Mutex<HashMap<PeerId, PairingEntry>>,
     /// Unfinished pairings since pairing mode was last turned on.
     pub(crate) pairing_failures: AtomicU32,
+    /// Test only: the static key this phone's own card claims.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) card_static_for_test: Mutex<Option<[u8; 32]>>,
 }
 
 impl LinkState {
