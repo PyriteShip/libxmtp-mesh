@@ -825,6 +825,11 @@ The radio reports how each link opened (`on_peer_connected(peer, role)`):
     the link, and so the card). Either way it must name the peer's
     verified inbox, never this phone's own inbox or static key, and is
     applied only after verification.
+  - A static key names one contact. A card, forced or not, on any link,
+    whose static key is on file under another inbox (a live or a removed
+    contact) is refused and closes the link, counted; the store's index on
+    static keys is unique. So a pairing partner cannot take over another
+    contact's key, which would send that contact's dials to it.
   - Storing: a new inbox is added; a newer generation with the same static
     key replaces the stored card. An older generation, a different static
     key for a known inbox, or a removed contact's card is ignored; only a
@@ -903,11 +908,17 @@ never cross the FFI.
   recovery phrase. For 72 hours, or until `end_restore_window`, an IK
   dialer whose static key is unknown, and not a removed contact's, gets a
   contact link; once its Auth and identity log prove its inbox, its card
-  is stored and it is a contact again. The window is persisted with the
-  latest time the phone has seen and is judged by a clock that never runs
-  backwards, so it survives restarts and setting the clock back neither
-  lengthens nor reopens it. A phone that never opened one accepts live
-  contacts only. The cost: while it is open, anyone who holds the phone's
+  is stored and it is a contact again. Calling `begin_restore_window`
+  while a window is open changes nothing: it never extends one. The window
+  is persisted with the latest time the phone has seen (saved when it
+  opens and at each `advert_state`) and is judged by a clock that never
+  runs backwards: that time, advanced by a clock that keeps counting
+  while the phone sleeps (`CLOCK_BOOTTIME`). While the phone stays on,
+  setting its clock back neither lengthens nor reopens the window. Across
+  a restart it resumes from the saved time, so it can gain only the time
+  the phone spent powered off (or the app dead since the last save) with
+  its clock set back. A phone that never opened one accepts live contacts
+  only. The cost: while it is open, anyone who holds the phone's
   static key (an ex-contact whose removal the restore forgot) can dial it
   and learn it is this phone.
 - **Contacts a restore window added** are flagged `auto_added` (and
@@ -924,8 +935,14 @@ never cross the FFI.
   the generation-0 token again, which every contact cut off by a remove
   and reset before the loss can still recognise. Later resets mix in new
   randomness (§B14.1), so they never repeat a key an ex-contact held.
-  Contacts that held a later generation no longer recognise the restored
-  phone and must dial it during the window, or re-pair in person.
+  Contacts that held a later generation cannot recognise the restored
+  phone, and it cannot recognise them: neither side dials, so they re-pair
+  in person.
+- **A store at a generation after 0 without its reset salt** (reset by an
+  older build) cannot derive its discovery key: `set_account_key` refuses
+  with an error saying to call `reset_discovery_key` (which draws a salt)
+  and then `set_account_key` again; contacts get the new card on their
+  next contact link, or re-pair in person.
 - **Two live installations of one inbox** (§C4, D7's fork case) derive the
   same keys and tokens. They classify each other's adverts as their own
   and never link directly, and a contact cannot tell which one it dials.

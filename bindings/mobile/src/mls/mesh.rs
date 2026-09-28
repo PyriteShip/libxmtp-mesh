@@ -871,8 +871,8 @@ impl FfiMeshNode {
     /// restored this account from its recovery phrase, before `start_sync`.
     /// For 72 hours, or until `end_restore_window`, contacts this phone no
     /// longer knows can dial it and are added back (flagged `auto_added`).
-    /// It survives restarts and a clock set back. Returns its end (unix
-    /// seconds).
+    /// It survives restarts and a clock set back; calling it again while
+    /// one is open changes nothing. Returns its end (unix seconds).
     pub fn begin_restore_window(&self) -> Result<u64, FfiError> {
         self.node.begin_restore_window().map_err(mesh_error)
     }
