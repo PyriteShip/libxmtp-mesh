@@ -1211,6 +1211,13 @@ async fn pairing_shows_one_code_and_sends_nothing_identifying_until_both_confirm
     })
     .await;
     assert_eq!(a.node.mesh_stats().links_pairing, 1);
+    // The pairing ran on throwaway keys; each phone stored the other's
+    // real static, from its card, and the next link is a contact link.
+    for (p, q) in [(&a, &b), (&b, &a)] {
+        let real = q.node.own_contact_card_for_test().unwrap().noise_static_pub;
+        let stored = p.node.contact(&inbox(q)).unwrap().unwrap().noise_static_pub;
+        assert_eq!(stored.as_slice(), real.as_slice());
+    }
     hub.unlink("a", "b");
     for p in [&a, &b] {
         p.node.set_pairing_mode(false);

@@ -225,7 +225,7 @@ pub(crate) struct Session {
     /// What the handshake opened; `None` while handshaking and on a test
     /// cleartext link.
     pub(crate) link_kind: Option<LinkKind>,
-    /// The peer's Noise static key (IK, XX). On an accepting side, not
+    /// The peer's Noise static key on a contact link (IK). On an accepting side, not
     /// key-confirmed until `peer_spoke`.
     pub(crate) remote_static: Option<[u8; 32]>,
     /// The Noise handshake hash (zeros on a test cleartext link).
@@ -690,7 +690,12 @@ impl Session {
         self.records = Some(records);
         self.link_kind = Some(open.kind);
         self.binding = open.handshake_hash;
-        self.remote_static = open.remote_static;
+        // A pairing link's static is a throwaway (§B14.4): the contact's
+        // real one arrives in its card.
+        self.remote_static = match open.kind {
+            LinkKind::Contact => open.remote_static,
+            LinkKind::Relay | LinkKind::Pairing => None,
+        };
         self.node.link_counters().count_link(open.kind);
         match open.kind {
             LinkKind::Relay => {
@@ -761,17 +766,31 @@ impl Session {
         }
     }
 
-    /// A card must name this link's static key; it is applied once the
-    /// peer is verified (§B14.4).
+    /// On a contact link a card must name the link's static key. On a
+    /// pairing link, which ran on throwaway keys, the card is where the
+    /// contact's real static comes from: the code both people confirmed
+    /// authenticates the link, and so the card (§B14.4). Either way it is
+    /// applied once the peer is verified, for the inbox it proved.
     async fn on_contact_card(&mut self, card: ContactCard) -> Result<(), MeshError> {
-        let Some(remote) = self.remote_static else {
-            return Ok(()); // a test cleartext link has no static key
-        };
-        if card.noise_static_pub.as_slice() != remote.as_slice() {
-            self.node.link_counters().count_frame_rejected();
-            return Err(MeshError::LinkAuthFailed(
-                "contact card for another static key".into(),
-            ));
+        match self.link_kind {
+            Some(LinkKind::Contact) => {
+                let Some(remote) = self.remote_static else {
+                    self.node.link_counters().count_frame_rejected();
+                    return Err(MeshError::LinkAuthFailed(
+                        "contact link without a static key".into(),
+                    ));
+                };
+                if card.noise_static_pub.as_slice() != remote.as_slice() {
+                    self.node.link_counters().count_frame_rejected();
+                    return Err(MeshError::LinkAuthFailed(
+                        "contact card for another static key".into(),
+                    ));
+                }
+            }
+            Some(LinkKind::Pairing) => {}
+            // A test cleartext link has no keys; a relay link never
+            // carries a card (refused before this).
+            Some(LinkKind::Relay) | None => return Ok(()),
         }
         if !self.verified {
             self.pending_card = Some(card);

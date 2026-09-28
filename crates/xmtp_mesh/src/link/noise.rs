@@ -13,8 +13,12 @@
 //!   Any other message 1 of kind 0 is answered exactly like a stranger's,
 //!   by NN on a fresh state.
 //! - NN message 1: 95 random bytes, in the clear. NN message 2: empty.
-//! - XX (commit-then-reveal): message 1 carries, in the clear,
-//!   `SHA-256("xmtp-mesh-pair-commit-v1" ‖ Na)` and 63 random bytes;
+//! - XX (commit-then-reveal) runs on a throwaway static made for that one
+//!   pairing, on both sides: until the people compared codes, the other
+//!   end is unauthenticated, and XX shows each static to it. The real
+//!   static goes inside the ContactCard once both confirmed. Message 1
+//!   carries, in the clear, `SHA-256("xmtp-mesh-pair-commit-v1" ‖ Na)`
+//!   and 63 random bytes;
 //!   message 2 a random 32-byte `Nb`; message 3 `Na`, which the responder
 //!   checks against the commitment. The code both people compare is
 //!   [`short_code`] of the handshake hash after message 2 (`h2`), `Na` and
@@ -65,7 +69,9 @@ pub(crate) enum DialTarget {
 pub(crate) struct LinkOpen {
     pub(crate) kind: LinkKind,
     pub(crate) transport: TransportState,
-    /// The peer's static key (IK, XX); `None` on a relay link.
+    /// The peer's static key: its real one on a contact link (IK), the
+    /// throwaway key of this one pairing on a pairing link (XX), `None` on
+    /// a relay link.
     ///
     /// On the responder side of a contact link this is not key-confirmed
     /// until the first inbound record authenticates: IK message 1 alone
@@ -369,8 +375,13 @@ impl Handshake {
                 let na = Zeroizing::new(random::<NONCE_LEN>());
                 let mut payload = pair_commitment(&na).to_vec();
                 payload.extend_from_slice(&random::<XX_PAD>());
+                // A throwaway static for this one pairing (§B14.4): XX
+                // shows it to whoever answers, before anyone compared
+                // codes. The real static travels in the ContactCard, once
+                // both people confirmed.
+                let throwaway = Zeroizing::new(random::<32>());
                 (
-                    build(XX, Some(local_secret), None, true)?,
+                    build(XX, Some(&throwaway), None, true)?,
                     LinkKind::Pairing,
                     KIND_PAIRING,
                     payload,
@@ -484,7 +495,10 @@ impl Handshake {
                         if !pairing_mode {
                             return Err(refuse("pairing link while not in pairing mode"));
                         }
-                        let mut hs = build(XX, Some(&local_secret), None, false)?;
+                        // A throwaway static for this one pairing, never
+                        // our real one (see `dial`).
+                        let throwaway = Zeroizing::new(random::<32>());
+                        let mut hs = build(XX, Some(&throwaway), None, false)?;
                         let payload =
                             read_exact(&mut hs, &message[1..], EPHEMERAL_PAYLOAD, "XX message 1")?;
                         let commitment: [u8; 32] =
@@ -857,10 +871,8 @@ mod tests {
             (dialer.kind, responder.kind),
             (LinkKind::Pairing, LinkKind::Pairing)
         );
-        assert_eq!(
-            (dialer.remote_static, responder.remote_static),
-            (Some(b_pub), Some(a_pub))
-        );
+        assert!(dialer.remote_static.is_some_and(|k| k != b_pub));
+        assert!(responder.remote_static.is_some_and(|k| k != a_pub));
         assert!(dialer.pairing_code.is_some());
         assert_eq!(dialer.pairing_code, responder.pairing_code);
         let (a_side, m_left) =
@@ -870,6 +882,48 @@ mod tests {
         assert_eq!(a_side.pairing_code, m_left.pairing_code);
         assert_eq!(m_right.pairing_code, b_side.pairing_code);
         assert_ne!(a_side.pairing_code, b_side.pairing_code);
+    }
+
+    /// Pairing runs on throwaway statics (§B14.4): a device that starts a
+    /// pairing and aborts after message 2, twice, sees two unrelated keys,
+    /// neither of them the phone's real static; dialing IK at one gets the
+    /// stranger answer.
+    #[test]
+    fn an_aborted_pairing_reveals_no_stable_static() {
+        let (a, a_pub) = keypair(1);
+        let (b, b_pub) = keypair(2);
+        let (m, _) = keypair(3);
+        let mut seen_of_b = Vec::new();
+        for _ in 0..2 {
+            let mut responder = accept(&b, true, true);
+            let (mut hand, msg1) = HandDialer::start(&m);
+            let msg2 = responder.read(&msg1).unwrap().reply.unwrap();
+            hand.read2(&msg2);
+            let key: [u8; 32] = hand.hs.get_remote_static().unwrap().try_into().unwrap();
+            seen_of_b.push(key);
+            // m aborts here: no message 3.
+        }
+        assert_ne!(seen_of_b[0], seen_of_b[1], "a new key per pairing");
+        assert!(seen_of_b.iter().all(|k| *k != b_pub));
+        // The dialer's side is throwaway too: what b sees of a.
+        let mut seen_of_a = Vec::new();
+        for _ in 0..2 {
+            let (_, responder) =
+                run(dial(&DialTarget::Pairing, &a), accept(&b, true, false)).unwrap();
+            seen_of_a.push(responder.remote_static.unwrap());
+        }
+        assert_ne!(seen_of_a[0], seen_of_a[1]);
+        assert!(seen_of_a.iter().all(|k| *k != a_pub));
+        // A harvested key is not b's: an IK dial at it is read as a
+        // stranger's, even by a node that would allow the dialer.
+        let (_, msg1) = dial(
+            &DialTarget::Contact {
+                remote_static: seen_of_b[0],
+            },
+            &m,
+        );
+        let open = accept(&b, false, true).read(&msg1).unwrap().open.unwrap();
+        assert_eq!((open.kind, open.remote_static), (LinkKind::Relay, None));
     }
 
     /// A middle phone plays the dialer by hand (§B14.4 commit-then-reveal).
