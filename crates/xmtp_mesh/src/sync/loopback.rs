@@ -58,6 +58,11 @@ struct HubInner {
     nodes: HashMap<PeerId, MeshNode>,
     /// Live links, keyed by unordered pair, with the generation of this link-up.
     links: HashMap<(PeerId, PeerId), u64>,
+    /// Pairs whose link is down but whose nodes have not both heard
+    /// `on_peer_lost` yet: `is_linked` still says yes, so a test that waits
+    /// for the link to close and then relinks never has its new sessions
+    /// removed by the old link's late `on_peer_lost`.
+    closing: HashMap<(PeerId, PeerId), usize>,
     next_generation: u64,
     sim: Option<Sim>,
     /// Pairs that never exchange contact cards (strangers, §B14.3).
@@ -269,14 +274,18 @@ impl LoopbackHub {
             if !inner.link_down(a, b) {
                 return;
             }
+            inner.begin_closing(a, b);
             (inner.nodes.get(a).cloned(), inner.nodes.get(b).cloned())
         };
         notify_lost(nodes, a, b);
+        self.inner.lock().end_closing(a, b);
     }
 
     /// Whether `a` and `b` are currently linked (a disconnect unlinks them).
     pub fn is_linked(&self, a: &str, b: &str) -> bool {
-        self.inner.lock().links.contains_key(&key(a, b))
+        let inner = self.inner.lock();
+        let pair = key(a, b);
+        inner.links.contains_key(&pair) || inner.closing.contains_key(&pair)
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -423,6 +432,7 @@ impl LoopbackHub {
                 return;
             }
             inner.link_down(from, to);
+            inner.begin_closing(from, to);
             let sim = inner.sim.as_mut().expect("only simulated links drop");
             let token = sim.next_relink;
             sim.next_relink += 1;
@@ -435,6 +445,7 @@ impl LoopbackHub {
         };
         tracing::debug!(from, to, "loopback: simulated link drop");
         notify_lost(nodes, from, to);
+        self.inner.lock().end_closing(from, to);
 
         let hub = self.clone();
         let (from, to) = (from.to_string(), to.to_string());
@@ -457,6 +468,20 @@ impl LoopbackHub {
 }
 
 impl HubInner {
+    fn begin_closing(&mut self, a: &str, b: &str) {
+        *self.closing.entry(key(a, b)).or_default() += 1;
+    }
+
+    fn end_closing(&mut self, a: &str, b: &str) {
+        let pair = key(a, b);
+        if let Some(n) = self.closing.get_mut(&pair) {
+            *n -= 1;
+            if *n == 0 {
+                self.closing.remove(&pair);
+            }
+        }
+    }
+
     /// Bring the pair's link up; a link that is already up keeps its generation.
     fn link_up(&mut self, a: &str, b: &str) {
         if !self.links.contains_key(&key(a, b)) {
