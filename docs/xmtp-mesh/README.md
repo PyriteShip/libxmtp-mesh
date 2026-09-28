@@ -8,11 +8,13 @@ store and syncs with nearby phones over BLE. Phones can also relay sealed
 messages for each other (multi-hop, store-carry-forward).
 
 > **Status: experimental.** Not audited. **Not a protest-safety claim**:
-> links are private (rotating advert tokens, Noise), but radio
-> fingerprinting, ex-contacts and timing remain, and relayed traffic is
-> relay-blind but not anonymous. Private discovery and Noise links (§B14)
+> links are encrypted and adverts rotate (Noise, rotating tokens, padded
+> records), but radio fingerprinting, ex-contacts, a restored phone's
+> 72-hour restore window, relay spool digests and timing remain, and
+> relayed traffic is relay-blind but not anonymous. Private discovery and Noise links (§B14)
 > are implemented in the Rust core and the FFI and tested in the simulator;
-> the Android radio does not use them yet. Multi-hop relay is verified in
+> the Android radio does not use them yet, and its Kotlin callers must be
+> updated for the new FFI before it builds against it. Multi-hop relay is verified in
 > the simulator; multi-hop on three or more real phones is not yet tested.
 > Read [DESIGN.md §R9](DESIGN.md#r9-what-this-does-not-protect),
 > [§B14.7](DESIGN.md#b147-what-this-does-not-fix) and

@@ -72,9 +72,9 @@ Goals of the base mesh:
 | D30 | Every sequenced row carries a signature by the installation that ordered it, over a record shaped like XMTP d14n's originator envelope; every node checks it before storing a row, and mesh.10 syncs only with mesh.10 (§B13) | A signature per frame (lost once rows are stored); a hash chain (broken by §C4.7 id reuse); a mixed-version transition period |
 | D31 | Strangers learn nothing linkable: a relay link is Noise NN with fresh keys, carries only relay frames, is short-lived, and gets per-link and per-window relay budgets (§B14.3, §B14.5, §R5.4) | A relay identity key (trackable); XX with the installation key (names the phone) |
 | D32 | One discovery key per phone, shared with every contact; advert token = first 8 bytes of HMAC-SHA256(discovery key, 15-minute window); advert and address rotate together; the lower token dials (§B14.2) | Per-contact keys (the advert has room for one token); a fixed short id (D22) |
-| D33 | Contact links use Noise IK, accepted only from a live contact (or by a phone with no contacts at all); pairing uses Noise XX with a commit-then-reveal 6-digit code (§B14.3, §B14.4) | Noise KK (a restored phone that lost its contacts could not answer); XX everywhere (sends statics to anyone) |
-| D34 | The Noise static key and the discovery key are derived from the account key the recovery phrase restores (§B14.1) | Random keys (a restored phone could not be recognised or dialed) |
-| D35 | Contact and relay links look alike on the air: every first message is 128 bytes, stale or replayed IK is answered like a stranger, and the responder tries IK, then NN (§B14.2, §B14.3) | Distinct first messages (a sniffer learns who are contacts) |
+| D33 | Contact links use Noise IK, accepted only from a live contact, or during a restore window from a static that is no removed contact's; pairing uses Noise XX on throwaway static keys with a commit-then-reveal 6-digit code, and the real static travels in the contact card once both people confirmed (§B14.3, §B14.4, §B14.7) | Noise KK (a restored phone that lost its contacts could not answer); XX everywhere, or pairing XX with the real static (shows the static to whoever answers); accepting any IK dialer while a phone has no contacts (a stranger holding the static becomes a contact) |
+| D34 | The Noise static key and the generation-0 discovery key are derived from the account key the recovery phrase restores; every discovery reset mixes in a random salt stored on the phone (§B14.1) | Random keys (a restored phone could not be recognised or dialed); resets derived from the generation alone (a restore brings back every key an ex-contact held) |
+| D35 | Contact and relay links look alike on the air: every first message is 128 bytes, message 2 is the same size, every record is padded to a size bucket, stale or replayed IK is answered like a stranger, and the responder tries IK, then NN (§B14.2, §B14.3) | Distinct first messages or exact record sizes (a sniffer learns who are contacts, and recognises a phone by the size of its identity log) |
 | D36 | Hard cut: mesh.11 talks only to mesh.11 (advert version 2, Noise prologue `xmtp-mesh-link-v1`, `Hello.link = 1`, Auth text v2) | A transition period |
 
 ### Private discovery (D31–D36)
@@ -297,8 +297,9 @@ directly to a "waiting for peer" state in the UI.
 ### B6.2 Pairing (in person)
 
 Pairing is an app concern; the mesh provides what it needs. Both phones
-advertise a pairing flag (§B6.3), the phones run a Noise XX link and both
-show a 6-digit code (commit-then-reveal, from its handshake); the users
+advertise a pairing flag (§B6.3), the phones run a Noise XX link on
+throwaway keys and both show a 6-digit code (commit-then-reveal, from its
+handshake); the users
 compare it and confirm, and only then do the phones exchange identity logs,
 key packages and contact cards (§B5.3, §B14.4). Creating the DM then uses
 the cached key package; its welcome and commit are sequenced at once because
@@ -647,8 +648,8 @@ name a phone (inbox id, installation key, account address), recognise it
 from one 15-minute window to the next by what it advertises or says, see
 which phones sync with which, or read or alter a link. Contacts still find
 each other, relays still work, and a phone restored from its recovery
-phrase can still reconnect to its contacts. What remains is in §B14.7 and
-§R9.
+phrase can still reconnect to its contacts (during its restore window,
+§B14.7). What remains is in §B14.7 and §R9.
 
 The Rust core and the FFI implement this section (mesh.11). The Android
 radio must advertise, rotate and dial as §B14.2 says; until it does, only
@@ -665,15 +666,20 @@ dropped:
 ```
 prk           = HKDF-SHA256-Extract(salt = "xmtp-mesh-keys-v1", ikm = account key)
 noise_static  = HKDF-Expand(prk, "noise-static" ‖ inbox_id, 32)            (X25519)
-discovery_key = HKDF-Expand(prk, "discovery" ‖ inbox_id ‖ u32_be(generation), 32)
+discovery_key = HKDF-Expand(prk, "discovery" ‖ inbox_id ‖ u32_be(0), 32)  (generation 0)
+discovery_key = HKDF-Expand(prk, "discovery" ‖ inbox_id ‖ u32_be(g) ‖ reset_salt, 32)
+                                                                          (generation g ≥ 1)
 ```
 
 `generation` starts at 0 and is stored in the node. `reset_discovery_key`
-increments it and re-derives the discovery key; the static key never
-changes. A phone restored from its recovery phrase derives the same static
-key and the generation-0 discovery key. The installation's ed25519 key and
-its signatures are unchanged; they prove the installation inside the link
-(§B14.4).
+increments it, draws a fresh random 32-byte `reset_salt`, stores both, and
+re-derives the discovery key; the static key never changes. Because of the
+salt, no reset ever repeats a key: not after a restore, and not on another
+phone of the account. A phone restored from its recovery phrase derives the
+same static key and the generation-0 discovery key; the salts of its
+earlier resets are gone with the old phone (§B14.7). The installation's
+ed25519 key and its signatures are unchanged; they prove the installation
+inside the link (§B14.4).
 
 ### B14.2 Adverts, tokens and dialing (D32, D35)
 
@@ -706,9 +712,10 @@ its signatures are unchanged; they prove the installation inside the link
 **Which dialers get a contact link.** A responder accepts an IK message 1
 (§B14.3) only if all of these hold:
 
-1. The dialer's static key belongs to a live (not removed) contact, or the
-   phone has no contact rows at all, live or removed (a phone just
-   restored from its recovery phrase).
+1. The dialer's static key belongs to a live (not removed) contact, or a
+   restore window is open (§B14.7) and the key is no removed contact's. A
+   phone that never opened a restore window accepts live contacts only,
+   however few contacts it has.
 2. Its encrypted payload is dated (`u64_be(window)`) within `w-1 ..= w+1`
    of the responder's window. It also carries 16 random bytes.
 3. It was not seen before. The node keeps one replay cache of accepted IK
@@ -721,8 +728,8 @@ Anything else, including a captured message 1 replayed later or an
 ex-contact dialing with our static key, is answered exactly like a
 stranger: NN on a fresh state (or refused while relay is off). So a replay
 cannot ask "are you B?", and the responder looks the same as any other
-phone. The allowed-dialer set is an in-memory copy of the contacts, so
-every dialer is answered without database I/O.
+phone. The allowed-dialer set is an in-memory copy of the contacts and
+the restore window, so every dialer is answered without database I/O.
 
 ### B14.3 Links and handshakes (D31, D33, D35)
 
@@ -734,7 +741,7 @@ The radio reports how each link opened (`on_peer_connected(peer, role)`):
 |---|---|---|---|
 | Contact | the dialer saw a contact's token | IK | Only the responder learns the dialer's static key (encrypted to its own). |
 | Relay | the dialer saw a stranger that offers relay, and relays itself | NN | Nobody learns anything stable: fresh ephemeral keys only. |
-| Pairing | both phones in pairing mode | XX | Both statics, encrypted; the people compare a code (§B14.4). |
+| Pairing | both phones in pairing mode | XX | Only throwaway statics made for this one pairing, which the other end sees before anyone compared codes. The real statics travel in the contact cards once both people confirmed (§B14.4). |
 
 - **Message 1 is always 128 bytes:** a kind byte (0: contact or relay;
   1: pairing), then Noise message 1 padded to 127 bytes. IK message 1 is
@@ -745,26 +752,42 @@ The radio reports how each link opened (`on_peer_connected(peer, role)`):
   bytes (§B14.4). For kind 0 the responder tries IK with its static key,
   then NN. It refuses NN while its relay is off, and XX outside pairing
   mode. Every payload has an exact length; anything else fails. Message 2
-  is the same size for IK and NN.
+  is the same size for IK and NN (48 bytes).
 - **The dialer speaks first.** The responder's view of the dialer is not
   key-confirmed by IK message 1 alone (it could be a replay), so after the
   handshake the responder sends nothing, not even a Hello or a relay
   frame, until the dialer's first record authenticates.
-- **Records.** After the handshake, every frame is split into records of
-  `flag ‖ up to 65 518 frame bytes`. Each record is sealed as one Noise
-  transport message of at most 65 535 bytes and sent in order. Reassembly
-  stops at 1 MiB. Both directions rekey every 65 536 records. Records fail
-  closed: after one error, every later record on the link fails too.
+- **Records.** After the handshake, every frame is split into chunks of up
+  to 65 515 bytes. A record's plaintext is `flag ‖ u16_be(chunk length) ‖
+  chunk ‖ zeros`, padded to the smallest of 256, 1 024, 4 096, 16 384 or
+  65 518 bytes that holds it, then sealed as one Noise transport message
+  (16 bytes longer) and sent in order. So a record's size says only which
+  bucket its chunk fell in: the dialer's first record looks the same on a
+  contact link (a Hello) and a relay link (a digest), and a phone's
+  identity log or key package no longer has a size of its own. A record of
+  another size, a length past its bucket or padding that is not zeros
+  fails. Reassembly stops at 1 MiB. Both directions rekey every 65 536
+  records. Records fail closed: after one error, every later record on the
+  link fails too.
 - **Relay links** carry only `Relay`, `SpoolDigest` and `SpoolWant`. No
   `Hello`, identity log, key package, interest, welcome, relay key or
   contact card ever travels on one; any other frame, or an undecodable
   one, closes the link. A stranger must not hold one of the radio's four
-  connections: a relay link closes after 60 s without useful traffic (an
-  envelope the relay engine accepted, or a digest or want naming at least
-  one envelope), after 10 minutes however busy, and at once when this phone
-  turns relay off. After closing one (idle, at the cap, for a rejected
-  frame, or relay off), the phone refuses that radio peer as a stranger,
-  dialing or accepting, for 30 s (at most 256 peers remembered).
+  connections: a relay link closes after 60 s without a relayed envelope
+  accepted as new (digests and wants never count: anyone can make up ids
+  to name), after 10 minutes however busy, and at once when this phone
+  turns relay off. The node reports each open link's kind
+  (`link_kind(peer)`: contact, relay or pairing), so the radio can keep
+  slots for contacts, for example at most two relay links of four, and
+  close one when a contact's advert is seen with every slot taken.
+- **Back-off (best effort).** After closing a relay link (idle, at the
+  cap, for a rejected frame, or relay off), the node refuses that radio
+  `PeerId` as a stranger, dialing or accepting, for 30 s (at most 256
+  remembered). A stranger has no stable identity to key this on: a radio
+  that follows the transport contract gives every connection a fresh
+  `PeerId`, and a device can change its address, so this is not a bound.
+  The bounds are the idle timer, the lifetime cap and the per-window caps
+  (§R5.4).
 - **Failures.** A failed or timed-out (15 s) handshake, a record that fails
   authentication, a frame the link type does not allow, or a Hello, Auth or
   card that does not match the link ends it. The error is fatal
@@ -789,11 +812,17 @@ The radio reports how each link opened (`on_peer_connected(peer, role)`):
   reset or a restore reaches contacts without re-pairing:
   - A phone sends its own card once the peer's Auth verifies, if it knows
     the peer as a contact (the dialer always does; a responder does when it
-    recognised the dialer's static key).
-  - A phone that did not know the dialer (restored, no contact rows) sends
-    its card only after the dialer is verified (Auth and identity log,
-    §B5.3) and the dialer's card is stored.
-  - A received card must name the link's static key and the peer's
+    recognised the dialer's static key), unless that contact was added by
+    a restore window and the user has not confirmed it yet (§B14.7).
+  - A dialer the phone did not know (only a restore window lets one in) is
+    stored from its card after it is verified (Auth and identity log,
+    §B5.3), flagged `auto_added`, and gets no card back until the user
+    confirms it (`confirm_restored_contact`); the card then goes on the
+    open link.
+  - A received card on a contact link must name the link's static key; on
+    a pairing link, which ran on throwaway keys, the card is where the
+    contact's real static key comes from (the confirmed code authenticates
+    the link, and so the card). Either way it must name the peer's
     verified inbox, never this phone's own inbox or static key, and is
     applied only after verification.
   - Storing: a new inbox is added; a newer generation with the same static
@@ -805,9 +834,15 @@ The radio reports how each link opened (`on_peer_connected(peer, role)`):
   it, but it still recognises them, dials them and sends the new card.
 - **Removed contacts** (`remove_contact`) keep a tombstone: their tokens are
   no longer matched, and an IK dialer with their static key is answered as
-  a stranger (§B14.2). Removing a contact and then resetting the discovery
-  key cuts it off.
-- **Pairing** runs XX, in person, commit-then-reveal. The dialer picks a
+  a stranger (§B14.2), during a restore window too. Their open contact
+  links close at once (a close, not a failure). Removing a contact and then
+  resetting the discovery key cuts it off.
+- **Pairing** runs XX, in person, commit-then-reveal, on a fresh random
+  static key per pairing on both sides: until the people compared codes
+  the other end is unauthenticated, and XX shows it each static, so a
+  device that answers a pairing and aborts learns nothing it can use
+  later. The real static key travels in the contact card after both
+  confirmed. The dialer picks a
   random 32-byte `Na` and sends `SHA-256("xmtp-mesh-pair-commit-v1" ‖ Na)`
   in message 1; the responder answers with a random 32-byte `Nb` in
   message 2; the dialer reveals `Na` in message 3, and the responder checks
@@ -847,8 +882,11 @@ delivered past a limit (§R5.4).
 (links opened, by kind), `handshake_failed`, `link_frame_rejected` (a
 record, frame, Hello, Auth or card the link refused), `discovery_resets`,
 `relay_links_idle_closed`, `relay_links_force_closed` (at the lifetime cap
-or relay turned off), `relay_links_backoff_refused` and
-`pairing_attempts_exhausted`. `peers_rejected_version` also counts a
+or relay turned off), `relay_links_backoff_refused`,
+`pairing_attempts_exhausted` and `restore_contacts_added` (contacts a
+restore window added). `handshake_failed` also counts links this phone
+refused to start or open itself (for example a relay link while its relay
+is off). `peers_rejected_version` also counts a
 `Hello.link` below 1. `RelayStats` adds `dropped_full` (a stranger's
 envelope with only contacts' entries left to displace). The FFI's
 `FfiMeshStats` and `FfiRelayStats` carry them all. Contacts' discovery keys
@@ -859,28 +897,55 @@ never cross the FFI.
 - **Ex-contacts.** Anyone who was ever your contact can recognise your
   adverts until you remove them and reset the discovery key. The static
   key never changes, so a removal is what refuses their links.
-- **A restore forgets removals.** Tombstones live on the phone. A removed
-  contact that still holds your card and dials in is stored again, and
-  later resets reach it. The app should list contacts a restored phone
-  added by itself, so the user can remove them again.
-- **A restored phone re-learns contacts one way only.** It accepts any IK
-  dialer only while it has no contact rows. Once it has stored one card,
-  contacts it has not yet re-learned are answered as strangers, and it
-  cannot recognise their adverts without their cards; they re-pair in
-  person.
-- **A restore after a reset** derives generation 0, which contacts no
-  longer recognise: they re-pair in person.
+- **The restore window.** A restored phone has lost its contact list, so
+  it cannot recognise its contacts' adverts; they must dial it. The app
+  opens a restore window (`begin_restore_window`) when it restores from the
+  recovery phrase. For 72 hours, or until `end_restore_window`, an IK
+  dialer whose static key is unknown, and not a removed contact's, gets a
+  contact link; once its Auth and identity log prove its inbox, its card
+  is stored and it is a contact again. The window is persisted with the
+  latest time the phone has seen and is judged by a clock that never runs
+  backwards, so it survives restarts and setting the clock back neither
+  lengthens nor reopens it. A phone that never opened one accepts live
+  contacts only. The cost: while it is open, anyone who holds the phone's
+  static key (an ex-contact whose removal the restore forgot) can dial it
+  and learn it is this phone.
+- **Contacts a restore window added** are flagged `auto_added` (and
+  counted) and get none of this phone's cards until the user confirms each
+  one (`confirm_restored_contact`). A genuine old contact that recognised
+  the restored phone already holds its generation-0 card, so it loses
+  nothing; a stranger holding only the static key does not get the
+  discovery key. The app lists them so the user can confirm or remove
+  them.
+- **A restore forgets removals** (tombstones live on the phone). A removed
+  contact that still holds your card and dials in during the window is
+  stored again, flagged for the user.
+- **A restore brings back generation 0.** The restored phone advertises
+  the generation-0 token again, which every contact cut off by a remove
+  and reset before the loss can still recognise. Later resets mix in new
+  randomness (§B14.1), so they never repeat a key an ex-contact held.
+  Contacts that held a later generation no longer recognise the restored
+  phone and must dial it during the window, or re-pair in person.
 - **Two live installations of one inbox** (§C4, D7's fork case) derive the
   same keys and tokens. They classify each other's adverts as their own
   and never link directly, and a contact cannot tell which one it dials.
 - **Relay links show their peer** the spool digests and wants on that link
   (sealed from everyone else) and the envelopes' `ttl` and expiry. NN is
   unauthenticated, so a device in the middle of a relay link sees the same.
+  The 8-byte ids in digests stay the same for as long as the phone holds
+  those envelopes (hours), so a stranger that relay-links again in a later
+  window can recognise the phone by them. Per-link blinded ids would fix
+  this; they are a later protocol change.
+- **Strangers have no stable identity** to back off from: the back-off
+  after closing a relay link matches only a reused `PeerId` (§B14.3). The
+  idle timer, the 10-minute lifetime and the per-window caps are the
+  bounds, and the radio keeps slots for contacts using `link_kind`.
 - **Relay limits** use fixed 15-minute windows, so strangers together can
   push up to twice the window cap across a boundary (§R5.4).
 - **Radio fingerprinting, RSSI, origin location and timing** (§R9) are
-  unchanged, as are record sizes and timing, and the small timing
-  difference between trying IK and falling back to NN. The service UUID
+  unchanged, as are the number of records, their size buckets and their
+  timing, and the small timing difference between trying IK and falling
+  back to NN. The service UUID
   says "a PyriteChat phone is here"; the pairing flag and a pairing link's
   kind byte say "pairing".
 - **iOS:** a backgrounded app cannot change its adverts (§R11). Rotating
@@ -1489,7 +1554,9 @@ share:
   enters the spool counts: a duplicate, invalid or expired envelope costs the
   stranger its own link's budget, never the shared window. These are fixed
   windows, not a bucket, so strangers can push up to twice the cap across a
-  window boundary.
+  window boundary. Valid junk envelopes can use up the strangers' window
+  for the rest of it; contacts are not affected, and a recipient still gets
+  its own messages.
 - **In the spool:** strangers' entries together hold at most factor × the
   share in entries and in bytes. To make room, a stranger's envelope
   displaces only strangers' entries (soonest-drop first), never a contact's;
@@ -1638,12 +1705,16 @@ cannot read hop counts, spool digests or group ids on a link. What remains
 (details in §B14.7):
 
 1. **Ex-contacts** recognise you until you remove them and reset the
-   discovery key; a restore forgets removals (§B14.7).
+   discovery key. A restore forgets removals and brings back the
+   generation-0 key, and during its 72-hour restore window anyone holding
+   your static key can dial you (§B14.7).
 2. **What your relay links show their peer.** A relay stranger you link
-   with sees your `SpoolDigest`s and `SpoolWant`s on that link (a spool
-   fingerprint for up to 10 minutes) and the `ttl` and expiry of the
-   envelopes it receives. Relay links are unauthenticated (NN), so a device
-   in the middle of one sees the same.
+   with sees your `SpoolDigest`s and `SpoolWant`s on that link and the
+   `ttl` and expiry of the envelopes it receives. The digest ids stay the
+   same for as long as you hold those envelopes (hours), so a stranger
+   that links with you again in a later window can recognise you by them.
+   Relay links are unauthenticated (NN), so a device in the middle of one
+   sees the same.
 3. **Origin location.** The first phone to transmit a new envelope can be
    located by radio. Random delays blur this; nothing removes it.
 4. **Origin time.** `expires_at` is coarse, but still says roughly when an
@@ -1661,7 +1732,10 @@ cannot read hop counts, spool digests or group ids on a link. What remains
 8. **Answer timing.** A phone next to a recipient can see an envelope go
    in and, soon after, a fresh one come out. The random 2–10 s answer
    delay blurs this; it does not remove it.
-9. **Link sizes and timing.** Records hide content, not sizes and times.
+9. **Link sizes and timing.** Records are padded to five size buckets, so
+   their sizes no longer tell link kinds apart or name a phone by its
+   identity log; the number of records, their buckets and their timing
+   still show how much a link carries and when.
 10. **iOS.** Rotating tokens in adverts are Android-only for now (§B14.7).
 
 **Claims to avoid** in apps, store listings and docs built on this:
