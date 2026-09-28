@@ -1,6 +1,10 @@
 //! Records (§B14.3): a frame travels over an open Noise link as one or
-//! more Noise transport messages, each `flag ‖ chunk` sealed, in order.
-//! Both directions rekey every [`REKEY_EVERY`] records, in step.
+//! more Noise transport messages, sealed in order. Each record's plaintext
+//! is `flag ‖ u16_be(chunk length) ‖ chunk ‖ zeros`, padded up to one of
+//! [`RECORD_BUCKETS`], so a record's size says only which bucket its chunk
+//! fell in: not the link kind, nor the exact size of a phone's identity
+//! log or key package. Both directions rekey every [`REKEY_EVERY`]
+//! records, in step.
 use parking_lot::Mutex;
 use snow::TransportState;
 use zeroize::{Zeroize, Zeroizing};
@@ -10,8 +14,12 @@ use crate::sync::frames::MAX_FRAME_LEN;
 
 pub(crate) const MAX_NOISE_MESSAGE: usize = 65_535;
 const TAG_LEN: usize = 16;
-pub(crate) const MAX_RECORD_PLAINTEXT: usize = MAX_NOISE_MESSAGE - TAG_LEN;
-pub(crate) const MAX_RECORD_CHUNK: usize = MAX_RECORD_PLAINTEXT - 1;
+/// Padded record plaintext sizes; a sealed record is 16 bytes longer.
+pub(crate) const RECORD_BUCKETS: [usize; 5] = [256, 1024, 4096, 16_384, 65_518];
+/// `flag ‖ u16_be(chunk length)`.
+const RECORD_HEADER: usize = 3;
+pub(crate) const MAX_RECORD_PLAINTEXT: usize = RECORD_BUCKETS[RECORD_BUCKETS.len() - 1];
+pub(crate) const MAX_RECORD_CHUNK: usize = MAX_RECORD_PLAINTEXT - RECORD_HEADER;
 const LAST: u8 = 0;
 const MORE: u8 = 1;
 pub(crate) const REKEY_EVERY: u64 = 1 << 16;
@@ -20,8 +28,8 @@ pub(crate) const REKEY_EVERY: u64 = 1 << 16;
 /// sending half (`LinkTx`) and its session; each call locks briefly.
 ///
 /// Fails closed: after any error (a record that does not authenticate, a
-/// bad flag, an over-long frame, a failed seal) every later `seal` and
-/// `open` fails too, and the partial frame is dropped.
+/// bad flag, length or padding, an over-long frame, a failed seal) every
+/// later `seal` and `open` fails too, and the partial frame is dropped.
 pub(crate) struct Records {
     state: Mutex<State>,
 }
@@ -97,8 +105,8 @@ impl Drop for State {
 }
 
 impl State {
-    /// Every error ends up here (see [`Records::open`] and
-    /// [`Records::seal`]): the partial frame is wiped at once.
+    /// Every error of `open` and `seal` past their first checks ends up
+    /// here: the partial frame is wiped at once.
     fn fail(&mut self) {
         self.failed = true;
         self.partial.zeroize();
@@ -131,12 +139,13 @@ impl State {
         if self.received.is_multiple_of(self.rekey_every) {
             self.noise.rekey_incoming();
         }
-        let (flag, chunk) = plain[..n].split_first().ok_or_else(|| rejected("empty"))?;
+        let chunk = unpad(&plain[..n])?;
+        let flag = plain[0];
         if self.partial.len() + chunk.len() > MAX_FRAME_LEN {
             return Err(rejected("frame over MAX_FRAME_LEN"));
         }
         self.append(chunk);
-        match *flag {
+        match flag {
             LAST => Ok(Some(std::mem::take(&mut self.partial))),
             MORE => Ok(None),
             _ => Err(rejected("flag")),
@@ -160,9 +169,7 @@ impl State {
     }
 
     fn seal_one(&mut self, flag: u8, chunk: &[u8]) -> Result<Vec<u8>, MeshError> {
-        let mut plain = Zeroizing::new(Vec::with_capacity(chunk.len() + 1));
-        plain.push(flag);
-        plain.extend_from_slice(chunk);
+        let plain = pad(flag, chunk)?;
         let mut sealed = vec![0u8; plain.len() + TAG_LEN];
         let n = self
             .noise
@@ -175,6 +182,41 @@ impl State {
         }
         Ok(sealed)
     }
+}
+
+/// The smallest bucket that holds `len` plaintext bytes.
+fn bucket_for(len: usize) -> Option<usize> {
+    RECORD_BUCKETS.into_iter().find(|&b| b >= len)
+}
+
+/// `flag ‖ u16_be(len) ‖ chunk ‖ zeros`, as long as its bucket.
+fn pad(flag: u8, chunk: &[u8]) -> Result<Zeroizing<Vec<u8>>, MeshError> {
+    let size = bucket_for(RECORD_HEADER + chunk.len())
+        .ok_or_else(|| MeshError::LinkAuthFailed("record chunk too long".into()))?;
+    let len = u16::try_from(chunk.len())
+        .map_err(|_| MeshError::LinkAuthFailed("record chunk too long".into()))?;
+    let mut plain = Zeroizing::new(vec![0u8; size]);
+    plain[0] = flag;
+    plain[1..RECORD_HEADER].copy_from_slice(&len.to_be_bytes());
+    plain[RECORD_HEADER..RECORD_HEADER + chunk.len()].copy_from_slice(chunk);
+    Ok(plain)
+}
+
+/// The chunk of a padded plaintext: its size must be a bucket, its length
+/// must fit, and its padding must be zeros.
+fn unpad(plain: &[u8]) -> Result<&[u8], MeshError> {
+    if !RECORD_BUCKETS.contains(&plain.len()) {
+        return Err(rejected("not a record size"));
+    }
+    let len = usize::from(u16::from_be_bytes([plain[1], plain[2]]));
+    let end = RECORD_HEADER
+        .checked_add(len)
+        .filter(|&end| end <= plain.len())
+        .ok_or_else(|| rejected("chunk length"))?;
+    if plain[end..].iter().any(|&b| b != 0) {
+        return Err(rejected("padding"));
+    }
+    Ok(&plain[RECORD_HEADER..end])
 }
 
 #[cfg(test)]
@@ -192,8 +234,77 @@ mod tests {
         let (a, b) = pair();
         let records = a.seal(b"hello").unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].len(), 5 + 1 + 16);
+        assert_eq!(records[0].len(), 256 + 16);
         assert_eq!(b.open(&records[0]).unwrap(), Some(b"hello".to_vec()));
+    }
+
+    /// Every record is padded to a bucket: a 19-byte empty digest and a
+    /// 140-byte Hello seal to the same size; frames round-trip unchanged
+    /// at every bucket edge.
+    #[test]
+    fn records_are_padded_to_size_buckets() {
+        let (a, b) = pair();
+        let sealed_len = |len: usize| {
+            let frame: Vec<u8> = (0..len).map(|i| (i % 251) as u8 + 1).collect();
+            let records = a.seal(&frame).unwrap();
+            let lens: Vec<usize> = records.iter().map(Vec::len).collect();
+            let mut out = Vec::new();
+            for r in &records {
+                if let Some(f) = b.open(r).unwrap() {
+                    out = f;
+                }
+            }
+            assert_eq!(out, frame, "round trip at {len}");
+            lens
+        };
+        assert_eq!(
+            sealed_len(19),
+            sealed_len(140),
+            "digest and Hello look alike"
+        );
+        assert_eq!(sealed_len(0), vec![256 + 16]);
+        for (len, bucket) in [
+            (253, 256),
+            (254, 1024),
+            (1021, 1024),
+            (1022, 4096),
+            (4093, 4096),
+            (4094, 16_384),
+            (16_381, 16_384),
+            (16_382, 65_518),
+            (MAX_RECORD_CHUNK, 65_518),
+        ] {
+            assert_eq!(sealed_len(len), vec![bucket + 16], "a {len}-byte frame");
+        }
+        assert_eq!(
+            sealed_len(MAX_RECORD_CHUNK + 1),
+            vec![65_518 + 16, 256 + 16],
+            "a frame over one record"
+        );
+    }
+
+    /// A record whose plaintext is no bucket size, whose length runs past
+    /// it, or whose padding is not zeros fails the link.
+    #[test]
+    fn a_record_with_a_bad_size_length_or_padding_fails() {
+        let mut bad_len = vec![0u8; 256];
+        bad_len[1..3].copy_from_slice(&254u16.to_be_bytes());
+        let mut bad_pad = vec![0u8; 256];
+        bad_pad[1..3].copy_from_slice(&5u16.to_be_bytes());
+        bad_pad[200] = 1;
+        for plain in [vec![0u8; 255], vec![0u8; 257], bad_len, bad_pad] {
+            let (mut raw, b) = {
+                let (a, b) = test_pair();
+                (a, Records::new(b))
+            };
+            let mut sealed = vec![0u8; plain.len() + TAG_LEN];
+            let n = raw.write_message(&plain, &mut sealed).unwrap();
+            assert!(
+                matches!(b.open(&sealed[..n]), Err(MeshError::LinkAuthFailed(_))),
+                "plaintext of {} bytes",
+                plain.len()
+            );
+        }
     }
 
     /// A 1 MiB frame.
@@ -242,8 +353,7 @@ mod tests {
         };
         let mut failure = None;
         for i in 0..=MAX_FRAME_LEN / MAX_RECORD_CHUNK + 1 {
-            let mut plain = vec![MORE];
-            plain.extend(std::iter::repeat_n(0u8, MAX_RECORD_CHUNK));
+            let plain = pad(MORE, &[0u8; MAX_RECORD_CHUNK]).unwrap();
             let mut sealed = vec![0u8; plain.len() + TAG_LEN];
             let n = raw.write_message(&plain, &mut sealed).unwrap();
             if let Err(e) = b.open(&sealed[..n]) {

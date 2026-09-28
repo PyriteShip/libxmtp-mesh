@@ -164,6 +164,71 @@ async fn contacts_link_over_ik_and_nothing_on_the_air_names_them() {
     }
 }
 
+/// Padded records (§B14.3): after the two handshake messages, every
+/// message on the air is a record of a bucket size. The dialer's first
+/// record looks the same on a contact link (a Hello) and on a relay link
+/// (a digest), and two phones' identity logs land in the same bucket.
+#[tokio::test(flavor = "multi_thread")]
+async fn records_are_padded_so_link_kinds_and_identity_logs_look_alike() {
+    const RECORDS: [usize; 5] = [272, 1040, 4112, 16_400, 65_534];
+    let hub = LoopbackHub::new();
+    hub.record_wire_for_test();
+    let (a, rec_a) = recorded_peer(&hub, "a").await;
+    let (b, rec_b) = recorded_peer(&hub, "b").await;
+    hub.link("a", "b");
+    verified_pair(&a, &b).await;
+    let (c, _) = relay_peer(&hub, "c").await;
+    let (d, _) = relay_peer(&hub, "d").await;
+    hub.set_strangers("c", "d");
+    hub.link("c", "d");
+    eventually("a relay link", || async {
+        c.node.mesh_stats().links_relay == 1 && d.node.mesh_stats().links_relay == 1
+    })
+    .await;
+    let wire = hub.wire_for_test();
+    let on = |from: &str, to: &str| -> Vec<usize> {
+        wire.iter()
+            .filter(|(f, t, _)| f == from && t == to)
+            .map(|(_, _, m)| m.len())
+            .collect()
+    };
+    let mut first_records = Vec::new();
+    for (x, y) in [("a", "b"), ("c", "d")] {
+        for (from, to) in [(x, y), (y, x)] {
+            let sizes = on(from, to);
+            assert!(!sizes.is_empty(), "{from} -> {to} said nothing");
+            assert!(
+                sizes[0] == 128 || sizes[0] == 48,
+                "a handshake message first"
+            );
+            assert!(
+                sizes[1..].iter().all(|n| RECORDS.contains(n)),
+                "{from} -> {to}: {sizes:?}"
+            );
+            if sizes[0] == 128 {
+                first_records.push(sizes[1]);
+            }
+        }
+    }
+    assert_eq!(first_records.len(), 2);
+    assert_eq!(
+        first_records[0], first_records[1],
+        "contact and relay links start alike"
+    );
+    let log_record = |rec: &common::Recording, to: &str| -> usize {
+        let log = rec
+            .raw_to(to)
+            .into_iter()
+            .find(|f| matches!(frames::decode(f), Ok(Body::IdentityLog(_))))
+            .expect("an identity log");
+        RECORDS
+            .into_iter()
+            .find(|&r| r >= log.len() + 3 + 16)
+            .unwrap()
+    };
+    assert_eq!(log_record(&rec_a, "b"), log_record(&rec_b, "a"));
+}
+
 /// §B14.3 relay link (NN): relay frames flow between strangers; a
 /// Hello, Interest or KeyPackage on the link closes it.
 #[tokio::test(flavor = "multi_thread")]
@@ -325,7 +390,7 @@ async fn tampered_or_reordered_records_close_the_link() {
 }
 
 /// §B14.3 records, end to end: a frame near the limit crosses as
-/// full 65 535-byte records and the link stays in step.
+/// full records of the largest bucket and the link stays in step.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_frame_near_the_limit_crosses_as_records() {
     let hub = LoopbackHub::new();
@@ -344,13 +409,15 @@ async fn a_frame_near_the_limit_crosses_as_records() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(hub.is_linked("a", "b"));
     assert_eq!(b.node.mesh_stats().link_frame_rejected, 0);
-    // 65 535 = a full record; 65 518 frame bytes fit in one.
+    // 65 534 = a record of the largest bucket, which holds 65 515 frame
+    // bytes. The last chunk is over 16 KiB, so it pads to that bucket too.
+    assert!(frame_len % 65_515 > 16_384);
     let full = hub
         .wire_for_test()
         .iter()
-        .filter(|(f, t, m)| f == "a" && t == "b" && m.len() == 65_535)
+        .filter(|(f, t, m)| f == "a" && t == "b" && m.len() == 65_534)
         .count();
-    assert_eq!(full, frame_len / 65_518);
+    assert_eq!(full, frame_len.div_ceil(65_515));
 }
 
 /// Review focus: message 1 lost on the air (the link was replaced while
