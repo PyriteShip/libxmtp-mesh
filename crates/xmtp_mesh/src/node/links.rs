@@ -10,11 +10,11 @@ use crate::link::keys::{AccountPrk, MeshKeys};
 use crate::link::noise::{ReplayCache, ResponderContext};
 use crate::link::{
     AdvertMatch, AdvertState, AllowedDialers, ContactLinkEntry, ContactLinkOutcome, FLAG_PAIRING,
-    FLAG_RELAY, LinkCounters, LinkKeyInfo, Token, WINDOW_SECS, advert_token, parse_service_data,
-    service_data, window_at,
+    FLAG_RELAY, LinkCounters, LinkKeyInfo, RESTORE_WINDOW_SECS, Token, WINDOW_SECS, advert_token,
+    parse_service_data, restore_window_open, service_data, window_at,
 };
 use crate::link::{MAX_UNFINISHED_PAIRINGS, PairingEntry, PendingPairing};
-use crate::store::{Contact, ContactUpdate};
+use crate::store::{Contact, ContactUpdate, RestoreWindow};
 use crate::sync::MeshTransport;
 use crate::sync::frames::ContactCard;
 use crate::sync::frames::frame::Body;
@@ -145,6 +145,9 @@ impl MeshNode {
     /// What the radio advertises and matches during the window of `now`.
     pub fn advert_state(&self, now: u64) -> Result<AdvertState, MeshError> {
         let keys = self.mesh_keys().ok_or(MeshError::NoAccountKey)?;
+        if let Err(e) = self.note_restore_clock(&mut self.inner.store.lock()) {
+            tracing::warn!(error = %e, "could not persist the restore window clock");
+        }
         let window = window_at(now);
         let own_token = keys.own_token(window);
         let mut flags = 0;
@@ -245,21 +248,109 @@ impl MeshNode {
         Ok(removed)
     }
 
-    /// Re-read which IK dialers get a contact link (§B14.2) after the
-    /// contacts changed. Callers hold the store. On a store error nobody
-    /// is allowed (fails closed: dialers get the stranger fallback).
+    /// Re-read which IK dialers get a contact link (§B14.2, §B14.7) after
+    /// the contacts or the restore window changed. Callers hold the store.
+    /// On a store error nobody is allowed (fails closed: dialers get the
+    /// stranger fallback).
     pub(crate) fn refresh_allowed_dialers(&self, store: &mut crate::store::MeshStore) {
-        let dialers = match store.contact_statics() {
-            Ok((live, any)) => AllowedDialers {
-                live: live.into_iter().collect(),
-                no_contacts: !any,
-            },
+        let loaded = store
+            .contact_statics()
+            .and_then(|statics| Ok((statics, store.restore_window()?)));
+        let dialers = match loaded {
+            Ok((statics, window)) => {
+                if let Some(w) = window {
+                    self.inner.link.restore_clock.seen(w.seen);
+                }
+                AllowedDialers {
+                    live: statics.live.into_iter().collect(),
+                    removed: statics.removed.into_iter().collect(),
+                    restore_until: window.map(|w| w.until),
+                }
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "contacts unavailable; no IK dialer allowed");
                 AllowedDialers::default()
             }
         };
         *self.inner.link.dialers.write() = dialers;
+    }
+
+    /// The clock for the restore window: it never runs backwards
+    /// (§B14.7).
+    fn restore_clock(&self) -> u64 {
+        self.inner.link.restore_clock.now(self.unix_now())
+    }
+
+    /// Open the restore window (§B14.7): call when this phone was restored
+    /// from its recovery phrase. For [`RESTORE_WINDOW_SECS`] (72 h), or
+    /// until [`Self::end_restore_window`], an IK dialer whose static key is
+    /// unknown (not a removed contact's) gets a contact link; once its
+    /// identity log proves its inbox, its card is stored as a contact
+    /// flagged `auto_added`, which does not get this phone's card until the
+    /// user confirms it ([`Self::confirm_restored_contact`]). The window
+    /// survives restarts; a later call never shortens it. Returns its end
+    /// (unix seconds).
+    pub fn begin_restore_window(&self) -> Result<u64, MeshError> {
+        let now = self.restore_clock();
+        let mut store = self.inner.store.lock();
+        let open = store
+            .restore_window()?
+            .map(|w| w.until)
+            .filter(|&until| restore_window_open(until, now));
+        let until = open
+            .unwrap_or(0)
+            .max(now.saturating_add(RESTORE_WINDOW_SECS));
+        store.set_restore_window(RestoreWindow { until, seen: now })?;
+        self.refresh_allowed_dialers(&mut store);
+        Ok(until)
+    }
+
+    /// Close the restore window now: from here on only live contacts get
+    /// a contact link.
+    pub fn end_restore_window(&self) -> Result<(), MeshError> {
+        let mut store = self.inner.store.lock();
+        store.clear_restore_window()?;
+        self.refresh_allowed_dialers(&mut store);
+        Ok(())
+    }
+
+    /// The end (unix seconds) of the open restore window, or `None` when
+    /// none is open.
+    pub fn restore_window_until(&self) -> Option<u64> {
+        let now = self.restore_clock();
+        self.inner
+            .link
+            .dialers
+            .read()
+            .restore_until
+            .filter(|&until| restore_window_open(until, now))
+    }
+
+    /// Persist the latest wall clock seen while a restore window is open,
+    /// so a restart with the clock set back cannot lengthen it. Cheap
+    /// enough for the radio's once-a-window `advert_state`.
+    fn note_restore_clock(&self, store: &mut crate::store::MeshStore) -> Result<(), MeshError> {
+        let Some(until) = self.inner.link.dialers.read().restore_until else {
+            return Ok(());
+        };
+        let seen = self.restore_clock();
+        if store.restore_window()?.is_some_and(|w| w.seen < seen) {
+            store.set_restore_window(RestoreWindow { until, seen })?;
+        }
+        Ok(())
+    }
+
+    /// The user confirmed a contact this phone added by itself during a
+    /// restore window: it gets this phone's card from now on (on its open
+    /// link at once). Returns whether such a contact was waiting.
+    pub fn confirm_restored_contact(&self, inbox_id: &str) -> Result<bool, MeshError> {
+        let confirmed = self.inner.store.lock().confirm_contact(inbox_id)?;
+        if confirmed {
+            self.emit(vec![super::NodeEvent::ContactConfirmed(
+                inbox_id.to_string(),
+            )]);
+        }
+        Ok(confirmed)
     }
 
     /// This phone closed `peer`'s relay link (idle, at the lifetime cap, for
@@ -312,6 +403,17 @@ impl MeshNode {
         card: &ContactCard,
         force: bool,
     ) -> Result<ContactUpdate, MeshError> {
+        self.store_contact_card_with(card, force, false)
+    }
+
+    /// Store `card`; `auto_added`: the card came from a dialer the restore
+    /// window let in (§B14.7), so a new contact is flagged for the user.
+    pub(crate) fn store_contact_card_with(
+        &self,
+        card: &ContactCard,
+        force: bool,
+        auto_added: bool,
+    ) -> Result<ContactUpdate, MeshError> {
         if let Some(keys) = self.mesh_keys()
             && (card.inbox_id == keys.inbox_id
                 || card.noise_static_pub.as_slice() == keys.noise_public.as_slice())
@@ -321,7 +423,10 @@ impl MeshNode {
             ));
         }
         let mut store = self.inner.store.lock();
-        let outcome = store.upsert_contact(card, Self::now_ns(), force)?;
+        let outcome = store.upsert_contact_with(card, Self::now_ns(), force, auto_added)?;
+        if auto_added && outcome == ContactUpdate::Inserted {
+            self.inner.link.counters.count_restore_added();
+        }
         if matches!(outcome, ContactUpdate::Inserted | ContactUpdate::Updated) {
             self.refresh_allowed_dialers(&mut store);
             self.inner.link.bump_contacts_version();
@@ -647,8 +752,8 @@ impl ResponderContext for MeshNode {
     }
 
     fn is_allowed_dialer(&self, dialer_static: &[u8; 32]) -> bool {
-        let dialers = self.inner.link.dialers.read();
-        dialers.no_contacts || dialers.live.contains(dialer_static)
+        let now = self.restore_clock();
+        self.inner.link.dialers.read().allows(dialer_static, now)
     }
 
     fn replay_cache(&self) -> &ReplayCache {
@@ -659,6 +764,7 @@ impl ResponderContext for MeshNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::link::noise::ResponderContext;
     use crate::link::{FLAG_PAIRING, FLAG_RELAY, service_data};
 
     const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -877,6 +983,117 @@ mod tests {
             a.classify_advert(&seen, NOW).unwrap(),
             AdvertMatch::Contact { .. }
         ));
+    }
+
+    fn static_of(node: &MeshNode) -> [u8; 32] {
+        node.mesh_keys().unwrap().noise_public
+    }
+
+    const HOUR: i64 = 3600;
+
+    /// A phone that never began a restore window, with no contacts,
+    /// allows no IK dialer it does not know.
+    #[test]
+    fn a_fresh_phone_allows_no_unknown_dialer() {
+        let (a, c) = (keyed(A, 1), keyed(C, 3));
+        assert!(!a.is_allowed_dialer(&static_of(&c)));
+        assert_eq!(a.restore_window_until(), None);
+    }
+
+    /// §B14.7: while the window is open an unknown static is allowed, a
+    /// removed contact's is not; `end_restore_window` closes it.
+    #[test]
+    fn the_restore_window_allows_unknown_dialers_but_not_removed_ones() {
+        let (a, b, c) = (keyed(A, 1), keyed(B, 2), keyed(C, 3));
+        a.store_contact_card(&b.own_contact_card().unwrap(), false)
+            .unwrap();
+        assert!(a.remove_contact(B).unwrap());
+        let until = a.begin_restore_window().unwrap();
+        assert_eq!(a.restore_window_until(), Some(until));
+        assert!(until >= a.unix_now() + RESTORE_WINDOW_SECS - 1);
+        assert!(a.is_allowed_dialer(&static_of(&c)));
+        assert!(
+            !a.is_allowed_dialer(&static_of(&b)),
+            "removed stays refused"
+        );
+        a.end_restore_window().unwrap();
+        assert_eq!(a.restore_window_until(), None);
+        assert!(!a.is_allowed_dialer(&static_of(&c)));
+    }
+
+    /// The window lasts 72 hours; setting the clock back afterwards does
+    /// not reopen it, and a second `begin` never shortens an open one.
+    #[test]
+    fn the_restore_window_ends_after_72_hours_whatever_the_clock_does() {
+        let (a, c) = (keyed(A, 1), keyed(C, 3));
+        let until = a.begin_restore_window().unwrap();
+        a.set_clock_offset_for_test(-10 * HOUR);
+        assert_eq!(
+            a.restore_window_until(),
+            Some(until),
+            "a clock set back does not move the end"
+        );
+        assert_eq!(a.begin_restore_window().unwrap(), until, "never shorter");
+        a.set_clock_offset_for_test(71 * HOUR);
+        assert!(a.is_allowed_dialer(&static_of(&c)));
+        a.set_clock_offset_for_test(72 * HOUR + 1);
+        assert!(!a.is_allowed_dialer(&static_of(&c)));
+        assert_eq!(a.restore_window_until(), None);
+        a.set_clock_offset_for_test(0);
+        assert!(
+            !a.is_allowed_dialer(&static_of(&c)),
+            "a clock set back does not reopen it"
+        );
+        assert_eq!(a.restore_window_until(), None);
+    }
+
+    fn temp_db(name: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "xmtp_mesh_{name}_{}_{nanos}.db3",
+            std::process::id()
+        ))
+    }
+
+    fn keyed_at(path: &std::path::Path, inbox: &str, secret: u8) -> MeshNode {
+        let node = MeshNode::open(path.to_str().unwrap(), None).unwrap();
+        node.inner.store.lock().set_local_inbox(inbox).unwrap();
+        node.set_account_key(&[secret; 32]).unwrap();
+        node
+    }
+
+    /// The window survives a restart, and so does the latest time seen: a
+    /// phone restarted with its clock set back does not get the window
+    /// back.
+    #[test]
+    fn the_restore_window_survives_a_restart_and_a_clock_set_back() {
+        let path = temp_db("restore_window");
+        let c = keyed(C, 3);
+        let until = {
+            let a = keyed_at(&path, A, 1);
+            a.begin_restore_window().unwrap()
+        };
+        {
+            let a = keyed_at(&path, A, 1);
+            assert_eq!(a.restore_window_until(), Some(until), "survives a restart");
+            assert!(a.is_allowed_dialer(&static_of(&c)));
+            a.set_clock_offset_for_test(80 * HOUR);
+            // The radio's once-a-window call persists the time seen.
+            a.advert_state(a.unix_now()).unwrap();
+            assert_eq!(a.restore_window_until(), None);
+        }
+        let a = keyed_at(&path, A, 1);
+        assert_eq!(
+            a.restore_window_until(),
+            None,
+            "restarted with the clock 80 hours back: still over"
+        );
+        assert!(!a.is_allowed_dialer(&static_of(&c)));
+        drop(a);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

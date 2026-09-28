@@ -248,6 +248,9 @@ pub struct MeshStats {
     /// Times the phone left pairing mode after too many unfinished pairing
     /// handshakes (§B14.4).
     pub pairing_attempts_exhausted: u64,
+    /// Contacts the phone added by itself during a restore window
+    /// (§B14.7).
+    pub restore_contacts_added: u64,
 }
 
 #[derive(Debug, Default)]

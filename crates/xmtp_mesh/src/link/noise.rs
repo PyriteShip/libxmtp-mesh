@@ -8,8 +8,9 @@
 //! Payloads, all of exact length (anything else fails the handshake):
 //! - IK message 1: 31 encrypted bytes, `u64_be(advert window) ‖ 16 random
 //!   bytes ‖ 7 zero bytes`. The responder accepts it only from a dialer
-//!   its node allows (a live contact, or any dialer while the node has no
-//!   contacts), dated `w - 1 ..= w + 1`, and only once ([`ReplayCache`]).
+//!   its node allows (a live contact, or, during a restore window, a
+//!   static that is no removed contact's), dated `w - 1 ..= w + 1`, and
+//!   only once ([`ReplayCache`]).
 //!   Any other message 1 of kind 0 is answered exactly like a stranger's,
 //!   by NN on a fresh state.
 //! - NN message 1: 95 random bytes, in the clear. NN message 2: empty.
@@ -149,8 +150,9 @@ pub(crate) trait ResponderContext: Send + Sync {
     /// The current advert window, read when message 1 arrives.
     fn window(&self) -> u64;
     /// May this IK dialer have a contact link? The node answers yes for a
-    /// live (not removed) contact, or for anyone while it has no contacts
-    /// at all (a restored phone). Anyone else is answered as a stranger.
+    /// live (not removed) contact, and, while a restore window is open,
+    /// for a static that is no removed contact's (§B14.7). Anyone else is
+    /// answered as a stranger.
     fn is_allowed_dialer(&self, dialer_static: &[u8; 32]) -> bool;
     /// The node's one replay cache.
     fn replay_cache(&self) -> &ReplayCache;
@@ -594,16 +596,25 @@ mod tests {
         Handshake::dial(target, secret, W).unwrap()
     }
 
-    /// A node's answers: its window, its live contacts' statics (none:
-    /// allow any dialer, as a node with no contacts does), its cache.
+    /// A node's answers: its window, the statics it allows (`None`: any
+    /// dialer, as a node in its restore window with no removed contacts),
+    /// its cache.
     struct TestContext {
         window: AtomicU64,
-        contacts: Vec<[u8; 32]>,
+        contacts: Option<Vec<[u8; 32]>>,
         cache: ReplayCache,
     }
 
     impl TestContext {
         fn new(contacts: Vec<[u8; 32]>) -> Arc<Self> {
+            Self::with(Some(contacts))
+        }
+
+        fn allow_all() -> Arc<Self> {
+            Self::with(None)
+        }
+
+        fn with(contacts: Option<Vec<[u8; 32]>>) -> Arc<Self> {
             Arc::new(Self {
                 window: AtomicU64::new(W),
                 contacts,
@@ -617,7 +628,9 @@ mod tests {
             self.window.load(Ordering::SeqCst)
         }
         fn is_allowed_dialer(&self, dialer_static: &[u8; 32]) -> bool {
-            self.contacts.is_empty() || self.contacts.contains(dialer_static)
+            self.contacts
+                .as_ref()
+                .is_none_or(|c| c.contains(dialer_static))
         }
         fn replay_cache(&self) -> &ReplayCache {
             &self.cache
@@ -625,7 +638,7 @@ mod tests {
     }
 
     fn accept(secret: &[u8; 32], pairing_mode: bool, relay_on: bool) -> Handshake {
-        Handshake::accept(secret, pairing_mode, relay_on, TestContext::new(Vec::new()))
+        Handshake::accept(secret, pairing_mode, relay_on, TestContext::allow_all())
     }
 
     /// Runs a handshake to the end: (dialer's open link, responder's).
@@ -761,7 +774,7 @@ mod tests {
     fn a_replayed_contact_message_1_is_answered_as_a_stranger() {
         let (a, a_pub) = keypair(1);
         let (b, b_pub) = keypair(2);
-        let node = TestContext::new(Vec::new());
+        let node = TestContext::allow_all();
         let (_, msg1) = dial(
             &DialTarget::Contact {
                 remote_static: b_pub,
@@ -1177,15 +1190,15 @@ mod tests {
 
         let no_contacts = TestContext::new(Vec::new());
         let (_, msg1) = dial(&target, &a);
-        let open = Handshake::accept(&b, false, false, no_contacts)
+        let open = Handshake::accept(&b, false, true, no_contacts)
             .read(&msg1)
             .unwrap()
             .open
             .unwrap();
         assert_eq!(
             open.kind,
-            LinkKind::Contact,
-            "a node with no contacts allows any dialer"
+            LinkKind::Relay,
+            "a node with no contacts allows no dialer by itself"
         );
     }
 
@@ -1195,7 +1208,7 @@ mod tests {
     fn the_window_is_read_when_message_1_arrives() {
         let (a, _) = keypair(1);
         let (b, b_pub) = keypair(2);
-        let node = TestContext::new(Vec::new());
+        let node = TestContext::allow_all();
         let mut responder = Handshake::accept(&b, false, true, node.clone());
         node.window.store(W + 2, Ordering::SeqCst);
         let (_, msg1) = dial(

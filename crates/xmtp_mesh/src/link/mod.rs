@@ -120,6 +120,7 @@ pub(crate) struct LinkCounters {
     relay_force_closed: AtomicU64,
     relay_backoff_refused: AtomicU64,
     pairing_exhausted: AtomicU64,
+    restore_added: AtomicU64,
 }
 
 impl LinkCounters {
@@ -156,6 +157,10 @@ impl LinkCounters {
         self.pairing_exhausted.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub(crate) fn count_restore_added(&self) {
+        self.restore_added.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn count_discovery_reset(&self) {
         self.discovery_resets.fetch_add(1, Ordering::Relaxed);
     }
@@ -172,17 +177,78 @@ impl LinkCounters {
         stats.relay_links_force_closed = get(&self.relay_force_closed);
         stats.relay_links_backoff_refused = get(&self.relay_backoff_refused);
         stats.pairing_attempts_exhausted = get(&self.pairing_exhausted);
+        stats.restore_contacts_added = get(&self.restore_added);
     }
 }
 
-/// Which IK dialers get a contact link (§B14.2): the live contacts' static
-/// keys, or anyone while the phone has no contact at all (not even a
-/// removed one: a restored phone). An in-memory copy of the store, so a
+/// How long a restore window lasts (§B14.7): 72 hours.
+pub const RESTORE_WINDOW_SECS: u64 = 72 * 60 * 60;
+
+/// Which IK dialers get a contact link (§B14.2, §B14.7): the live
+/// contacts' static keys; and, while a restore window is open, any static
+/// that is not a removed contact's. A phone that never began a restore
+/// window accepts live contacts only. An in-memory copy of the store, so a
 /// responder answers without database I/O.
 #[derive(Default)]
 pub(crate) struct AllowedDialers {
     pub(crate) live: HashSet<[u8; 32]>,
-    pub(crate) no_contacts: bool,
+    pub(crate) removed: HashSet<[u8; 32]>,
+    /// The restore window's end (unix seconds), if one was begun.
+    pub(crate) restore_until: Option<u64>,
+}
+
+impl AllowedDialers {
+    pub(crate) fn allows(&self, dialer_static: &[u8; 32], now: u64) -> bool {
+        self.live.contains(dialer_static)
+            || (!self.removed.contains(dialer_static)
+                && self
+                    .restore_until
+                    .is_some_and(|until| restore_window_open(until, now)))
+    }
+}
+
+/// Whether a restore window ending at `until` is open at `now` (a
+/// [`RestoreClock`] reading). It is never open for longer than
+/// [`RESTORE_WINDOW_SECS`] from `now`, so a clock set back further than
+/// any time this node remembers cannot stretch it either.
+pub(crate) fn restore_window_open(until: u64, now: u64) -> bool {
+    now < until && until - now <= RESTORE_WINDOW_SECS
+}
+
+/// A wall clock (unix seconds) that never runs backwards (§B14.7): the
+/// latest time seen, advanced by the process's monotonic clock. Setting
+/// the phone's clock back therefore neither reopens nor lengthens the
+/// restore window. Across restarts it resumes from the time persisted with
+/// the window (`restore_window_seen`).
+#[derive(Default)]
+pub(crate) struct RestoreClock {
+    /// A wall-clock reading and when it was taken.
+    base: Mutex<Option<(u64, std::time::Instant)>>,
+}
+
+impl RestoreClock {
+    /// The time now: the wall clock `wall`, or, if that is behind, the
+    /// latest time seen plus the monotonic time since.
+    pub(crate) fn now(&self, wall: u64) -> u64 {
+        let mut base = self.base.lock();
+        let projected = base.map(|(seen, at)| seen.saturating_add(at.elapsed().as_secs()));
+        match projected {
+            Some(p) if p >= wall => p,
+            _ => {
+                *base = Some((wall, std::time::Instant::now()));
+                wall
+            }
+        }
+    }
+
+    /// A time seen before (persisted): never run behind it.
+    pub(crate) fn seen(&self, seen: u64) {
+        let mut base = self.base.lock();
+        let projected = base.map(|(s, at)| s.saturating_add(at.elapsed().as_secs()));
+        if projected.is_none_or(|p| p < seen) {
+            *base = Some((seen, std::time::Instant::now()));
+        }
+    }
 }
 
 /// A verified contact link, for resolving two links to one phone
@@ -247,6 +313,8 @@ pub(crate) struct LinkState {
     /// The node's one IK replay cache, shared by all its responders.
     pub(crate) replay: noise::ReplayCache,
     pub(crate) dialers: RwLock<AllowedDialers>,
+    /// The clock the restore window is judged by (§B14.7).
+    pub(crate) restore_clock: RestoreClock,
     /// Verified contact links by peer. Lock order: the node's `sessions`,
     /// then this.
     pub(crate) contact_links: Mutex<HashMap<PeerId, ContactLinkEntry>>,

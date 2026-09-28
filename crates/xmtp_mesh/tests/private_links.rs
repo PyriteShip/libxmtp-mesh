@@ -694,6 +694,9 @@ async fn a_contact_link_whose_hello_names_another_inbox_is_closed() {
     let mut card = b.node.own_contact_card_for_test().unwrap();
     card.inbox_id = inbox(&c);
     a.node.add_contact_for_test(card);
+    // b knows a, so it answers a's IK dial as a contact link.
+    b.node
+        .add_contact_for_test(a.node.own_contact_card_for_test().unwrap());
     hub.link_as(
         "a",
         "b",
@@ -706,22 +709,30 @@ async fn a_contact_link_whose_hello_names_another_inbox_is_closed() {
     assert!(a.node.verified_peers().is_empty());
 }
 
-/// §B14.4 IK to a restored phone that lost its contacts: the restored
-/// phone (same wallet, empty node, no contacts, no groups) accepts, verifies
-/// the dialer by Auth and identity log, and stores it from its card.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_restored_phone_accepts_a_contact_and_stores_it() {
-    let hub = LoopbackHub::new();
+/// A contact of `wallet`'s phone `b` (`a`), and the phone restored from
+/// the same wallet on an empty node (`b2`, no contacts, no groups), with
+/// its frames recorded.
+async fn restored_phone(
+    hub: &LoopbackHub,
+    contacts: &[&str],
+) -> (Vec<TestPeer>, TestPeer, TestPeer, Arc<common::Recording>) {
     let wallet = generate_local_wallet();
-    let a = peer(&hub, "a").await;
-    let b = peer_on(&hub, "b", MeshNode::in_memory().unwrap(), &wallet).await;
-    hub.link("a", "b");
-    verified_pair(&a, &b).await;
-    hub.unlink("a", "b");
+    let b = peer_on(hub, "b", MeshNode::in_memory().unwrap(), &wallet).await;
+    let mut peers = Vec::new();
+    for name in contacts {
+        let p = peer(hub, name).await;
+        hub.link(name, "b");
+        verified_pair(&p, &b).await;
+        hub.unlink(name, "b");
+        peers.push(p);
+    }
     b.node.stop_sync();
     // Whole-second gap: `b` stays the older origin of the inbox (D24).
     tokio::time::sleep(Duration::from_secs(1)).await;
-    let b2 = peer_on(&hub, "b2", MeshNode::in_memory().unwrap(), &wallet).await;
+    let node = MeshNode::in_memory().unwrap();
+    let rec = Arc::new(common::Recording::default());
+    node.set_frame_tap_for_test(Some(rec.clone()));
+    let b2 = peer_on(hub, "b2", node, &wallet).await;
     assert!(b2.node.contacts().unwrap().is_empty());
     assert_eq!(
         b2.node
@@ -731,6 +742,23 @@ async fn a_restored_phone_accepts_a_contact_and_stores_it() {
         b.node.own_contact_card_for_test().unwrap().noise_static_pub,
         "the recovery phrase restores the static key"
     );
+    (peers, b, b2, rec)
+}
+
+fn cards_to(rec: &common::Recording, peer: &str) -> usize {
+    rec.sent_to(peer)
+        .iter()
+        .filter(|b| matches!(b, Body::ContactCard(_)))
+        .count()
+}
+
+/// §B14.7: a restored phone that never opened a restore window answers a
+/// contact's IK dial like a stranger's: nothing verified, nothing stored.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_phone_without_a_restore_window_refuses_unknown_dialers() {
+    let hub = LoopbackHub::new();
+    let (peers, b, b2, rec) = restored_phone(&hub, &["a"]).await;
+    let a = &peers[0];
     hub.link_as(
         "a",
         "b2",
@@ -738,30 +766,94 @@ async fn a_restored_phone_accepts_a_contact_and_stores_it() {
             inbox_id: inbox(&b),
         },
     );
-    eventually("b2 verifies a and stores it as a contact", || async {
-        b2.node
-            .verified_peers()
-            .iter()
-            .any(|p| p.installation == a.installation())
-            && b2.node.contact(&inbox(&a)).unwrap().is_some()
-    })
-    .await;
-    assert_eq!(b2.node.mesh_stats().links_contact, 1);
+    eventually("a gives up", || async { !hub.is_linked("a", "b2") }).await;
+    assert_eq!(b2.node.mesh_stats().links_contact, 0);
+    assert!(b2.node.authenticated_peers().is_empty());
+    assert!(b2.node.contacts().unwrap().is_empty());
+    assert!(rec.sent_to("a").is_empty(), "b2 said nothing");
+    assert!(a.node.verified_peers().is_empty());
+}
+
+/// §B14.7 restore window: the restored phone accepts IK from all three of
+/// its contacts, verifies each by Auth and identity log, and stores each
+/// from its card, flagged as added by restore and counted. It sends none
+/// of them its own card until the user confirms that contact; then the
+/// card goes on the open link.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restored_phone_reconnects_to_every_contact_in_its_restore_window() {
+    let hub = LoopbackHub::new();
+    let (peers, b, b2, rec) = restored_phone(&hub, &["a", "c", "d"]).await;
+    let until = b2.node.begin_restore_window().unwrap();
+    assert_eq!(b2.node.restore_window_until(), Some(until));
+    for p in &peers {
+        hub.link_as(
+            &p.name,
+            "b2",
+            DialIntent::Contact {
+                inbox_id: inbox(&b),
+            },
+        );
+    }
+    for p in &peers {
+        eventually("b2 verifies the contact and stores it", || async {
+            b2.node
+                .verified_peers()
+                .iter()
+                .any(|v| v.installation == p.installation())
+                && b2.node.contact(&inbox(p)).unwrap().is_some()
+        })
+        .await;
+        let stored = b2.node.contact(&inbox(p)).unwrap().unwrap();
+        assert!(stored.auto_added, "flagged for the user");
+        assert_eq!(
+            stored.noise_static_pub.to_vec(),
+            p.node.own_contact_card_for_test().unwrap().noise_static_pub
+        );
+    }
+    assert_eq!(b2.node.mesh_stats().links_contact, 3);
+    assert_eq!(b2.node.mesh_stats().restore_contacts_added, 3);
     assert!(
         b2.client
             .find_groups(GroupQueryArgs::default())
             .unwrap()
             .is_empty()
     );
-    assert_eq!(
-        b2.node
-            .contact(&inbox(&a))
-            .unwrap()
-            .unwrap()
-            .noise_static_pub
-            .to_vec(),
-        a.node.own_contact_card_for_test().unwrap().noise_static_pub
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    for p in &peers {
+        assert_eq!(cards_to(&rec, &p.name), 0, "no card before confirmation");
+    }
+    let a = &peers[0];
+    assert!(b2.node.confirm_restored_contact(&inbox(a)).unwrap());
+    assert!(!b2.node.contact(&inbox(a)).unwrap().unwrap().auto_added);
+    eventually("the card goes to the confirmed contact", || async {
+        cards_to(&rec, "a") == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(cards_to(&rec, "c"), 0, "still unconfirmed");
+    assert_eq!(cards_to(&rec, "d"), 0, "still unconfirmed");
+}
+
+/// Once the restore window ended, an unknown static gets the stranger
+/// answer again.
+#[tokio::test(flavor = "multi_thread")]
+async fn after_the_restore_window_an_unknown_dialer_is_a_stranger() {
+    let hub = LoopbackHub::new();
+    let (peers, b, b2, rec) = restored_phone(&hub, &["a"]).await;
+    b2.node.begin_restore_window().unwrap();
+    b2.node.end_restore_window().unwrap();
+    assert_eq!(b2.node.restore_window_until(), None);
+    hub.link_as(
+        "a",
+        "b2",
+        DialIntent::Contact {
+            inbox_id: inbox(&b),
+        },
     );
+    eventually("a gives up", || async { !hub.is_linked("a", "b2") }).await;
+    assert!(b2.node.contacts().unwrap().is_empty());
+    assert!(rec.sent_to("a").is_empty());
+    assert!(peers[0].node.verified_peers().is_empty());
 }
 
 /// §B14.4 discovery reset: the old token is gone; the contact does not
@@ -978,9 +1070,9 @@ async fn simultaneous_contact_dials_keep_the_same_link_on_both_phones() {
     }
 }
 
-/// A restored phone (no contact rows) accepts any IK dialer, but stores
-/// and answers only one that proves its inbox: `m` dials with its own
-/// static key and a Hello claiming `a`'s inbox, is dropped at the
+/// A phone in its restore window accepts an unknown IK dialer, but
+/// stores and answers only one that proves its inbox: `m` dials with its
+/// own static key and a Hello claiming `a`'s inbox, is dropped at the
 /// verification deadline, is not stored, and never gets `b2`'s card.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_restored_phone_drops_a_dialer_that_cannot_prove_its_inbox() {
@@ -991,6 +1083,7 @@ async fn a_restored_phone_drops_a_dialer_that_cannot_prove_its_inbox() {
     b2.node
         .set_peer_verify_timeout_for_test(Duration::from_millis(500));
     assert!(b2.node.contacts().unwrap().is_empty());
+    b2.node.begin_restore_window().unwrap();
     m.node
         .add_contact_for_test(b2.node.own_contact_card_for_test().unwrap());
     // m's link keys stay its own; only its Hello claims a's inbox.

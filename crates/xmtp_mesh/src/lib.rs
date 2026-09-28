@@ -95,13 +95,13 @@ mod verifier;
 pub use error::MeshError;
 pub use link::{
     AdvertMatch, AdvertState, DialIntent, LinkKeyInfo, LinkKind, LinkRole, MAX_UNFINISHED_PAIRINGS,
-    PendingPairing,
+    PendingPairing, RESTORE_WINDOW_SECS,
 };
 pub use node::{MeshNode, MeshStream, NodeEvent, Resolution, ResyncOutcome, VerifiedPeer};
 pub use relay::{ClientRelayExporter, RelayConfig, RelayExporter, RelayStats};
 pub use store::{
-    Contact, ContactUpdate, InsertOutcome, MeshStore, NewGroupMessage, StoredGroupMessage,
-    StoredWelcome,
+    Contact, ContactStatics, ContactUpdate, InsertOutcome, MeshStore, NewGroupMessage,
+    RestoreWindow, StoredGroupMessage, StoredWelcome,
 };
 pub use sync::frames::MAX_FRAME_LEN;
 pub use sync::seq::{Equivocation, MeshStats, SeqProof, SeqRecord, SeqReject};

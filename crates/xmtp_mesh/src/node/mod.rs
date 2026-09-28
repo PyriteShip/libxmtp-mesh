@@ -221,6 +221,9 @@ pub enum NodeEvent {
         inbox_id: String,
         outcome: ResyncOutcome,
     },
+    /// The user confirmed a contact this phone added by itself during a
+    /// restore window (§B14.7): it may now get our contact card.
+    ContactConfirmed(String),
 }
 
 impl MeshNode {

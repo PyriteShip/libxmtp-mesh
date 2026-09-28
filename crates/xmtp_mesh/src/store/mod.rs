@@ -16,7 +16,7 @@ mod contacts;
 mod relay;
 #[cfg(test)]
 mod tests;
-pub use contacts::{Contact, ContactUpdate};
+pub use contacts::{Contact, ContactStatics, ContactUpdate, RestoreWindow};
 pub use relay::SpoolEntry;
 
 const MIGRATIONS: EmbeddedMigrations = embed_migrations!("migrations");

@@ -244,6 +244,10 @@ pub(crate) struct Session {
     dialer_static: Option<[u8; 32]>,
     /// We sent our contact card on this link.
     card_sent: bool,
+    /// Accepting a contact link from a static key that is no contact's:
+    /// only a restore window lets one in (§B14.7). Its card, once verified,
+    /// makes an `auto_added` contact.
+    restore_dialer: bool,
     /// A card received before the peer was verified.
     pending_card: Option<ContactCard>,
     /// Another contact link to the same phone was kept (§B14.3): this one
@@ -342,6 +346,7 @@ pub(crate) fn spawn(
         expected_inbox: None,
         dialer_static: None,
         card_sent: false,
+        restore_dialer: false,
         pending_card: None,
         superseded: false,
         pairing_attempt: false,
@@ -724,11 +729,11 @@ impl Session {
     }
 
     /// A contact link: note who dialed, and, when accepting, which contact
-    /// the dialer's static key belongs to. An unknown key (this phone was
-    /// restored and has no contacts) is decided by Hello/Auth and the
+    /// the dialer's static key belongs to. An unknown key (only a restore
+    /// window lets one in, §B14.7) is decided by Hello/Auth and the
     /// identity log, as on any link; its card then makes it a contact
-    /// (§B14.4). A removed contact never gets here (it is answered as a
-    /// stranger), but is refused should one slip through.
+    /// flagged for the user. A removed contact never gets here (it is
+    /// answered as a stranger), but is refused should one slip through.
     fn contact_link_opened(&mut self, open: &LinkOpen) -> Result<(), MeshError> {
         let Some(remote) = open.remote_static else {
             self.node.link_counters().count_handshake_failed();
@@ -752,14 +757,36 @@ impl Session {
                 self.expected_inbox = Some(c.inbox_id);
                 Ok(())
             }
-            None => Ok(()),
+            None => {
+                self.restore_dialer = true;
+                Ok(())
+            }
         }
     }
 
-    /// Send our contact card once on this contact link.
+    /// Send our contact card once on this link. A contact the phone added
+    /// by itself during a restore window gets none until the user confirmed
+    /// it (§B14.7).
     fn send_own_card(&mut self) {
         if self.card_sent {
             return;
+        }
+        if self.link_kind == Some(LinkKind::Contact) {
+            let Some(inbox_id) = self
+                .peer_inbox
+                .clone()
+                .or_else(|| self.expected_inbox.clone())
+            else {
+                return;
+            };
+            match self.node.contact(&inbox_id) {
+                Ok(Some(c)) if !c.removed && !c.auto_added => {}
+                Ok(_) => return,
+                Err(e) => {
+                    tracing::warn!(peer = %self.peer, error = %e, "contact unavailable; card not sent");
+                    return;
+                }
+            }
         }
         if let Some(card) = self.node.own_contact_card() {
             self.card_sent = self.try_send(Body::ContactCard(card));
@@ -799,10 +826,11 @@ impl Session {
         self.apply_contact_card(card).await
     }
 
-    /// Store a verified peer's card (contact links only; a pairing card
-    /// waits for the user). An older card, or one for a removed contact,
-    /// is ignored; a new contact (this phone was restored) gets our card
-    /// back.
+    /// Store a verified peer's card (a pairing card waits for both people
+    /// to confirm). An older card, or one for a removed contact, is
+    /// ignored. A new contact (a dialer the restore window let in) is
+    /// flagged `auto_added` and gets no card of ours until the user
+    /// confirms it (§B14.7).
     async fn apply_contact_card(&mut self, card: ContactCard) -> Result<(), MeshError> {
         if self.peer_inbox.as_deref() != Some(card.inbox_id.as_str()) {
             self.node.link_counters().count_frame_rejected();
@@ -815,7 +843,13 @@ impl Session {
             Some(LinkKind::Pairing) => return self.apply_pairing_card(card),
             _ => return Ok(()),
         }
-        match self.node.store_contact_card(&card, false)? {
+        match self
+            .node
+            .store_contact_card_with(&card, false, self.restore_dialer)?
+        {
+            ContactUpdate::Inserted if self.restore_dialer => {
+                tracing::info!(peer = %self.peer, "restore window: contact added, awaiting the user");
+            }
             ContactUpdate::Inserted => self.send_own_card(),
             ContactUpdate::Stale => {
                 tracing::debug!(peer = %self.peer, "an older contact card; kept ours");
@@ -1915,6 +1949,13 @@ impl Session {
                 if self.may_announce(&gid).await? {
                     self.send(Body::Interest(self.node.group_summary(&gid)?));
                 }
+                Ok(())
+            }
+            NodeEvent::ContactConfirmed(inbox_id)
+                if self.link_kind == Some(LinkKind::Contact)
+                    && self.peer_inbox.as_deref() == Some(inbox_id.as_str()) =>
+            {
+                self.send_own_card();
                 Ok(())
             }
             _ => Ok(()),

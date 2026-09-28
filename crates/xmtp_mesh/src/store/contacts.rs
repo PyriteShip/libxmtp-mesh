@@ -1,5 +1,6 @@
-//! Contacts: the phones this one recognises and dials as contacts, and
-//! its own discovery generation (DESIGN.md §B14.1, §B14.4).
+//! Contacts: the phones this one recognises and dials as contacts, its
+//! own discovery generation, and the restore window (DESIGN.md §B14.1,
+//! §B14.4, §B14.7).
 use diesel::prelude::*;
 use diesel::sql_query;
 use diesel::sql_types::{BigInt, Binary, Nullable, Text};
@@ -9,8 +10,13 @@ use crate::MeshError;
 use crate::sync::frames::ContactCard;
 
 const META_DISCOVERY_GENERATION: &str = "discovery_generation";
-const CONTACT_COLUMNS: &str =
-    "inbox_id, noise_static_pub, discovery_key, generation, updated_ns, removed_ns";
+/// Unix second the restore window ends (§B14.7).
+const META_RESTORE_UNTIL: &str = "restore_window_until";
+/// The latest wall clock (unix seconds) seen while the window was open: a
+/// clock set back never makes the window longer.
+const META_RESTORE_SEEN: &str = "restore_window_seen";
+const CONTACT_COLUMNS: &str = "inbox_id, noise_static_pub, discovery_key, generation, updated_ns, \
+     removed_ns, auto_added_ns";
 
 /// A stored contact. `Debug` omits the discovery key: it is a secret shared
 /// with that contact.
@@ -23,6 +29,24 @@ pub struct Contact {
     pub updated_ns: i64,
     /// A removed contact: kept so its static key is refused (§B14.4).
     pub removed: bool,
+    /// Added by the phone itself during a restore window, and not yet
+    /// confirmed by the user: it does not get our card (§B14.7).
+    pub auto_added: bool,
+}
+
+/// The persisted restore window (§B14.7): it ends at `until`; `seen` is the
+/// latest wall clock observed while it was open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreWindow {
+    pub until: u64,
+    pub seen: u64,
+}
+
+/// The contacts the node's allowed-dialer set is built from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContactStatics {
+    pub live: Vec<[u8; 32]>,
+    pub removed: Vec<[u8; 32]>,
 }
 
 impl std::fmt::Debug for Contact {
@@ -34,6 +58,7 @@ impl std::fmt::Debug for Contact {
             .field("generation", &self.generation)
             .field("updated_ns", &self.updated_ns)
             .field("removed", &self.removed)
+            .field("auto_added", &self.auto_added)
             .finish()
     }
 }
@@ -66,6 +91,8 @@ struct ContactRow {
     updated_ns: i64,
     #[diesel(sql_type = Nullable<BigInt>)]
     removed_ns: Option<i64>,
+    #[diesel(sql_type = Nullable<BigInt>)]
+    auto_added_ns: Option<i64>,
 }
 
 impl TryFrom<ContactRow> for Contact {
@@ -84,6 +111,7 @@ impl TryFrom<ContactRow> for Contact {
                 .map_err(|_| MeshError::InvalidRequest("stored contact generation".into()))?,
             updated_ns: r.updated_ns,
             removed: r.removed_ns.is_some(),
+            auto_added: r.auto_added_ns.is_some(),
         })
     }
 }
@@ -131,20 +159,20 @@ impl MeshStore {
         rows.into_iter().map(Contact::try_from).collect()
     }
 
-    /// The live contacts' static keys, and whether any contact at all
-    /// (live or removed) is on file.
-    pub fn contact_statics(&mut self) -> Result<(Vec<[u8; 32]>, bool), MeshError> {
+    /// The live and the removed contacts' static keys.
+    pub fn contact_statics(&mut self) -> Result<ContactStatics, MeshError> {
         let rows: Vec<ContactRow> =
             sql_query(format!("SELECT {CONTACT_COLUMNS} FROM contacts")).load(&mut self.conn)?;
-        let any = !rows.is_empty();
-        let mut live = Vec::with_capacity(rows.len());
+        let mut statics = ContactStatics::default();
         for row in rows {
             let contact = Contact::try_from(row)?;
-            if !contact.removed {
-                live.push(contact.noise_static_pub);
+            if contact.removed {
+                statics.removed.push(contact.noise_static_pub);
+            } else {
+                statics.live.push(contact.noise_static_pub);
             }
         }
-        Ok((live, any))
+        Ok(statics)
     }
 
     /// Store `card`. Without `force` a card never replaces a newer
@@ -155,6 +183,20 @@ impl MeshStore {
         card: &ContactCard,
         now_ns: i64,
         force: bool,
+    ) -> Result<ContactUpdate, MeshError> {
+        self.upsert_contact_with(card, now_ns, force, false)
+    }
+
+    /// [`Self::upsert_contact`]; a card `Inserted` with `auto_added` is
+    /// flagged as added by the phone itself during a restore window
+    /// (§B14.7). A forced store (a confirmed pairing) clears the flag;
+    /// other updates keep it.
+    pub fn upsert_contact_with(
+        &mut self,
+        card: &ContactCard,
+        now_ns: i64,
+        force: bool,
+        auto_added: bool,
     ) -> Result<ContactUpdate, MeshError> {
         check_card(card)?;
         self.transaction(|s| {
@@ -177,17 +219,20 @@ impl MeshStore {
                 Some(_) => ContactUpdate::Updated,
             };
             sql_query(
-                "INSERT INTO contacts (inbox_id, noise_static_pub, discovery_key, generation, updated_ns, removed_ns) \
-                 VALUES (?, ?, ?, ?, ?, NULL) \
+                "INSERT INTO contacts (inbox_id, noise_static_pub, discovery_key, generation, updated_ns, \
+                 removed_ns, auto_added_ns) VALUES (?, ?, ?, ?, ?, NULL, ?) \
                  ON CONFLICT(inbox_id) DO UPDATE SET noise_static_pub = excluded.noise_static_pub, \
                  discovery_key = excluded.discovery_key, generation = excluded.generation, \
-                 updated_ns = excluded.updated_ns, removed_ns = NULL",
+                 updated_ns = excluded.updated_ns, removed_ns = NULL, \
+                 auto_added_ns = CASE WHEN ? THEN NULL ELSE contacts.auto_added_ns END",
             )
             .bind::<Text, _>(&card.inbox_id)
             .bind::<Binary, _>(&card.noise_static_pub)
             .bind::<Binary, _>(&card.discovery_key)
             .bind::<BigInt, _>(i64::from(card.generation))
             .bind::<BigInt, _>(now_ns)
+            .bind::<Nullable<BigInt>, _>(auto_added.then_some(now_ns))
+            .bind::<diesel::sql_types::Bool, _>(force)
             .execute(&mut s.conn)?;
             Ok(outcome)
         })
@@ -202,6 +247,54 @@ impl MeshStore {
         .bind::<Text, _>(inbox_id)
         .execute(&mut self.conn)?;
         Ok(n > 0)
+    }
+
+    /// The user confirmed a contact the phone added by itself during a
+    /// restore window (§B14.7). Returns whether such a live contact was
+    /// flagged.
+    pub fn confirm_contact(&mut self, inbox_id: &str) -> Result<bool, MeshError> {
+        let n = sql_query(
+            "UPDATE contacts SET auto_added_ns = NULL \
+             WHERE inbox_id = ? AND removed_ns IS NULL AND auto_added_ns IS NOT NULL",
+        )
+        .bind::<Text, _>(inbox_id)
+        .execute(&mut self.conn)?;
+        Ok(n > 0)
+    }
+
+    /// The persisted restore window, if one was begun and not ended
+    /// (it may have run out: see `MeshNode::restore_window_until`).
+    pub fn restore_window(&mut self) -> Result<Option<RestoreWindow>, MeshError> {
+        let read = |v: Option<Vec<u8>>| -> Result<Option<u64>, MeshError> {
+            match v {
+                None => Ok(None),
+                Some(v) if v.is_empty() => Ok(None),
+                Some(v) => Ok(Some(u64::from_be_bytes(v.as_slice().try_into().map_err(
+                    |_| MeshError::InvalidRequest("stored restore window".into()),
+                )?))),
+            }
+        };
+        let until = read(self.meta(META_RESTORE_UNTIL)?)?;
+        let seen = read(self.meta(META_RESTORE_SEEN)?)?;
+        Ok(until.map(|until| RestoreWindow {
+            until,
+            seen: seen.unwrap_or(0),
+        }))
+    }
+
+    pub fn set_restore_window(&mut self, window: RestoreWindow) -> Result<(), MeshError> {
+        self.transaction(|s| {
+            s.set_meta(META_RESTORE_UNTIL, &window.until.to_be_bytes())?;
+            s.set_meta(META_RESTORE_SEEN, &window.seen.to_be_bytes())
+        })
+    }
+
+    /// End the restore window (an empty value means none).
+    pub fn clear_restore_window(&mut self) -> Result<(), MeshError> {
+        self.transaction(|s| {
+            s.set_meta(META_RESTORE_UNTIL, &[])?;
+            s.set_meta(META_RESTORE_SEEN, &[])
+        })
     }
 
     pub fn discovery_generation(&mut self) -> Result<u32, MeshError> {

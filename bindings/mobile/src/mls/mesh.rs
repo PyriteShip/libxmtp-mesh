@@ -458,6 +458,11 @@ pub struct FfiContact {
     pub inbox_id: String,
     pub generation: u32,
     pub updated_ns: i64,
+    /// The phone added this contact by itself during a restore window
+    /// (DESIGN.md §B14.7): list it for the user to confirm
+    /// (`confirm_restored_contact`) or remove. It gets no card of ours
+    /// until confirmed.
+    pub auto_added: bool,
 }
 
 impl From<Contact> for FfiContact {
@@ -466,6 +471,7 @@ impl From<Contact> for FfiContact {
             inbox_id: c.inbox_id,
             generation: c.generation,
             updated_ns: c.updated_ns,
+            auto_added: c.auto_added,
         }
     }
 }
@@ -542,6 +548,8 @@ pub struct FfiMeshStats {
     /// Times the phone left pairing mode after too many unfinished pairing
     /// handshakes.
     pub pairing_attempts_exhausted: u64,
+    /// Contacts the phone added by itself during a restore window.
+    pub restore_contacts_added: u64,
 }
 
 impl From<MeshStats> for FfiMeshStats {
@@ -564,6 +572,7 @@ impl From<MeshStats> for FfiMeshStats {
             relay_links_force_closed: s.relay_links_force_closed,
             relay_links_backoff_refused: s.relay_links_backoff_refused,
             pairing_attempts_exhausted: s.pairing_attempts_exhausted,
+            restore_contacts_added: s.restore_contacts_added,
         }
     }
 }
@@ -821,11 +830,41 @@ impl FfiMeshNode {
             .collect())
     }
 
-    /// Stop recognising and accepting `inbox_id` (DESIGN.md §B14.4). The app
-    /// should offer `reset_discovery_key` right after, so the removed
-    /// contact stops recognising this phone too.
+    /// Stop recognising and accepting `inbox_id` (DESIGN.md §B14.4), and
+    /// close its open links. The app should offer `reset_discovery_key`
+    /// right after, so the removed contact stops recognising this phone
+    /// too.
     pub fn remove_contact(&self, inbox_id: String) -> Result<bool, FfiError> {
         self.node.remove_contact(&inbox_id).map_err(mesh_error)
+    }
+
+    /// Open the restore window (DESIGN.md §B14.7): call once when the app
+    /// restored this account from its recovery phrase, before `start_sync`.
+    /// For 72 hours, or until `end_restore_window`, contacts this phone no
+    /// longer knows can dial it and are added back (flagged `auto_added`).
+    /// It survives restarts and a clock set back. Returns its end (unix
+    /// seconds).
+    pub fn begin_restore_window(&self) -> Result<u64, FfiError> {
+        self.node.begin_restore_window().map_err(mesh_error)
+    }
+
+    /// Close the restore window now (the user is done reconnecting).
+    pub fn end_restore_window(&self) -> Result<(), FfiError> {
+        self.node.end_restore_window().map_err(mesh_error)
+    }
+
+    /// The end (unix seconds) of the open restore window, or `None`.
+    pub fn restore_window_until(&self) -> Option<u64> {
+        self.node.restore_window_until()
+    }
+
+    /// The user confirmed a contact the restore window added (`auto_added`):
+    /// it gets this phone's card from now on. Returns whether such a contact
+    /// was waiting.
+    pub fn confirm_restored_contact(&self, inbox_id: String) -> Result<bool, FfiError> {
+        self.node
+            .confirm_restored_contact(&inbox_id)
+            .map_err(mesh_error)
     }
 
     /// Start syncing with peers. `client` must be the registered client whose
@@ -1979,6 +2018,20 @@ mod tests {
         node.stop_sync();
     }
 
+    /// The restore window over FFI (DESIGN.md §B14.7).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_restore_window_opens_and_ends_over_ffi() {
+        let (client, node) = registered_mesh_client().await;
+        ready_to_pair(&client, &node);
+        assert_eq!(node.restore_window_until(), None);
+        let until = node.begin_restore_window().unwrap();
+        assert_eq!(node.restore_window_until(), Some(until));
+        assert!(!node.confirm_restored_contact("nobody".into()).unwrap());
+        node.end_restore_window().unwrap();
+        assert_eq!(node.restore_window_until(), None);
+        assert_eq!(node.mesh_stats().restore_contacts_added, 0);
+    }
+
     /// The radio's and the app's surface (DESIGN.md §B14): pair over FFI,
     /// confirm, classify each other's adverts, reset, remove.
     #[tokio::test(flavor = "multi_thread")]
@@ -2041,6 +2094,10 @@ mod tests {
                 .map(|c| c.inbox_id)
                 .collect::<Vec<_>>(),
             vec![b.inbox_id()]
+        );
+        assert!(
+            node_a.contacts().unwrap().iter().all(|c| !c.auto_added),
+            "a paired contact is no restore guess"
         );
         // A successful pairing leaves pairing mode by itself.
         assert!(!node_a.pairing_mode());

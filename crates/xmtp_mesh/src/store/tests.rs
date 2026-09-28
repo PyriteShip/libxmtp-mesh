@@ -558,8 +558,11 @@ fn a_removed_contact_stays_removed_until_it_is_paired_again() {
     assert!(s.contacts().unwrap().is_empty());
     assert_eq!(
         s.contact_statics().unwrap(),
-        (vec![], true),
-        "no live static, but a contact is on file"
+        ContactStatics {
+            live: vec![],
+            removed: vec![[1; 32]]
+        },
+        "no live static; the removed one is on file"
     );
     let tomb = s.contact_by_static(&[1; 32]).unwrap().unwrap();
     assert!(
@@ -575,14 +578,68 @@ fn a_removed_contact_stays_removed_until_it_is_paired_again() {
         ContactUpdate::Updated
     );
     assert!(!s.contact("i").unwrap().unwrap().removed);
-    assert_eq!(s.contact_statics().unwrap(), (vec![[1; 32]], true));
+    assert_eq!(
+        s.contact_statics().unwrap(),
+        ContactStatics {
+            live: vec![[1; 32]],
+            removed: vec![]
+        }
+    );
     assert_eq!(
         MeshStore::open_in_memory()
             .unwrap()
             .contact_statics()
             .unwrap(),
-        (vec![], false)
+        ContactStatics::default()
     );
+}
+
+/// §B14.7: a contact a restore window added is flagged until the user
+/// confirms it; a pairing (forced store) clears the flag, other updates
+/// keep it.
+#[test]
+fn a_contact_added_by_restore_is_flagged_until_confirmed() {
+    let mut s = MeshStore::open_in_memory().unwrap();
+    assert_eq!(
+        s.upsert_contact_with(&card("i", 1, 0), 10, false, true)
+            .unwrap(),
+        ContactUpdate::Inserted
+    );
+    assert!(s.contact("i").unwrap().unwrap().auto_added);
+    s.upsert_contact_with(&card("i", 1, 1), 11, false, false)
+        .unwrap();
+    assert!(
+        s.contact("i").unwrap().unwrap().auto_added,
+        "a newer card keeps the flag"
+    );
+    assert!(s.confirm_contact("i").unwrap());
+    assert!(!s.confirm_contact("i").unwrap(), "already confirmed");
+    assert!(!s.contact("i").unwrap().unwrap().auto_added);
+    s.upsert_contact_with(&card("j", 2, 0), 12, false, true)
+        .unwrap();
+    s.upsert_contact(&card("j", 2, 0), 13, true).unwrap();
+    assert!(
+        !s.contact("j").unwrap().unwrap().auto_added,
+        "pairing confirms"
+    );
+    s.upsert_contact_with(&card("k", 3, 0), 14, false, false)
+        .unwrap();
+    assert!(!s.contact("k").unwrap().unwrap().auto_added);
+    assert!(!s.confirm_contact("k").unwrap());
+}
+
+#[test]
+fn the_restore_window_persists_until_cleared() {
+    let mut s = MeshStore::open_in_memory().unwrap();
+    assert_eq!(s.restore_window().unwrap(), None);
+    let w = RestoreWindow {
+        until: 1_000,
+        seen: 10,
+    };
+    s.set_restore_window(w).unwrap();
+    assert_eq!(s.restore_window().unwrap(), Some(w));
+    s.clear_restore_window().unwrap();
+    assert_eq!(s.restore_window().unwrap(), None);
 }
 
 #[test]
