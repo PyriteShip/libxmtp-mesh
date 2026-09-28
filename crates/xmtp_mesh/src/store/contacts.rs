@@ -10,6 +10,8 @@ use crate::MeshError;
 use crate::sync::frames::ContactCard;
 
 const META_DISCOVERY_GENERATION: &str = "discovery_generation";
+/// The random salt of the current generation's key (§B14.1).
+const META_DISCOVERY_SALT: &str = "discovery_reset_salt";
 /// Unix second the restore window ends (§B14.7).
 const META_RESTORE_UNTIL: &str = "restore_window_until";
 /// The latest wall clock (unix seconds) seen while the window was open: a
@@ -306,7 +308,30 @@ impl MeshStore {
         }
     }
 
-    pub fn set_discovery_generation(&mut self, generation: u32) -> Result<(), MeshError> {
-        self.set_meta(META_DISCOVERY_GENERATION, &generation.to_be_bytes())
+    /// The random salt the reset to the current generation mixed in
+    /// (§B14.1); `None` at generation 0.
+    pub fn discovery_reset_salt(&mut self) -> Result<Option<[u8; 32]>, MeshError> {
+        match self.meta(META_DISCOVERY_SALT)? {
+            None => Ok(None),
+            Some(v) if v.is_empty() => Ok(None),
+            Some(v) => Ok(Some(v.as_slice().try_into().map_err(|_| {
+                MeshError::InvalidRequest("stored discovery reset salt".into())
+            })?)),
+        }
+    }
+
+    /// Store the discovery generation and the salt its reset mixed in.
+    pub fn set_discovery_generation(
+        &mut self,
+        generation: u32,
+        reset_salt: Option<&[u8; 32]>,
+    ) -> Result<(), MeshError> {
+        self.transaction(|s| {
+            s.set_meta(META_DISCOVERY_GENERATION, &generation.to_be_bytes())?;
+            s.set_meta(
+                META_DISCOVERY_SALT,
+                reset_salt.map(|salt| salt.as_slice()).unwrap_or(&[]),
+            )
+        })
     }
 }

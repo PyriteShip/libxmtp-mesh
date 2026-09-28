@@ -661,6 +661,10 @@ fn malformed_contact_cards_are_refused() {
 fn the_discovery_generation_starts_at_zero_and_persists() {
     let mut s = MeshStore::open_in_memory().unwrap();
     assert_eq!(s.discovery_generation().unwrap(), 0);
-    s.set_discovery_generation(3).unwrap();
+    assert_eq!(s.discovery_reset_salt().unwrap(), None);
+    s.set_discovery_generation(3, Some(&[9; 32])).unwrap();
     assert_eq!(s.discovery_generation().unwrap(), 3);
+    assert_eq!(s.discovery_reset_salt().unwrap(), Some([9; 32]));
+    s.set_discovery_generation(0, None).unwrap();
+    assert_eq!(s.discovery_reset_salt().unwrap(), None);
 }

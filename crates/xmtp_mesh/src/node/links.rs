@@ -2,11 +2,13 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use zeroize::Zeroizing;
+
 use super::MeshNode;
 use crate::MeshError;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::link::LinkRole;
-use crate::link::keys::{AccountPrk, MeshKeys};
+use crate::link::keys::{AccountPrk, MeshKeys, ResetSalt};
 use crate::link::noise::{ReplayCache, ResponderContext};
 use crate::link::{
     AdvertMatch, AdvertState, AllowedDialers, ContactLinkEntry, ContactLinkOutcome, FLAG_PAIRING,
@@ -36,12 +38,21 @@ impl MeshNode {
         // Held throughout so a concurrent reset cannot derive from a stale
         // generation.
         let mut prk_slot = self.inner.link.prk.lock();
-        let (inbox_id, generation) = {
+        let (inbox_id, generation, salt) = {
             let mut store = self.inner.store.lock();
             let inbox_id = store.local_inbox()?.ok_or(MeshError::NotRegistered)?;
-            (inbox_id, store.discovery_generation()?)
+            (
+                inbox_id,
+                store.discovery_generation()?,
+                store.discovery_reset_salt()?,
+            )
         };
-        let keys = Arc::new(MeshKeys::derive(&prk, &inbox_id, generation));
+        let keys = Arc::new(MeshKeys::derive(
+            &prk,
+            &inbox_id,
+            generation,
+            salt.as_ref(),
+        )?);
         let info = LinkKeyInfo {
             noise_static_pub: keys.noise_public,
             generation,
@@ -71,9 +82,13 @@ impl MeshNode {
     /// Start advertising under a new discovery key (§B14.4): contacts that
     /// have not received the new card stop recognising this phone, which
     /// still recognises them and sends the card on its next contact link.
+    /// The new key mixes in fresh randomness, stored on this phone
+    /// (§B14.1), so no reset ever repeats a key an ex-contact held, even
+    /// after a restore.
     pub fn reset_discovery_key(&self) -> Result<u32, MeshError> {
         let prk = self.inner.link.prk.lock();
         let prk = prk.as_ref().ok_or(MeshError::NoAccountKey)?;
+        let salt = Zeroizing::new(rand::random::<ResetSalt>());
         let (inbox_id, generation) = {
             let mut store = self.inner.store.lock();
             let inbox_id = store.local_inbox()?.ok_or(MeshError::NotRegistered)?;
@@ -83,10 +98,15 @@ impl MeshNode {
                 .ok_or_else(|| {
                     MeshError::InvalidRequest("discovery generation exhausted".into())
                 })?;
-            store.set_discovery_generation(generation)?;
+            store.set_discovery_generation(generation, Some(&*salt))?;
             (inbox_id, generation)
         };
-        *self.inner.link.keys.lock() = Some(Arc::new(MeshKeys::derive(prk, &inbox_id, generation)));
+        *self.inner.link.keys.lock() = Some(Arc::new(MeshKeys::derive(
+            prk,
+            &inbox_id,
+            generation,
+            Some(&*salt),
+        )?));
         self.inner.link.counters.count_discovery_reset();
         self.inner.link.bump_contacts_version();
         Ok(generation)
@@ -643,11 +663,17 @@ impl MeshNode {
         let prk = self.inner.link.prk.lock();
         let prk = prk.as_ref().ok_or(MeshError::NoAccountKey)?;
         let inbox_id = self.local_inbox()?.ok_or(MeshError::NotRegistered)?;
+        let salt = (generation > 0).then(rand::random::<ResetSalt>);
         self.inner
             .store
             .lock()
-            .set_discovery_generation(generation)?;
-        *self.inner.link.keys.lock() = Some(Arc::new(MeshKeys::derive(prk, &inbox_id, generation)));
+            .set_discovery_generation(generation, salt.as_ref())?;
+        *self.inner.link.keys.lock() = Some(Arc::new(MeshKeys::derive(
+            prk,
+            &inbox_id,
+            generation,
+            salt.as_ref(),
+        )?));
         self.inner.link.bump_contacts_version();
         Ok(())
     }
@@ -1092,6 +1118,50 @@ mod tests {
             "restarted with the clock 80 hours back: still over"
         );
         assert!(!a.is_allowed_dialer(&static_of(&c)));
+        drop(a);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn discovery_key_of(node: &MeshNode) -> Vec<u8> {
+        node.own_contact_card().unwrap().discovery_key
+    }
+
+    /// §B14.1 random reset keys: a restore (same account key, empty node)
+    /// starts from the same generation-0 key; resetting after it gives a
+    /// generation-1 key other than the one before the loss.
+    #[test]
+    fn a_reset_after_a_restore_never_repeats_a_key() {
+        let a = keyed(A, 1);
+        let gen0 = discovery_key_of(&a);
+        a.reset_discovery_key().unwrap();
+        let before_loss = discovery_key_of(&a);
+        assert_ne!(before_loss, gen0);
+        a.reset_discovery_key().unwrap();
+        let gen2 = discovery_key_of(&a);
+        let restored = keyed(A, 1);
+        assert_eq!(restored.discovery_generation().unwrap(), 0);
+        assert_eq!(discovery_key_of(&restored), gen0, "a restore yields gen 0");
+        restored.reset_discovery_key().unwrap();
+        assert_eq!(restored.discovery_generation().unwrap(), 1);
+        let after_restore = discovery_key_of(&restored);
+        assert_ne!(after_restore, before_loss, "never the pre-loss gen 1");
+        restored.reset_discovery_key().unwrap();
+        assert_ne!(discovery_key_of(&restored), gen2);
+    }
+
+    /// The reset key survives a restart: its salt is stored with the
+    /// generation.
+    #[test]
+    fn a_reset_key_survives_a_restart() {
+        let path = temp_db("reset_salt");
+        let key = {
+            let a = keyed_at(&path, A, 1);
+            a.reset_discovery_key().unwrap();
+            discovery_key_of(&a)
+        };
+        let a = keyed_at(&path, A, 1);
+        assert_eq!(a.discovery_generation().unwrap(), 1);
+        assert_eq!(discovery_key_of(&a), key);
         drop(a);
         let _ = std::fs::remove_file(&path);
     }
