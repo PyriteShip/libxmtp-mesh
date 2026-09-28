@@ -33,6 +33,8 @@ pub(crate) enum Inbound {
     Plain(Vec<u8>),
     /// This phone's person confirmed (or rejected) the pairing code.
     Pairing { confirm: bool },
+    /// This inbox is no longer a contact: a contact link to it closes.
+    ContactRemoved(String),
 }
 
 /// How a session's link was opened.
@@ -543,6 +545,27 @@ impl Session {
                 self.on_frame(&frame).await
             }
             Inbound::Pairing { confirm } => self.on_pairing_decision(confirm),
+            Inbound::ContactRemoved(inbox_id) => {
+                self.on_contact_removed(&inbox_id);
+                Ok(())
+            }
+        }
+    }
+
+    /// The user removed `inbox_id` (§B14.4): a contact link to it closes
+    /// now, like a superseded link (no failure is counted). That covers a
+    /// verified link and one still proving itself.
+    fn on_contact_removed(&mut self, inbox_id: &str) {
+        let ours = self.link_kind == Some(LinkKind::Contact)
+            && (self.peer_inbox.as_deref() == Some(inbox_id)
+                || self.expected_inbox.as_deref() == Some(inbox_id));
+        if !ours || self.superseded {
+            return;
+        }
+        tracing::info!(peer = %self.peer, "contact removed; closing its link");
+        self.superseded = true;
+        if !self.is_cancelled() {
+            self.transport.disconnect(&self.peer);
         }
     }
 

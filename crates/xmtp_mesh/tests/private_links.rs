@@ -262,6 +262,45 @@ async fn the_radio_learns_each_links_kind() {
     .await;
 }
 
+/// §B14.4: removing a contact closes its open link at once (no failure
+/// counted), and it does not come back as a contact link.
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_contact_closes_its_open_link() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    let c = peer(&hub, "c").await;
+    hub.link("a", "b");
+    hub.link("a", "c");
+    verified_pair(&a, &b).await;
+    verified_pair(&a, &c).await;
+    let before = a.node.mesh_stats();
+    assert!(a.node.remove_contact(&inbox(&b)).unwrap());
+    eventually("a closes b's link", || async { !hub.is_linked("a", "b") }).await;
+    assert!(hub.is_linked("a", "c"), "other contacts stay linked");
+    let after = a.node.mesh_stats();
+    assert_eq!(
+        (after.handshake_failed, after.link_frame_rejected),
+        (before.handshake_failed, before.link_frame_rejected),
+        "a close, not a failure"
+    );
+    hub.link_as(
+        "b",
+        "a",
+        DialIntent::Contact {
+            inbox_id: inbox(&a),
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !a.node
+            .verified_peers()
+            .iter()
+            .any(|p| p.installation == b.installation())
+    );
+    assert_eq!(a.node.mesh_stats().links_contact, before.links_contact);
+}
+
 /// §B14.3 relay link (NN): relay frames flow between strangers; a
 /// Hello, Interest or KeyPackage on the link closes it.
 #[tokio::test(flavor = "multi_thread")]

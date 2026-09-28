@@ -268,15 +268,26 @@ impl MeshNode {
         self.inner.store.lock().contact_by_static(key)
     }
 
-    /// Stop recognising and accepting `inbox_id` (§B14.4). Its static key
-    /// stays on file, so an IK link from it is refused. Follow with
-    /// `reset_discovery_key` so it can no longer recognise this phone.
+    /// Stop recognising and accepting `inbox_id` (§B14.4), and close its
+    /// open contact links. Its static key stays on file, so an IK link from
+    /// it is refused. Follow with `reset_discovery_key` so it can no longer
+    /// recognise this phone.
     pub fn remove_contact(&self, inbox_id: &str) -> Result<bool, MeshError> {
-        let mut store = self.inner.store.lock();
-        let removed = store.remove_contact(inbox_id, Self::now_ns())?;
+        let removed = {
+            let mut store = self.inner.store.lock();
+            let removed = store.remove_contact(inbox_id, Self::now_ns())?;
+            if removed {
+                self.refresh_allowed_dialers(&mut store);
+                self.inner.link.bump_contacts_version();
+            }
+            removed
+        };
         if removed {
-            self.refresh_allowed_dialers(&mut store);
-            self.inner.link.bump_contacts_version();
+            for handle in self.inner.sessions.lock().values() {
+                let _ = handle
+                    .tx
+                    .send(Inbound::ContactRemoved(inbox_id.to_string()));
+            }
         }
         Ok(removed)
     }
