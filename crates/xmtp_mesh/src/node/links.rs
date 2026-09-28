@@ -48,6 +48,17 @@ impl MeshNode {
                 store.discovery_reset_salt()?,
             )
         };
+        if generation > 0 && salt.is_none() {
+            // A generation an older build reset without a salt: its key
+            // cannot be derived any more. Keep the PRK so the app can reset.
+            *prk_slot = Some(prk);
+            *self.inner.link.keys.lock() = None;
+            return Err(MeshError::InvalidRequest(format!(
+                "discovery generation {generation} has no reset salt (stored by an older \
+                 build): call reset_discovery_key, then set_account_key again; contacts \
+                 get the new card on their next contact link, or re-pair in person"
+            )));
+        }
         let keys = Arc::new(MeshKeys::derive(
             &prk,
             &inbox_id,
@@ -332,18 +343,20 @@ impl MeshNode {
     /// identity log proves its inbox, its card is stored as a contact
     /// flagged `auto_added`, which does not get this phone's card until the
     /// user confirms it ([`Self::confirm_restored_contact`]). The window
-    /// survives restarts; a later call never shortens it. Returns its end
-    /// (unix seconds).
+    /// survives restarts. While one is open, a call changes nothing and
+    /// returns its end: it never extends the window. Returns the window's
+    /// end (unix seconds).
     pub fn begin_restore_window(&self) -> Result<u64, MeshError> {
         let now = self.restore_clock();
         let mut store = self.inner.store.lock();
-        let open = store
+        if let Some(until) = store
             .restore_window()?
             .map(|w| w.until)
-            .filter(|&until| restore_window_open(until, now));
-        let until = open
-            .unwrap_or(0)
-            .max(now.saturating_add(RESTORE_WINDOW_SECS));
+            .filter(|&until| restore_window_open(until, now))
+        {
+            return Ok(until);
+        }
+        let until = now.saturating_add(RESTORE_WINDOW_SECS);
         store.set_restore_window(RestoreWindow { until, seen: now })?;
         self.refresh_allowed_dialers(&mut store);
         Ok(until)
@@ -1105,6 +1118,12 @@ mod tests {
             "a clock set back does not move the end"
         );
         assert_eq!(a.begin_restore_window().unwrap(), until, "never shorter");
+        a.set_clock_offset_for_test(HOUR);
+        assert_eq!(
+            a.begin_restore_window().unwrap(),
+            until,
+            "an open window is never extended"
+        );
         a.set_clock_offset_for_test(71 * HOUR);
         assert!(a.is_allowed_dialer(&static_of(&c)));
         a.set_clock_offset_for_test(72 * HOUR + 1);
@@ -1224,6 +1243,27 @@ mod tests {
             a.classify_advert(&seen, u64::MAX).unwrap(),
             AdvertMatch::Contact { .. }
         ));
+    }
+
+    /// A store an older build reset without a salt: `set_account_key`
+    /// says what to do, derives no key, and a reset recovers.
+    #[test]
+    fn a_generation_without_its_reset_salt_asks_for_a_reset() {
+        let a = keyed(A, 1);
+        a.inner
+            .store
+            .lock()
+            .set_discovery_generation(2, None)
+            .unwrap();
+        let err = a.set_account_key(&[1; 32]).unwrap_err();
+        assert!(
+            matches!(&err, MeshError::InvalidRequest(m) if m.contains("reset_discovery_key")),
+            "{err}"
+        );
+        assert!(!a.has_account_key());
+        assert_eq!(a.reset_discovery_key().unwrap(), 3);
+        assert!(a.has_account_key());
+        assert_eq!(a.set_account_key(&[1; 32]).unwrap().generation, 3);
     }
 
     #[test]
