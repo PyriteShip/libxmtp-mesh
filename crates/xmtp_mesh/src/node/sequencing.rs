@@ -220,7 +220,8 @@ impl MeshNode {
         result
     }
 
-    /// Signed-sequencing counters since this node was opened (§B13).
+    /// Signed-sequencing (§B13) and link (§B14) counters since this node
+    /// was opened.
     pub fn mesh_stats(&self) -> MeshStats {
         let mut stats = self.inner.seq.snapshot();
         self.inner.link.counters.fill(&mut stats);

@@ -492,7 +492,7 @@ async fn a_frame_near_the_limit_crosses_as_records() {
     assert_eq!(full, frame_len.div_ceil(65_515));
 }
 
-/// Review focus: message 1 lost on the air (the link was replaced while
+/// Message 1 lost on the air (the link was replaced while
 /// handshaking). The dialer times out once, counted; the next link works;
 /// that stale message 1 arriving on an open link closes it cleanly.
 #[tokio::test(flavor = "multi_thread")]
@@ -535,7 +535,7 @@ async fn a_lost_first_message_times_out_and_the_next_link_works() {
     assert_eq!(b.node.mesh_stats().link_frame_rejected, 1);
 }
 
-/// Review focus: the dialer's message 1 reaches the other phone before its
+/// The dialer's message 1 reaches the other phone before its
 /// radio reported the connection; the implicit accepting session is kept.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_first_message_before_accept_is_kept() {
@@ -555,7 +555,7 @@ async fn a_first_message_before_accept_is_kept() {
     assert_eq!(b.node.mesh_stats().handshake_failed, 0);
 }
 
-/// Review focus: the window changes while a link is mid-handshake; it
+/// Window boundary: the window changes while a link is mid-handshake; it
 /// completes, and the token seen before the boundary still names the
 /// contact after it.
 #[tokio::test(flavor = "multi_thread")]
@@ -1585,7 +1585,7 @@ async fn pairing_needs_pairing_mode_on_both_phones() {
     assert!(a.node.pending_pairings().is_empty());
 }
 
-/// Review focus: re-pairing in person replaces a card a contact link could
+/// Re-pairing in person replaces a card a contact link could
 /// not (an older generation).
 #[tokio::test(flavor = "multi_thread")]
 async fn pairing_replaces_a_stale_card() {

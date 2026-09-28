@@ -269,7 +269,8 @@ pub(crate) struct Session {
     paired: bool,
     /// An open pairing link closes then unless both people confirmed.
     pairing_deadline: Option<Instant>,
-    /// An open relay link closes when no relay frame arrived by then.
+    /// An open relay link closes when no relayed envelope was accepted as
+    /// new by then.
     relay_idle_at: Option<Instant>,
     /// An open relay link closes then however busy it is, so a stranger
     /// cannot hold a radio slot forever (§B14.3).
@@ -983,8 +984,9 @@ impl Session {
         }
         match (self.state, body) {
             (State::RelayOnly, body) => {
-                // Only useful traffic keeps a stranger link open: empty
-                // digests, duplicates or frames while relay is off do not.
+                // Only a relayed envelope accepted as new keeps a stranger
+                // link open: digests, wants, duplicates or frames while
+                // relay is off do not.
                 if self.node.on_relay_frame(&self.peer, body).await {
                     self.relay_idle_at = Some(Instant::now() + self.node.relay_idle_timeout());
                 }

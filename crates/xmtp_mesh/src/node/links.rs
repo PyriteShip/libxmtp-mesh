@@ -183,7 +183,7 @@ impl MeshNode {
             service_data: service_data(flags, &own_token),
             own_token,
             contact_tokens: self.contact_tokens(window)?,
-            next_window_at: (window + 1) * WINDOW_SECS,
+            next_window_at: window.saturating_add(1).saturating_mul(WINDOW_SECS),
             contacts_version: self.inner.link.contacts_version(),
         })
     }
@@ -198,7 +198,7 @@ impl MeshNode {
         let own = keys.own_token(window);
         // Our own advert (or another installation of our inbox, which
         // shares the keys) from a neighbouring window.
-        if [window.saturating_sub(1), window, window + 1]
+        if [window.saturating_sub(1), window, window.saturating_add(1)]
             .into_iter()
             .any(|w| keys.own_token(w) == token)
         {
@@ -224,7 +224,7 @@ impl MeshNode {
         let contacts = self.inner.store.lock().contacts()?;
         let mut out = Vec::with_capacity(contacts.len() * 3);
         for c in contacts {
-            for w in [window.saturating_sub(1), window, window + 1] {
+            for w in [window.saturating_sub(1), window, window.saturating_add(1)] {
                 out.push((advert_token(&c.discovery_key, w), c.inbox_id.clone()));
             }
         }
@@ -931,7 +931,7 @@ mod tests {
         ));
     }
 
-    /// Review focus: a token seen one second before a window boundary still
+    /// Window boundary: a token seen one second before a window boundary still
     /// names the contact one second after it (the radio may classify late);
     /// two windows on it does not.
     #[test]
@@ -1191,6 +1191,21 @@ mod tests {
         assert_eq!(discovery_key_of(&a), key);
         drop(a);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// `now` comes over the FFI: the largest one does not overflow.
+    #[test]
+    fn a_huge_now_does_not_overflow() {
+        let (a, b) = (keyed(A, 1), keyed(B, 2));
+        a.store_contact_card(&b.own_contact_card().unwrap(), false)
+            .unwrap();
+        let state = a.advert_state(u64::MAX).unwrap();
+        assert_eq!(state.next_window_at, u64::MAX);
+        let seen = service_data(0, &b.own_advert_token(u64::MAX).unwrap());
+        assert!(matches!(
+            a.classify_advert(&seen, u64::MAX).unwrap(),
+            AdvertMatch::Contact { .. }
+        ));
     }
 
     #[test]

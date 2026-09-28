@@ -23,12 +23,23 @@ pub type PeerId = String;
 /// - `MeshNode::on_peer_lost(p)` means the pipe is gone.
 /// - `send` must not block (queue and return); `disconnect` asks the radio to
 ///   drop the pipe and later report `on_peer_lost`.
+/// - `send` and `disconnect` must never call back into the node
+///   synchronously (no `on_frame`, `on_peer_lost` or any other node call
+///   from inside them): the node calls them while holding its locks, so a
+///   re-entrant call can deadlock. Queue the work and report it from the
+///   radio's own thread.
 ///
 /// A session that does not authenticate its peer within the handshake
-/// deadline (15 s) is disconnected, and so is a relay link that carries no
-/// relay frame for a minute, so stray frames, devices that never speak the
-/// protocol and idle strangers cannot hold a session (or a radio slot)
-/// forever.
+/// deadline (15 s) is disconnected, and so is a relay link that brings no
+/// new relayed envelope for a minute, or that reached its 10-minute
+/// lifetime, so stray frames, devices that never speak the protocol and
+/// strangers cannot hold a session (or a radio slot) forever. The node
+/// reports each open link's kind (`MeshNode::link_kind`) so the radio can
+/// keep slots for contacts.
+///
+/// A radio that reuses a `PeerId` for the same device (only the test hub
+/// does) also gets a short back-off after a stranger's relay link closes;
+/// with fresh ids it never matches, so it is best effort, not a bound.
 ///
 /// [`LoopbackHub`](super::LoopbackHub) reuses node names as `PeerId`s across
 /// re-links for test readability; the node tolerates that (a re-link starts a
