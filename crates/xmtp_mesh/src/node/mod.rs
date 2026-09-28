@@ -57,7 +57,8 @@ pub(crate) struct NodeInner {
     pub(crate) peer_verify_timeout: Mutex<Duration>,
     /// How long a session has to complete its Noise handshake and Hello/Auth.
     pub(crate) handshake_timeout: Mutex<Duration>,
-    /// How long an open relay link may go without a relay frame.
+    /// How long an open relay link may go without a relayed envelope
+    /// accepted as new.
     pub(crate) relay_idle_timeout: Mutex<Duration>,
     /// How long a relay link may stay open at all.
     pub(crate) relay_link_lifetime: Mutex<Duration>,

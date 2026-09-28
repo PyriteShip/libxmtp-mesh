@@ -14,8 +14,8 @@ use tokio::sync::broadcast::error::RecvError;
 use xmtp_api_d14n::ClientBundle;
 use xmtp_mesh::{
     AdvertMatch, AdvertState, ClientGroupMembership, ClientHelloSigner, ClientRelayExporter,
-    Contact, DialIntent, LinkRole, MAX_FRAME_LEN, MeshError, MeshNode, MeshStats, MeshTransport,
-    NodeEvent, PeerId, RelayStats, ResyncOutcome, VerifiedPeer,
+    Contact, DialIntent, LinkKind, LinkRole, MAX_FRAME_LEN, MeshError, MeshNode, MeshStats,
+    MeshTransport, NodeEvent, PeerId, RelayStats, ResyncOutcome, VerifiedPeer,
 };
 use xmtp_mls::client::ClientError;
 use xmtp_mls::identity::IdentityError;
@@ -331,6 +331,27 @@ impl From<FfiLinkRole> for LinkRole {
             FfiLinkRole::DialRelay => LinkRole::Dial(DialIntent::Relay),
             FfiLinkRole::DialPairing => LinkRole::Dial(DialIntent::Pairing),
             FfiLinkRole::Accept => LinkRole::Accept,
+        }
+    }
+}
+
+/// The kind of an open link (DESIGN.md §B14.3), from `link_kind`.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FfiLinkKind {
+    /// Noise IK between contacts.
+    Contact,
+    /// Noise NN with a stranger: relay traffic only.
+    Relay,
+    /// Noise XX in pairing mode.
+    Pairing,
+}
+
+impl From<LinkKind> for FfiLinkKind {
+    fn from(kind: LinkKind) -> Self {
+        match kind {
+            LinkKind::Contact => Self::Contact,
+            LinkKind::Relay => Self::Relay,
+            LinkKind::Pairing => Self::Pairing,
         }
     }
 }
@@ -836,6 +857,14 @@ impl FfiMeshNode {
     /// too.
     pub fn remove_contact(&self, inbox_id: String) -> Result<bool, FfiError> {
         self.node.remove_contact(&inbox_id).map_err(mesh_error)
+    }
+
+    /// The kind of `peer_id`'s open link (DESIGN.md §B14.3), or `None`
+    /// while its handshake runs or with no link. The radio reserves slots
+    /// for contacts with it: cap relay links (for example 2 of 4) and close
+    /// one when a contact's advert is seen with every slot taken.
+    pub fn link_kind(&self, peer_id: String) -> Option<FfiLinkKind> {
+        self.node.link_kind(&peer_id).map(Into::into)
     }
 
     /// Open the restore window (DESIGN.md §B14.7): call once when the app
@@ -2072,6 +2101,8 @@ mod tests {
         .join()
         .unwrap();
         confirm_pairings(&node_a, "b#1", &node_b, "a#1").await;
+        assert_eq!(node_a.link_kind("b#1".into()), Some(FfiLinkKind::Pairing));
+        assert_eq!(node_a.link_kind("nobody".into()), None);
 
         eventually("both hold the other's card", || async {
             node_a

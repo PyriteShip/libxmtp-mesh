@@ -370,20 +370,15 @@ impl RelayEngine {
 
     // ---- frames ----
 
-    /// Handle one relay frame. Returns whether it was useful traffic: a
-    /// digest or want naming at least one id, or an envelope newly
-    /// accepted into the spool (what keeps a stranger link open, §B14.3).
+    /// Handle one relay frame. Returns whether it was useful traffic: an
+    /// envelope newly accepted into the spool, the one thing that keeps a
+    /// stranger link open (§B14.3). Digests and wants never count: any
+    /// peer can make up ids to name.
     pub(crate) async fn on_frame(self: &Arc<Self>, peer: &str, body: Body) -> bool {
         let mut useful = false;
         let result = match body {
-            Body::SpoolDigest(d) => {
-                useful = self.names_an_id(&d.ids);
-                self.on_digest(peer, d)
-            }
-            Body::SpoolWant(w) => {
-                useful = self.names_an_id(&w.ids);
-                self.on_want(peer, w)
-            }
+            Body::SpoolDigest(d) => self.on_digest(peer, d),
+            Body::SpoolWant(w) => self.on_want(peer, w),
             Body::Relay(env) => self.on_relay(peer, env).await.map(|new| useful = new),
             Body::RelayKeyOffer(o) => self.on_key_offer(peer, o).await,
             Body::RelayKeyAck(a) => self.on_key_ack(peer, a).await,
@@ -402,14 +397,6 @@ impl RelayEngine {
                 false
             }
         }
-    }
-
-    /// Whether a digest or want names at least one id this engine would
-    /// read (8 bytes, within the first `max_entries`).
-    fn names_an_id(&self, ids: &[Vec<u8>]) -> bool {
-        ids.iter()
-            .take(self.cfg.max_entries)
-            .any(|id| id.len() == 8)
     }
 
     fn on_digest(&self, peer: &str, d: SpoolDigest) -> Result<(), MeshError> {

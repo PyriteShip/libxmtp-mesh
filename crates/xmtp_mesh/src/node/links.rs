@@ -6,6 +6,7 @@ use zeroize::Zeroizing;
 
 use super::MeshNode;
 use crate::MeshError;
+use crate::link::LinkKind;
 #[cfg(any(test, feature = "test-utils"))]
 use crate::link::LinkRole;
 use crate::link::keys::{AccountPrk, MeshKeys, ResetSalt};
@@ -243,6 +244,18 @@ impl MeshNode {
             .map(|(_, inbox_id)| inbox_id))
     }
 
+    /// The kind of `peer`'s open link (§B14.3), or `None` while its
+    /// handshake runs or with no link. The radio uses it to keep slots
+    /// for contacts: for example, cap relay links and close one when a
+    /// contact's advert is seen with every slot taken.
+    pub fn link_kind(&self, peer: &str) -> Option<LinkKind> {
+        self.inner
+            .sessions
+            .lock()
+            .get(peer)
+            .and_then(|h| h.link.kind())
+    }
+
     pub fn contacts(&self) -> Result<Vec<Contact>, MeshError> {
         self.inner.store.lock().contacts()
     }
@@ -375,8 +388,11 @@ impl MeshNode {
 
     /// This phone closed `peer`'s relay link (idle, at the lifetime cap, for
     /// a rejected frame, or relay off): refuse it as a stranger for the
-    /// back-off (§B14.3), so
-    /// reconnecting cannot hold a radio slot.
+    /// back-off (§B14.3). Best effort only: it matches only a radio that
+    /// reuses the `PeerId`, while the transport contract asks for a fresh
+    /// one per connection, and a stranger has no stable identity to key it
+    /// on (it can change its address too). The bounds on strangers are the
+    /// idle timer, the lifetime cap and the per-window caps.
     pub(crate) fn back_off_relay_peer(&self, peer: &str) {
         let now = std::time::Instant::now();
         let until = now + *self.inner.relay_backoff.lock();

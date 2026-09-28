@@ -2,7 +2,7 @@
 //! engine share it, so every frame, relayed ones included, is sealed and
 //! handed to the radio in one order.
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use parking_lot::Mutex;
 
@@ -20,11 +20,22 @@ enum TxState {
     Plain,
 }
 
+/// `LinkTx::kind` values.
+const KIND_NONE: u8 = 0;
+const KIND_CONTACT: u8 = 1;
+const KIND_RELAY: u8 = 2;
+const KIND_PAIRING: u8 = 3;
+
 pub(crate) struct LinkTx {
     peer: PeerId,
+    /// The open link's kind, readable without `state`'s lock: `state` is
+    /// held across `MeshTransport::send`, and callers that hold the node's
+    /// `sessions` lock (closing relay links, the radio's `link_kind`) must
+    /// never wait on it.
     transport: Arc<dyn MeshTransport>,
     /// The session's cancel flag: a replaced session never sends.
     cancelled: Arc<AtomicBool>,
+    kind: AtomicU8,
     state: Mutex<TxState>,
     /// Test only: sees every frame this link sends, before sealing.
     tap: Option<Arc<dyn MeshTransport>>,
@@ -42,6 +53,7 @@ impl LinkTx {
             peer,
             transport,
             cancelled,
+            kind: AtomicU8::new(KIND_NONE),
             state: Mutex::new(if plain {
                 TxState::Plain
             } else {
@@ -67,11 +79,28 @@ impl LinkTx {
     /// The handshake opened a `kind` link: seal from now on.
     pub(crate) fn open(&self, records: Arc<Records>, kind: LinkKind) {
         *self.state.lock() = TxState::Open(records, kind);
+        let value = match kind {
+            LinkKind::Contact => KIND_CONTACT,
+            LinkKind::Relay => KIND_RELAY,
+            LinkKind::Pairing => KIND_PAIRING,
+        };
+        self.kind.store(value, Ordering::Release);
     }
 
-    /// An open relay (stranger) link.
+    /// The open link's kind; `None` while the handshake runs (and on a
+    /// test cleartext link). Takes no lock.
+    pub(crate) fn kind(&self) -> Option<LinkKind> {
+        match self.kind.load(Ordering::Acquire) {
+            KIND_CONTACT => Some(LinkKind::Contact),
+            KIND_RELAY => Some(LinkKind::Relay),
+            KIND_PAIRING => Some(LinkKind::Pairing),
+            _ => None,
+        }
+    }
+
+    /// An open relay (stranger) link. Takes no lock.
     pub(crate) fn is_relay_only(&self) -> bool {
-        matches!(&*self.state.lock(), TxState::Open(_, LinkKind::Relay))
+        self.kind() == Some(LinkKind::Relay)
     }
 
     /// Send one frame. Returns whether it went out: not when the session

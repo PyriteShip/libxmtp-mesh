@@ -17,7 +17,7 @@ use xmtp_db::group::GroupQueryArgs;
 use xmtp_mesh::frames::{self, Auth, Hello, Interest, KeyPackage, SpoolWant, frame::Body};
 use xmtp_mesh::link::{WINDOW_SECS, service_data};
 use xmtp_mesh::{
-    AdvertMatch, DialIntent, LoopbackHub, MAX_FRAME_LEN, MeshError, MeshNode, RelayConfig,
+    AdvertMatch, DialIntent, LinkKind, LoopbackHub, MAX_FRAME_LEN, MeshError, MeshNode, RelayConfig,
 };
 use xmtp_mesh::{HelloSigner, LinkRole, MeshTransport, PeerId};
 
@@ -227,6 +227,39 @@ async fn records_are_padded_so_link_kinds_and_identity_logs_look_alike() {
             .unwrap()
     };
     assert_eq!(log_record(&rec_a, "b"), log_record(&rec_b, "a"));
+}
+
+/// The radio learns each open link's kind (§B14.3), so it can keep radio
+/// slots for contacts.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_radio_learns_each_links_kind() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    assert_eq!(a.node.link_kind("b"), None);
+    hub.link("a", "b");
+    verified_pair(&a, &b).await;
+    assert_eq!(a.node.link_kind("b"), Some(LinkKind::Contact));
+    assert_eq!(b.node.link_kind("a"), Some(LinkKind::Contact));
+    let (c, _) = relay_peer(&hub, "c").await;
+    let (d, _) = relay_peer(&hub, "d").await;
+    hub.set_strangers("c", "d");
+    hub.link("c", "d");
+    eventually("a relay link", || async {
+        c.node.link_kind("d") == Some(LinkKind::Relay)
+            && d.node.link_kind("c") == Some(LinkKind::Relay)
+    })
+    .await;
+    let e = peer(&hub, "e").await;
+    let f = peer(&hub, "f").await;
+    open_pairing(&hub, &e, &f).await;
+    assert_eq!(e.node.link_kind("f"), Some(LinkKind::Pairing));
+    assert_eq!(f.node.link_kind("e"), Some(LinkKind::Pairing));
+    hub.unlink("a", "b");
+    eventually("gone with the link", || async {
+        a.node.link_kind("b").is_none()
+    })
+    .await;
 }
 
 /// §B14.3 relay link (NN): relay frames flow between strangers; a
@@ -679,28 +712,32 @@ async fn relay_strangers(
     (a, b)
 }
 
-fn digest(ids: usize) -> Vec<u8> {
-    frames::encode(Body::SpoolDigest(frames::SpoolDigest {
-        ids: vec![vec![9u8; 8]; ids],
-    }))
-}
-
-/// §B14.3: empty digests trickled in just under the idle bound do not keep
-/// a stranger link open; only useful relay traffic does.
+/// §B14.3: digests and wants trickled in just under the idle bound do not
+/// keep a stranger link open, however well-formed their ids (anyone can
+/// make ids up); only relayed envelopes accepted as new do.
 #[tokio::test(flavor = "multi_thread")]
-async fn empty_digests_do_not_keep_a_relay_link_open() {
+async fn digests_and_wants_do_not_keep_a_relay_link_open() {
     let hub = LoopbackHub::new();
     let (_a, b) = relay_strangers(&hub, Duration::from_millis(600), Duration::from_secs(60)).await;
-    for _ in 0..6 {
+    for n in 0..6u8 {
         if !hub.is_linked("a", "b") {
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
-        hub.inject("a", "b", digest(0));
+        let ids: Vec<Vec<u8>> = (0..4u8).map(|i| vec![n, i, 1, 2, 3, 4, 5, 6]).collect();
+        hub.inject(
+            "a",
+            "b",
+            frames::encode(if n % 2 == 0 {
+                Body::SpoolDigest(frames::SpoolDigest { ids })
+            } else {
+                Body::SpoolWant(SpoolWant { ids })
+            }),
+        );
     }
     assert!(
         !hub.is_linked("a", "b"),
-        "closed while the empty digests kept coming"
+        "closed while the digests and wants kept coming"
     );
     let stats = b.node.mesh_stats();
     assert_eq!(
@@ -716,7 +753,7 @@ async fn empty_digests_do_not_keep_a_relay_link_open() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_busy_relay_link_closes_at_its_lifetime_cap() {
     let hub = LoopbackHub::new();
-    let (_a, b) = relay_strangers(
+    let (a, b) = relay_strangers(
         &hub,
         Duration::from_millis(500),
         Duration::from_millis(1500),
@@ -724,7 +761,8 @@ async fn a_busy_relay_link_closes_at_its_lifetime_cap() {
     .await;
     let start = std::time::Instant::now();
     while hub.is_linked("a", "b") && start.elapsed() < Duration::from_secs(10) {
-        hub.inject("a", "b", digest(1));
+        // A new envelope for b every 150 ms: useful traffic.
+        a.node.originate_random_for_test(100, 5);
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
     assert!(!hub.is_linked("a", "b"));
