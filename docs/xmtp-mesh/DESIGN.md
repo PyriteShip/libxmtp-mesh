@@ -75,7 +75,7 @@ Goals of the base mesh:
 | D33 | Contact links use Noise IK, accepted only from a live contact, or during a restore window from a static that is no removed contact's; pairing uses Noise XX on throwaway static keys with a commit-then-reveal 6-digit code, and the real static travels in the contact card once both people confirmed (§B14.3, §B14.4, §B14.7) | Noise KK (a restored phone that lost its contacts could not answer); XX everywhere, or pairing XX with the real static (shows the static to whoever answers); accepting any IK dialer while a phone has no contacts (a stranger holding the static becomes a contact) |
 | D34 | The Noise static key and the generation-0 discovery key are derived from the account key the recovery phrase restores; every discovery reset mixes in a random salt stored on the phone (§B14.1) | Random keys (a restored phone could not be recognised or dialed); resets derived from the generation alone (a restore brings back every key an ex-contact held) |
 | D35 | Contact and relay links look alike on the air: every first message is 128 bytes, message 2 is the same size, every record is padded to a size bucket, stale or replayed IK is answered like a stranger, and the responder tries IK, then NN (§B14.2, §B14.3) | Distinct first messages or exact record sizes (a sniffer learns who are contacts, and recognises a phone by the size of its identity log) |
-| D36 | Hard cut: mesh.11 talks only to mesh.11 (advert version 2, Noise prologue `xmtp-mesh-link-v1`, `Hello.link = 1`, Auth text v2) | A transition period |
+| D36 | Hard cut: mesh.11 talks only to mesh.11 (advert version 2, Noise prologue `xmtp-mesh-link-v1`, `Hello.link = 1`, Auth text v2). A mesh.10 phone and a mesh.11 phone do not see each other at all: mesh.11 never dials a version-1 advert and refuses a version-1 link Hello. | A transition period |
 
 ### Private discovery (D31–D36)
 
@@ -322,8 +322,8 @@ advertising address. Only contacts can match it to a phone (§B14.2).
   peripheral notifies on TX (…0003).
 - Request MTU 517 and adapt to the granted MTU.
 - Link packets (big-endian): `Hello{version, token, flags, window}` (the
-  token is this phone's current advert token, §B14.2; `window` is the
-  flow-control window),
+  8-byte token field is all zeros, §B14.2; `window` is the flow-control
+  window),
   `Data{msg_id, index, count, payload}`, `Ack{msg_id, index}`, `Probe`,
   `ProbeAck`, `Bye{reason}`. `ReliableLink` gives an ordered, reliable frame
   pipe over one connection: frames are chunked (u16 index/count, so at a small
@@ -342,9 +342,18 @@ advertising address. Only contacts can match it to a phone (§B14.2).
   a peer is connected or was seen in the last minute. Android throttles apps
   that start scanning more than 5 times per 30 s, so no cycle is shorter than
   6 s.
-- At most 4 concurrent connections. The phone with the lower advert token
-  dials (§B14.2); the higher one dials only as a fallback 45 s later, so both
-  rarely dial at once.
+- At most 4 concurrent connections, at most 2 of them relay links. A
+  contact or pairing dial with every slot taken closes the oldest relay
+  link; relay links that dialed in beyond 2 are closed once the node
+  reports their kind (`link_kind`).
+- Every connection gets a fresh PeerId; the radio has no stable peer
+  identity. A contact dial that never verifies (the other phone removed us,
+  or holds an older card) backs off that contact (30 s doubling to
+  10 min); a relay link the node closed, or a link Hello from an older
+  version, cools that device down for 2 min (best effort: addresses
+  rotate).
+- The phone with the lower advert token dials (§B14.2); the higher one dials
+  only as a fallback 45 s later, so both rarely dial at once.
 - Two contact links to one phone (both dialed) are resolved by the node: both
   phones keep the one dialed by the lower Noise static key (§B14.3).
 - GATT status 133 (the usual failure) and other connect errors: per-peer
@@ -684,14 +693,20 @@ inside the link (§B14.4).
 ### B14.2 Adverts, tokens and dialing (D32, D35)
 
 - **Service data:** `version (= 2) ‖ flags ‖ token (8)`, 10 bytes. Flag
-  `0x01`: pairing mode; `0x02`: relay offered. Nothing else in the advert,
-  scan response or GATT database names the phone; the service and
-  characteristic UUIDs are the same on every phone. Any other version is
-  ignored.
+  `0x01`: pairing mode; `0x02`: relay offered. Nothing else in the advert
+  or scan response names the phone, and the mesh's own GATT service and
+  characteristic UUIDs are the same on every phone. The platform's GATT
+  database is another matter (see the known limits below). Any other
+  version is ignored.
 - **Token:** the first 8 bytes of `HMAC-SHA256(discovery_key,
-  u64_be(window))`, `window = floor(unix_seconds / 900)`. At every boundary
-  the radio stops and restarts advertising, so the token and the random
-  address change together.
+  u64_be(window))`, `window = floor(unix_seconds / 900)`. At every boundary,
+  and whenever the token changes inside a window (a discovery-key reset), the
+  radio starts a new advertising set, so the token and the random address
+  change together; a flag change updates the running set. The radio checks
+  the clock on a short tick, on BLE events and on an inexact while-idle alarm
+  at the boundary. In Doze the platform rate-limits such alarms (minutes
+  apart), so a phone can keep the previous token for some minutes; contacts
+  match tokens for `w-1 ..= w+1`, which absorbs up to one window of lateness.
 - **`advert_state(now)`** gives the radio its service data, its own token,
   the next boundary (`next_window_at`), and every live contact's tokens for
   windows `w-1`, `w`, `w+1` (up to 15 minutes of clock skew). Its
@@ -706,8 +721,48 @@ inside the link (§B14.4).
   contact as `Dial(Contact{inbox})`, a pairing phone as `Dial(Pairing)`, and
   a stranger as `Dial(Relay)` only when the stranger offers relay and our
   relay is on.
-- The link-layer Hello (§B7.1) carries the token in place of the old short
-  id.
+- The link-layer Hello (§B7.1) carries no token: its 8-byte token field
+  (where the old short id was) is 8 zero bytes, and nothing reads it. The
+  dialer connects from the adapter's own address, which rotates on the
+  platform's timer rather than with the window, so its token there would
+  tie that address to its tokens across windows.
+
+The Android radio starts a new advertising set at every window and at every
+new token, and changes the data on the running set for a flag change inside a
+window. It re-reads the advert state when `contacts_version` moves (contacts,
+keys, pairing mode, the relay switch), checks the clock on a 5 s tick and on
+BLE events, and arms an inexact while-idle alarm at the boundary for Doze; a
+late rotation keeps the old token for up to a few minutes, which contacts
+still match (w ± 1).
+
+**Known limits (Android radio).**
+
+- Android before API 26, or a controller with a single advertising instance,
+  may reuse the advertising address across advertising set restarts; the
+  address then rotates on the platform's own timer, not with the token.
+- The platform may also change the set's address inside a window on its
+  own timer (seen 8–14 minutes in on API 32 and 36); the token does not
+  change with it, and an address never carries two tokens.
+- Active scanning sends SCAN_REQ from the scanner's own address, which
+  rotates on the platform timer, not on the 15-minute window.
+- **The Bluetooth device name.** Android always serves the Generic Access
+  service (0x1800) with a readable Device Name (0x2A00) set to the
+  adapter's name, and the stack answers that read before the app sees the
+  link. Any phone that connects (a stranger's relay dial, or an inbound
+  connection while a slot is free) can read it, and the name is the model
+  by default and often the owner's name: a stable identifier the advert
+  rotation does not touch. The GATT database also lists other apps'
+  services (and a Database Hash on Android 12+), a further stable
+  fingerprint. The mesh cannot change either without renaming the user's
+  adapter, which is global; apps should tell users to give the phone a
+  plain Bluetooth name.
+- Eviction side channel: a relay peer whose link we close to make room can
+  infer that our next dial is to a contact or a pairing partner, until our
+  advert next rotates (at most one 15-minute window).
+- Native key copy: `Mesh.start` wipes the account key on the Kotlin side
+  after `setAccountKey` returns, and the Rust side zeroizes its own copy. The
+  copy uniffi's transfer buffer (RustBuffer) makes while crossing the FFI is
+  not wiped.
 
 **Which dialers get a contact link.** A responder accepts an IK message 1
 (§B14.3) only if all of these hold:
@@ -830,13 +885,26 @@ The radio reports how each link opened (`on_peer_connected(peer, role)`):
     contact) is refused and closes the link, counted; the store's index on
     static keys is unique. So a pairing partner cannot take over another
     contact's key, which would send that contact's dials to it.
+  - **A key claimed first.** A confirmed pairing partner can put someone
+    else's static key in its card before that person has paired with this
+    phone. The card is stored, because the key is not on file yet; the real
+    owner's later pairing is then refused (`StaticTaken`), and
+    `pairing_refusals` names the contact holding the key so the app can say
+    so. Nothing leaks and no dial is taken over (the partner cannot finish IK
+    as a key it does not hold); the cost is one blocked pairing, and it needs
+    an in-person, code-confirmed partner. `forget_contact` drops that
+    contact's row and tombstone, which frees the key; then pair again. After
+    a refused pairing the other phone may have stored this phone's card while
+    this phone stored nothing; pairing again fixes both sides.
   - Storing: a new inbox is added; a newer generation with the same static
     key replaces the stored card. An older generation, a different static
     key for a known inbox, or a removed contact's card is ignored; only a
     confirmed pairing replaces those.
 - **Reset** (`reset_discovery_key`): the phone advertises only the new
-  token. Contacts that have not yet received the new card stop recognising
-  it, but it still recognises them, dials them and sends the new card.
+  token. The new card goes at once on every open contact link and every
+  open pairing link both people finished; otherwise on the next contact
+  link. Contacts that have not yet received it stop recognising the phone,
+  but it still recognises them, dials them and sends the new card.
 - **Removed contacts** (`remove_contact`) keep a tombstone: their tokens are
   no longer matched, and an IK dialer with their static key is answered as
   a stranger (§B14.2), during a restore window too. Their open contact
@@ -863,8 +931,9 @@ The radio reports how each link opened (`on_peer_connected(peer, role)`):
   `PairConfirm`; any other frame closes it. The dialer speaks first here
   too. Then Hello/Auth, identity logs, key packages and cards follow as on
   a contact link. The other phone's card is stored once, forced: it
-  replaces any card or removal stored for that inbox; later cards on the
-  link are ignored. `reject_pairing` closes the link, and so does waiting
+  replaces any card or removal stored for that inbox. A later card on the
+  link (a reset) is stored like a contact card: only a newer generation
+  with the same static key replaces it. `reject_pairing` closes the link, and so does waiting
   120 s for the confirmations.
 - **Pairing mode ends** after a successful pairing, after 5 unfinished
   pairings (failed, rejected, timed out or dropped) since it was turned on
@@ -938,6 +1007,11 @@ never cross the FFI.
   Contacts that held a later generation cannot recognise the restored
   phone, and it cannot recognise them: neither side dials, so they re-pair
   in person.
+- **Two contacts that both reset apart.** A reset's card reaches a
+  contact on an open link at once, or when the resetting phone next dials
+  it. If two contacts both reset before either receives the other's card,
+  each holds only the other's old key, so neither recognises the other and
+  neither dials: they must pair again in person.
 - **A store at a generation after 0 without its reset salt** (reset by an
   older build) cannot derive its discovery key: `set_account_key` refuses
   with an error saying to call `reset_discovery_key` (which draws a salt)
@@ -1754,6 +1828,10 @@ cannot read hop counts, spool digests or group ids on a link. What remains
    identity log; the number of records, their buckets and their timing
    still show how much a link carries and when.
 10. **iOS.** Rotating tokens in adverts are Android-only for now (§B14.7).
+11. **The phone's Bluetooth name.** Any phone that connects can read the
+    adapter's device name from the platform's Generic Access service, and
+    the platform's GATT database lists other apps' services; both are
+    stable across windows (§B14.2 known limits).
 
 **Claims to avoid** in apps, store listings and docs built on this:
 *anonymous*, *untraceable*, *metadata-free*, *protest-safe*, *relays learn

@@ -12,9 +12,10 @@ messages for each other (multi-hop, store-carry-forward).
 > records), but radio fingerprinting, ex-contacts, a restored phone's
 > 72-hour restore window, relay spool digests and timing remain, and
 > relayed traffic is relay-blind but not anonymous. Private discovery and Noise links (§B14)
-> are implemented in the Rust core and the FFI and tested in the simulator;
-> the Android radio does not use them yet, and its Kotlin callers must be
-> updated for the new FFI before it builds against it. Multi-hop relay is verified in
+> are implemented in the Rust core and the FFI and tested in the simulator.
+> The Android radio (mesh.11) advertises the rotating tokens, dials by the
+> node's classification, and exposes pairing, contacts and the restore
+> window through `Mesh`. Multi-hop relay is verified in
 > the simulator; multi-hop on three or more real phones is not yet tested.
 > Read [DESIGN.md §R9](DESIGN.md#r9-what-this-does-not-protect),
 > [§B14.7](DESIGN.md#b147-what-this-does-not-fix) and
@@ -67,7 +68,7 @@ sdks/android/dev/publish-mesh-local
 
 A React Native app consumes the result through the companion React Native SDK
 fork, which depends on `org.xmtp:android` at the version in
-`sdks/android/gradle.properties` (for example `4.10.0-rc2-mesh.10`), resolved
+`sdks/android/gradle.properties` (for example `4.10.0-rc2-mesh.11`), resolved
 from the local Maven repository that `publish-mesh-local` writes.
 
 ## Testing
