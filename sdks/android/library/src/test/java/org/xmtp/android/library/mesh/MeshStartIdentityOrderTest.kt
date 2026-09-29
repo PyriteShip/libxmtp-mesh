@@ -10,7 +10,7 @@ import java.io.File
  * once. [Mesh.start] must subscribe the identity stream before it starts sync, or that event
  * goes out before anyone listens and the re-base waits a whole launch. A Service/FFI node can't
  * be opened in a plain JVM test, so this reads the source (comments stripped), the same
- * technique as [MeshStartShortIdTest].
+ * technique as [MeshStartKeyOrderTest].
  */
 class MeshStartIdentityOrderTest {
     private val code =

@@ -4,17 +4,20 @@ package org.xmtp.android.library.mesh.link
 sealed class LinkPacket {
     abstract fun encode(): ByteArray
 
-    /** First packet each way. The central sends first; the peripheral answers. */
+    /**
+     * First packet each way. The central sends first; the peripheral answers. [token] is 8 zero
+     * bytes: the field stays for the wire format, and nothing reads it (DESIGN.md §B14.2).
+     */
     class Hello(
         val version: Int,
-        val shortId: ByteArray,
+        val token: ByteArray,
         val flags: Int,
         val window: Int,
     ) : LinkPacket() {
         val codedHint: Boolean get() = (flags and FLAG_CODED_HINT) != 0
 
         override fun encode(): ByteArray =
-            byteArrayOf(TYPE_HELLO.toByte(), version.toByte()) + shortId +
+            byteArrayOf(TYPE_HELLO.toByte(), version.toByte()) + token +
                 byteArrayOf(flags.toByte(), window.toByte())
     }
 
@@ -75,8 +78,8 @@ sealed class LinkPacket {
     }
 
     companion object {
-        const val LINK_VERSION = 1
-        const val SHORT_ID_BYTES = 8
+        const val LINK_VERSION = 2
+        const val TOKEN_BYTES = 8
         const val FLAG_CODED_HINT = 0x01
         const val DATA_HEADER_BYTES = 7
         const val BYE_NORMAL = 0
@@ -87,7 +90,7 @@ sealed class LinkPacket {
         private const val TYPE_PROBE = 0x04
         private const val TYPE_PROBE_ACK = 0x05
         private const val TYPE_BYE = 0x06
-        private const val HELLO_BYTES = 2 + SHORT_ID_BYTES + 2
+        private const val HELLO_BYTES = 2 + TOKEN_BYTES + 2
 
         /** Returns null for anything malformed or unknown; callers ignore null. */
         fun decode(bytes: ByteArray): LinkPacket? {
@@ -97,7 +100,7 @@ sealed class LinkPacket {
                     if (bytes.size < HELLO_BYTES) {
                         null
                     } else {
-                        Hello(u8(bytes, 1), bytes.copyOfRange(2, 2 + SHORT_ID_BYTES), u8(bytes, 10), u8(bytes, 11))
+                        Hello(u8(bytes, 1), bytes.copyOfRange(2, 2 + TOKEN_BYTES), u8(bytes, 10), u8(bytes, 11))
                     }
                 TYPE_DATA -> {
                     if (bytes.size <= DATA_HEADER_BYTES) return null

@@ -11,13 +11,24 @@ class LinkPacketTest {
     private val id = ByteArray(8) { (it + 1).toByte() }
 
     @Test
+    fun theHelloCarriesTheAdvertTokenAtVersion2() {
+        val token = ByteArray(8) { 9 }
+        val hello =
+            LinkPacket.decode(
+                LinkPacket.Hello(LinkPacket.LINK_VERSION, token, 0, 4).encode(),
+            ) as LinkPacket.Hello
+        assertEquals(2, hello.version)
+        assertArrayEquals(token, hello.token)
+    }
+
+    @Test
     fun every_packet_type_round_trips() {
         val hello =
             LinkPacket.decode(
                 LinkPacket.Hello(1, id, LinkPacket.FLAG_CODED_HINT, 4).encode(),
             ) as LinkPacket.Hello
         assertEquals(1, hello.version)
-        assertArrayEquals(id, hello.shortId)
+        assertArrayEquals(id, hello.token)
         assertTrue(hello.codedHint)
         assertEquals(4, hello.window)
 

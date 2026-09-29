@@ -41,17 +41,31 @@ grep -q 'org/xmtp/android/library/mesh/MeshIdentityEvents.class' <<<"$CLASSES_LI
 grep -q 'org/xmtp/android/library/mesh/MeshRelayState.class' <<<"$CLASSES_LISTING" || fail "MeshRelayState (relay switch) missing"
 grep -q 'uniffi/xmtpv3/FfiRelayStats.class' <<<"$CLASSES_LISTING" || fail "FfiRelayStats missing"
 grep -q 'uniffi/xmtpv3/FfiMeshStats.class' <<<"$CLASSES_LISTING" || fail "FfiMeshStats (signed sequencing) missing"
-for sym in uniffi_xmtpv3_fn_method_ffimeshnode_stream_identity uniffi_xmtpv3_fn_method_ffixmtpclient_mesh_rebase_signature_request uniffi_xmtpv3_fn_method_ffimeshnode_enable_relay uniffi_xmtpv3_fn_method_ffimeshnode_disable_relay uniffi_xmtpv3_fn_method_ffimeshnode_relay_enabled uniffi_xmtpv3_fn_method_ffimeshnode_relay_stats uniffi_xmtpv3_fn_method_ffimeshnode_mesh_stats; do
+grep -q 'uniffi/xmtpv3/FfiPairingRefusal.class' <<<"$CLASSES_LISTING" || fail "FfiPairingRefusal (private discovery) missing"
+grep -q 'org/xmtp/android/library/mesh/policy/DialPlanner.class' <<<"$CLASSES_LISTING" || fail "DialPlanner (private discovery radio) missing"
+grep -q 'org/xmtp/android/library/mesh/policy/AdvertClock.class' <<<"$CLASSES_LISTING" || fail "AdvertClock (advert rotation) missing"
+grep -q 'org/xmtp/android/library/mesh/MeshPairingState.class' <<<"$CLASSES_LISTING" || fail "MeshPairingState (Mesh pairing API) missing"
+if grep -q 'org/xmtp/android/library/mesh/MeshIdentity.class' <<<"$CLASSES_LISTING"; then fail "stale MeshIdentity (short id) in the AAR"; fi
+for sym in uniffi_xmtpv3_fn_method_ffimeshnode_stream_identity uniffi_xmtpv3_fn_method_ffixmtpclient_mesh_rebase_signature_request uniffi_xmtpv3_fn_method_ffimeshnode_enable_relay uniffi_xmtpv3_fn_method_ffimeshnode_disable_relay uniffi_xmtpv3_fn_method_ffimeshnode_relay_enabled uniffi_xmtpv3_fn_method_ffimeshnode_relay_stats uniffi_xmtpv3_fn_method_ffimeshnode_mesh_stats uniffi_xmtpv3_fn_method_ffimeshnode_set_account_key uniffi_xmtpv3_fn_method_ffimeshnode_advert_state uniffi_xmtpv3_fn_method_ffimeshnode_classify_advert uniffi_xmtpv3_fn_method_ffimeshnode_link_kind uniffi_xmtpv3_fn_method_ffimeshnode_begin_restore_window uniffi_xmtpv3_fn_method_ffimeshnode_forget_contact uniffi_xmtpv3_fn_method_ffimeshnode_pairing_refusals uniffi_xmtpv3_fn_method_ffimeshnode_contacts_version; do
   [[ "$(grep -a -c "$sym" "$TMP/jni/arm64-v8a/libuniffi_xmtpv3.so" || true)" -ge 1 ]] \
     || fail "$sym missing from the native library"
 done
 grep -q 'BLUETOOTH_SCAN' "$TMP/AndroidManifest.xml" || fail "BLE permissions missing from manifest"
 grep -q 'MeshForegroundService' "$TMP/AndroidManifest.xml" || fail "foreground service missing from manifest"
 
-# DESIGN.md §B13: a mesh.10 AAR must carry signed sequencing; a stale .build/bindings would not.
+# DESIGN.md §B13: a mesh.10+ AAR must carry signed sequencing; a stale .build/bindings would not.
 [[ "$(grep -a -c 'xmtp-mesh-seq-v1:' "$TMP/jni/arm64-v8a/libuniffi_xmtpv3.so" || true)" -ge 1 ]] \
   || fail "signed sequencing (xmtp-mesh-seq-v1) missing from the native library"
 [[ "$(grep -a -c 'xmtp-mesh-seq-attest-v1:' "$TMP/jni/arm64-v8a/libuniffi_xmtpv3.so" || true)" -ge 1 ]] \
   || fail "signed sequencing attestations (xmtp-mesh-seq-attest-v1) missing from the native library"
+# DESIGN.md §B14.3: a mesh.11 AAR carries the Noise links and the private-discovery symbols in
+# every ABI; a stale .build/bindings for any one of them would not.
+for abi in "${EXPECTED_ABIS[@]}"; do
+  unzip -q -o "$AAR" "jni/$abi/libuniffi_xmtpv3.so" -d "$TMP"
+  for needle in xmtp-mesh-link-v1 uniffi_xmtpv3_fn_method_ffimeshnode_forget_contact uniffi_xmtpv3_fn_method_ffimeshnode_pairing_refusals; do
+    [[ "$(grep -a -c "$needle" "$TMP/jni/$abi/libuniffi_xmtpv3.so" || true)" -ge 1 ]] \
+      || fail "$needle missing from the $abi native library"
+  done
+done
 
 echo "Published org.xmtp:android:$VERSION -> $AAR"

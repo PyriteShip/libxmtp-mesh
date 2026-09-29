@@ -26,6 +26,8 @@ import org.xmtp.android.library.XMTPEnvironment
 import org.xmtp.android.library.hexToByteArray
 import org.xmtp.android.library.mesh.link.LinkLimits
 import org.xmtp.android.library.messages.PrivateKeyBuilder
+import uniffi.xmtpv3.FfiException
+import uniffi.xmtpv3.FfiLinkRole
 import uniffi.xmtpv3.FfiMeshNode
 import uniffi.xmtpv3.FfiMeshPresenceCallback
 import uniffi.xmtpv3.FfiMeshTransport
@@ -77,22 +79,31 @@ class MeshLoopbackTest {
             if (l.remoteId == peerId) outbox.trySend(l.idAtPeer to frame)
         }
 
-        override fun disconnect(peerId: String) = Unit
+        /** Like the radio: closing the current link reports it lost on both ends (off the node's thread). */
+        override fun disconnect(peerId: String) {
+            val l = link ?: return
+            if (l.remoteId == peerId) scope.launch { if (link === l) unlink(this@LoopEnd, l.peer) }
+        }
     }
 
     private var generation = 0
 
+    /**
+     * [a] dials [b] as [role]. [b] reports Accept first, as the radio does, so its node knows
+     * the link before [a]'s first frame arrives.
+     */
     private fun link(
         a: LoopEnd,
         b: LoopEnd,
+        role: FfiLinkRole,
     ) {
         generation++
         val aId = "${a.name}#$generation"
         val bId = "${b.name}#$generation"
         a.link = Link(b, remoteId = bId, idAtPeer = aId)
         b.link = Link(a, remoteId = aId, idAtPeer = bId)
-        a.node.onPeerConnected(bId)
-        b.node.onPeerConnected(aId)
+        b.node.onPeerConnected(aId, FfiLinkRole.Accept)
+        a.node.onPeerConnected(bId, role)
     }
 
     private fun unlink(
@@ -118,15 +129,22 @@ class MeshLoopbackTest {
                 dbDirectory = dir.absolutePath,
                 deviceSyncEnabled = false,
             )
-        val client = Client.create(PrivateKeyBuilder(), options)
+        val wallet = PrivateKeyBuilder()
+        val client = Client.create(wallet, options)
         val end = LoopEnd(name, openMeshNode(mesh.dbPath, mesh.encryptionKey))
         created += client to end.node
+        end.node.setAccountKey(
+            wallet
+                .getPrivateKey()
+                .secp256K1.bytes
+                .toByteArray(),
+        )
         end.node.startSync(client.ffiClientForMesh, end)
         return client to end
     }
 
     /** A mesh client with no loopback node of its own, for tests that go through [Mesh.start]. */
-    private suspend fun meshClient(name: String): Pair<Client, MeshOptions> {
+    private suspend fun meshClient(name: String): Triple<Client, MeshOptions, ByteArray> {
         val dir = File(context.cacheDir, "mesh-loopback-$name-${System.nanoTime()}").apply { mkdirs() }
         val mesh = MeshOptions(File(dir, "node.db3").absolutePath, SecureRandom().generateSeed(32))
         val options =
@@ -137,7 +155,13 @@ class MeshLoopbackTest {
                 dbDirectory = dir.absolutePath,
                 deviceSyncEnabled = false,
             )
-        return Client.create(PrivateKeyBuilder(), options) to mesh
+        val wallet = PrivateKeyBuilder()
+        val key =
+            wallet
+                .getPrivateKey()
+                .secp256K1.bytes
+                .toByteArray()
+        return Triple(Client.create(wallet, options), mesh, key)
     }
 
     private data class Pairing(
@@ -147,12 +171,48 @@ class MeshLoopbackTest {
         val b: LoopEnd,
     )
 
+    /**
+     * Pair two loopback nodes the way two people do (DESIGN.md §B14.4): both in pairing mode,
+     * a dials over Noise XX, both confirm the code both nodes show. The pairing link then
+     * carries identities and key packages like a contact link.
+     */
+    private suspend fun pairOverLoopback(
+        a: LoopEnd,
+        b: LoopEnd,
+        bInbox: String,
+        aInbox: String,
+    ) {
+        a.node.setPairingMode(true)
+        b.node.setPairingMode(true)
+        link(a, b, FfiLinkRole.DialPairing)
+        eventually("both nodes show the same code") {
+            val pa = a.node.pendingPairings().singleOrNull()
+            val pb = b.node.pendingPairings().singleOrNull()
+            pa != null && pb != null && pa.code == pb.code
+        }
+        a.node.confirmPairing(
+            a.node
+                .pendingPairings()
+                .single()
+                .peerId,
+        )
+        b.node.confirmPairing(
+            b.node
+                .pendingPairings()
+                .single()
+                .peerId,
+        )
+        eventually("each stored the other as a contact") {
+            a.node.contacts().any { it.inboxId == bInbox } && b.node.contacts().any { it.inboxId == aInbox }
+        }
+    }
+
     private suspend fun connectedPair(): Pairing {
         val (alix, a) = meshPeer("a")
         val (bo, b) = meshPeer("b")
         // Not linked yet: neither node can have the other's key package.
         assertFalse(alix.meshCanMessage(bo.installationId.hexToByteArray()))
-        link(a, b)
+        pairOverLoopback(a, b, bo.inboxId, alix.inboxId)
         eventually("mutual mesh auth") {
             a.node.authenticatedPeers() == listOf(a.link!!.remoteId) &&
                 b.node.authenticatedPeers() == listOf(b.link!!.remoteId)
@@ -183,11 +243,11 @@ class MeshLoopbackTest {
     @Test
     fun relayTogglesThroughTheNodeWithoutRestartingTheRadio() =
         runBlocking {
-            val (client, options) = meshClient("relay")
+            val (client, options, key) = meshClient("relay")
             try {
                 // Assumes the test device is charging or above 15% battery, or MeshRelayPolicy
                 // would pause the relay regardless of the userEnabled toggle asserted below.
-                val radio = Mesh.start(context, client, options, relay = true)
+                val radio = Mesh.start(context, client, options, key.copyOf(), relay = true)
                 assertTrue(Mesh.relay.value.active)
                 Mesh.setRelayEnabled(false)
                 assertFalse(Mesh.relay.value.active)
@@ -235,10 +295,10 @@ class MeshLoopbackTest {
     @Test
     fun statsFollowTheRunningMesh() =
         runBlocking {
-            val (client, options) = meshClient("stats")
+            val (client, options, key) = meshClient("stats")
             try {
                 assertNull(Mesh.stats())
-                Mesh.start(context, client, options)
+                Mesh.start(context, client, options, key.copyOf())
                 assertNotNull(Mesh.stats())
                 Mesh.stop(context)
                 assertNull(Mesh.stats())
@@ -247,6 +307,85 @@ class MeshLoopbackTest {
                 runCatching { client.ffiClientForMesh.close() }
             }
         }
+
+    /** DESIGN.md §B14.1: start_sync refuses a node without the account key. */
+    @Test
+    fun startSyncNeedsTheAccountKey() =
+        runBlocking {
+            val dir = File(context.cacheDir, "mesh-loopback-nokey-${System.nanoTime()}").apply { mkdirs() }
+            val mesh = MeshOptions(File(dir, "node.db3").absolutePath, SecureRandom().generateSeed(32))
+            val options =
+                ClientOptions(
+                    api = ClientOptions.Api(env = XMTPEnvironment.MESH, isSecure = false, mesh = mesh),
+                    appContext = context,
+                    dbEncryptionKey = SecureRandom().generateSeed(32),
+                    dbDirectory = dir.absolutePath,
+                    deviceSyncEnabled = false,
+                )
+            val client = Client.create(PrivateKeyBuilder(), options)
+            val end = LoopEnd("nokey", openMeshNode(mesh.dbPath, mesh.encryptionKey))
+            created += client to end.node
+            val failure = runCatching { end.node.startSync(client.ffiClientForMesh, end) }.exceptionOrNull()
+            assertTrue(
+                "startSync without setAccountKey must fail with FfiException, got $failure",
+                failure is FfiException,
+            )
+            // The core's MeshError::NoAccountKey.
+            assertTrue(
+                "expected the missing-account-key error, got: ${failure?.message}",
+                failure?.message?.contains("no account key") == true,
+            )
+        }
+
+    /**
+     * Contacts over the real bindings (DESIGN.md §B14.4): remove closes the contact link, forget
+     * drops the row, reset moves the generation. The pairing link is swapped for a contact link
+     * first, as the radio's next dial would be (the pairing-link case has its own tests).
+     */
+    @Test
+    fun removeForgetAndResetOverLoopback() =
+        runBlocking {
+            val (alix, a, bo, b) = connectedPair()
+            assertTrue(a.node.contacts().any { it.inboxId == bo.inboxId && !it.autoAdded })
+            unlink(a, b)
+            link(a, b, FfiLinkRole.DialContact(bo.inboxId))
+            eventually("contact link authenticated") {
+                a.node.authenticatedPeers() == listOf(a.link!!.remoteId)
+            }
+            val v = a.node.contactsVersion()
+            assertEquals(1u, a.node.resetDiscoveryKey())
+            assertTrue(a.node.contactsVersion() > v)
+            assertTrue(a.node.removeContact(bo.inboxId))
+            eventually("the removed contact's link closes") { a.node.authenticatedPeers().isEmpty() }
+            assertTrue(a.node.contacts().none { it.inboxId == bo.inboxId })
+            assertTrue(a.node.forgetContact(bo.inboxId))
+            assertFalse(a.node.forgetContact(bo.inboxId))
+            assertTrue(b.node.contacts().any { it.inboxId == alix.inboxId })
+            assertEquals(1uL, a.node.meshStats().discoveryResets)
+        }
+
+    /**
+     * Removing or forgetting a contact right after pairing, while the pairing link is still up,
+     * closes that link too (DESIGN.md §B14.4).
+     */
+    private suspend fun closesThePairingLinkOn(forget: Boolean) {
+        val (_, a, bo, _) = connectedPair()
+        val pairingLink = a.link!!.remoteId
+        assertEquals(listOf(pairingLink), a.node.authenticatedPeers())
+        if (forget) {
+            assertTrue(a.node.forgetContact(bo.inboxId))
+        } else {
+            assertTrue(a.node.removeContact(bo.inboxId))
+        }
+        eventually("the pairing link closes") { a.node.authenticatedPeers().isEmpty() && a.link == null }
+        assertTrue(a.node.contacts().none { it.inboxId == bo.inboxId })
+    }
+
+    @Test
+    fun removingAContactClosesThePairingLink() = runBlocking { closesThePairingLinkOn(forget = false) }
+
+    @Test
+    fun forgettingAContactClosesThePairingLink() = runBlocking { closesThePairingLinkOn(forget = true) }
 
     @Test
     fun frameLimitsAgree() {
@@ -296,7 +435,7 @@ class MeshLoopbackTest {
             // that ran, it would (correctly) coalesce the history and never report `first`.
             eventually("presence stream reported bo") { events.toList() == listOf("verified $first ${bo.inboxId}") }
             unlink(a, b)
-            link(a, b) // reconnect: a fresh connection id
+            link(a, b, FfiLinkRole.DialContact(bo.inboxId)) // reconnect: a fresh connection id
             val second = a.link!!.remoteId
             assertNotEquals(first, second)
             eventually("bo re-verified under the new connection id") {
@@ -331,7 +470,7 @@ class MeshLoopbackTest {
             delay(2_000)
             assertFalse(hasMessage(alix, "while apart"))
 
-            link(a, b) // fresh connection ids, as a real reconnect gets
+            link(a, b, FfiLinkRole.DialContact(bo.inboxId)) // fresh connection ids, as a real reconnect gets
             eventually("queued message delivered after reconnect", 120_000) { hasMessage(alix, "while apart") }
             sending.cancel()
         }

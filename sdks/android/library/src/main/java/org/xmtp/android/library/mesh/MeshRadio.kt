@@ -28,24 +28,34 @@ import org.xmtp.android.library.mesh.ble.ConnectionEvents
 import org.xmtp.android.library.mesh.ble.GattClientConnection
 import org.xmtp.android.library.mesh.ble.GattServerHost
 import org.xmtp.android.library.mesh.ble.HandlerScheduler
+import org.xmtp.android.library.mesh.ble.WindowAlarm
 import org.xmtp.android.library.mesh.link.Cancellable
 import org.xmtp.android.library.mesh.link.LinkConfig
 import org.xmtp.android.library.mesh.link.LinkLimits
 import org.xmtp.android.library.mesh.link.LinkListener
 import org.xmtp.android.library.mesh.link.LinkPacket
 import org.xmtp.android.library.mesh.link.ReliableLink
-import org.xmtp.android.library.mesh.link.ShortId
 import org.xmtp.android.library.mesh.link.WriteQueue
+import org.xmtp.android.library.mesh.policy.AddressCooldown
+import org.xmtp.android.library.mesh.policy.AdvertCache
+import org.xmtp.android.library.mesh.policy.AdvertClock
+import org.xmtp.android.library.mesh.policy.AdvertDriver
+import org.xmtp.android.library.mesh.policy.AdvertMatch
 import org.xmtp.android.library.mesh.policy.BackoffTracker
 import org.xmtp.android.library.mesh.policy.CodedPhyProbe
-import org.xmtp.android.library.mesh.policy.ConnectPolicy
-import org.xmtp.android.library.mesh.policy.MeshAdvertisement
+import org.xmtp.android.library.mesh.policy.DialPlanner
+import org.xmtp.android.library.mesh.policy.LinkKindTag
+import org.xmtp.android.library.mesh.policy.LinkOutcome
 import org.xmtp.android.library.mesh.policy.MeshPermissions
 import org.xmtp.android.library.mesh.policy.PeerTable
 import org.xmtp.android.library.mesh.policy.RadioStart
 import org.xmtp.android.library.mesh.policy.RestartBackoff
 import org.xmtp.android.library.mesh.policy.ScanSchedule
 import org.xmtp.android.library.mesh.policy.ScanStartLimiter
+import org.xmtp.android.library.mesh.policy.ServiceData
+import uniffi.xmtpv3.FfiAdvertMatch
+import uniffi.xmtpv3.FfiLinkKind
+import uniffi.xmtpv3.FfiLinkRole
 import uniffi.xmtpv3.FfiMeshCallbackException
 import uniffi.xmtpv3.FfiMeshNode
 import uniffi.xmtpv3.FfiMeshPresenceCallback
@@ -53,6 +63,8 @@ import uniffi.xmtpv3.FfiMeshPresenceStream
 import uniffi.xmtpv3.FfiMeshTransport
 import uniffi.xmtpv3.FfiVerifiedPeer
 import uniffi.xmtpv3.meshMaxFrameLen
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 
 data class MeshRadioConfig(
     val maxConnections: Int = 4,
@@ -80,8 +92,9 @@ class MeshException(
  * directly on that thread, which keeps them in order. [PeerTable] and
  * [CodedPhyProbe] are single-threaded and are only touched on that thread.
  *
- * Rust PeerIds are connection-scoped ("<shortId>#<n>", see [PeerTable]); the
- * short id is only the logical peer identity used for discovery and backoff.
+ * Rust PeerIds are connection-scoped (`"p#<n>"`, see [PeerTable]). The radio has no
+ * stable peer identity (DESIGN.md §B14): it advertises the node's service data, dials by
+ * `classifyAdvert`, and tells the node each link's role.
  *
  * A silent peer is detected by the BLE supervision timeout (the stack reports a
  * disconnect, which closes the link), by the link's own ack timeout × (retries + 1)
@@ -94,13 +107,9 @@ class MeshException(
 class MeshRadio internal constructor(
     context: Context,
     private val node: FfiMeshNode,
-    private val localShortId: ByteArray,
     private val config: MeshRadioConfig = MeshRadioConfig(),
 ) : FfiMeshTransport {
     private val context: Context = context.applicationContext
-
-    /** This phone's short id (lowercase hex): its logical identity in advertisements. */
-    val localShortIdHex: String = ShortId.hex(localShortId)
 
     private val thread = HandlerThread("xmtp-mesh-radio").apply { start() }
     private val handler = Handler(thread.looper)
@@ -108,24 +117,60 @@ class MeshRadio internal constructor(
     private val manager: BluetoothManager = this.context.getSystemService(BluetoothManager::class.java)
     private val adapter: BluetoothAdapter? = manager.adapter
 
-    private val peers = PeerTable(localShortIdHex)
-    private val policy = ConnectPolicy(maxConnections = config.maxConnections)
+    private val peers = PeerTable()
+    private val planner = DialPlanner(maxConnections = config.maxConnections)
     private val backoff = BackoffTracker()
+
+    /** IK dials to a contact that came up but never verified (DESIGN.md §B7.2): 30 s doubling to 10 min. */
+    private val contactBackoff = BackoffTracker(baseMs = 30_000, maxMs = 600_000, maxAttempts = 6, cooldownMs = 600_000)
+
+    /** Connection PeerIds that ever verified; written on a tokio thread, read on the radio thread. */
+    private val verifiedEver: MutableSet<String> = Collections.newSetFromMap(ConcurrentHashMap())
+    private val linkKinds = HashMap<String, LinkKindTag>() // GATT key -> kind, as the node reports it
+    private val classifyCache = AdvertCache()
+
+    /** Inbound strangers closed over the relay cap, refused for 30 s (best effort: addresses rotate). */
+    private val inboundCooldown = AddressCooldown(periodMs = INBOUND_COOLDOWN_MS)
     private val restartBackoff = RestartBackoff()
     private var restartTimer: Cancellable? = null
     private val links = HashMap<String, LinkSlot>()
     private val clients = HashMap<String, GattClientConnection>()
-    private val pendingByKey = HashMap<String, String>() // outbound key -> short id we dialed
+    private val pendingByKey = HashMap<String, PendingDial>() // outbound GATT key -> what we dialed
     private val sightings = HashMap<String, Sighting>()
-    private val lastLost = HashMap<String, Long>()
+    private val lastLost = LinkedHashMap<String, Long>() // dial key -> last link drop
     private val codedRejectedUntil = HashMap<String, Long>()
     private var lastSightingMs: Long? = null
     private var server: GattServerHost? = null
-    private var serviceReady = false
-    private var advertiser: BleAdvertiser? = null
     private var scanner: BleScanner? = null
-    private var pairingMode = false
     private var radioOn = false
+    private var ownToken = ByteArray(LinkPacket.TOKEN_BYTES)
+    private val advert = AdvertDriver()
+    private val advertClock get() = advert.clock
+    private var lastSightingCheckMs: Long? = null
+    private var tick: Cancellable? = null
+    private val windowAlarm =
+        WindowAlarm(this.context) { done ->
+            val posted =
+                handler.post {
+                    try {
+                        onWindowAlarm()
+                    } finally {
+                        done()
+                    }
+                }
+            if (!posted) done()
+        }
+    private val seenAdverts = LinkedHashSet<String>()
+
+    /** An outbound dial: its sighting key (DialPlanner.sightingKey), what we believe the other phone is, and its address. */
+    private class PendingDial(
+        val sightingKey: String,
+        val intent: DialPlanner.Intent,
+        val deviceAddress: String,
+    ) {
+        /** Back-offs, busy and last drop are keyed on this (per inbox and device for a contact). */
+        val dialKey: String = DialPlanner.dialKey(sightingKey, deviceAddress)
+    }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val connected = MutableStateFlow<Set<String>>(emptySet())
@@ -137,7 +182,7 @@ class MeshRadio internal constructor(
 
     @Volatile private var stopped = false
 
-    /** Short ids (hex) of phones with a working link. Rust authentication may still be in progress. */
+    /** Connection PeerIds with a working link. Rust authentication may still be in progress. */
     val connectedPeers: StateFlow<Set<String>> = connected.asStateFlow()
 
     /**
@@ -153,7 +198,8 @@ class MeshRadio internal constructor(
 
     /**
      * True while the radio is advertising/scanning. False while Bluetooth is off, after
-     * [stop], or while a failed start (GATT server unavailable) is being retried.
+     * [stop], or while a failed start (GATT server or the node's advert state unavailable)
+     * is being retried.
      */
     val radioUp: StateFlow<Boolean> = up.asStateFlow()
 
@@ -167,19 +213,18 @@ class MeshRadio internal constructor(
         val key: String,
         val role: PeerTable.Role,
         val queue: WriteQueue,
-        val expectedShortId: String?,
+        val dialed: PendingDial?,
     ) : LinkListener {
         var link: ReliableLink? = null
-        var shortId: String? = null
+        var peerId: String? = null
         var probe: CodedPhyProbe? = null
+        var readyAtMs = 0L
 
         override fun onReady(remote: LinkPacket.Hello) = onLinkReady(this, remote)
 
         override fun onFrame(frame: ByteArray) {
-            // Only the peer's active link carries its Rust connection; a losing duplicate is being closed.
-            val s = shortId ?: return
-            if (peers.activeKey(s) != key) return
-            peers.peerIdOf(s)?.let { peerId -> rust("onFrame") { node.onFrame(peerId, frame) } }
+            val id = peerId ?: return
+            rust("onFrame") { node.onFrame(id, frame) }
         }
 
         override fun onProbeAck(nonce: Int) {
@@ -196,7 +241,13 @@ class MeshRadio internal constructor(
         object : FfiMeshPresenceCallback {
             override fun onPeerVerified(peer: FfiVerifiedPeer) {
                 try {
-                    if (!stopped) verified.update { it + (peer.peerId to peer) }
+                    if (!stopped) {
+                        verifiedEver.add(peer.peerId)
+                        verified.update { it + (peer.peerId to peer) }
+                        // Any verified link to this inbox (ours or theirs) resets its back-off.
+                        val prefix = DialPlanner.contactBackoffPrefix(peer.inboxId)
+                        handler.post { onInboxVerified(prefix) }
+                    }
                 } catch (e: Exception) {
                     Log.w(TAG, "presence update failed", e)
                 }
@@ -281,11 +332,9 @@ class MeshRadio internal constructor(
         }
     }
 
-    fun setPairingMode(enabled: Boolean) {
-        handler.post {
-            pairingMode = enabled
-            if (radioOn && serviceReady) advertiser?.start(advertisement())
-        }
+    /** Re-read the node's advert now (pairing mode, contacts, a reset or the relay switch changed). */
+    internal fun refreshAdvert() {
+        handler.post { refreshAdvertIfDue(force = true) }
     }
 
     /** Rust connection ids that completed the signed hello. */
@@ -308,6 +357,11 @@ class MeshRadio internal constructor(
     private fun powerUp() {
         if (radioOn) return
         val adapter = adapter ?: return
+        // No advert, no start: never advertise or send a link Hello with a zero token.
+        if (!readAdvertState()) {
+            scheduleRestart("advert state unavailable")
+            return
+        }
         lateinit var gattServer: GattServerHost
         gattServer =
             GattServerHost(context, manager, handler, gattEvents) { ok ->
@@ -316,25 +370,27 @@ class MeshRadio internal constructor(
                 when (val next = RadioStart.onServiceAdded(ok)) {
                     RadioStart.ServiceAdded.Advertise -> {
                         restartBackoff.reset()
-                        serviceReady = true
-                        advertiser?.start(advertisement())
+                        if (advert.onServiceReady()) logAdvertising()
                     }
                     is RadioStart.ServiceAdded.Restart -> {
                         // Never stay dial-out only; retry the whole start
                         // with the same backoff as a failed open() (not reset by this power-down).
-                        Log.w(TAG, next.reason)
                         powerDown(next.reason, resetBackoff = false)
-                        scheduleRestart()
+                        scheduleRestart(next.reason)
                     }
                 }
             }
         if (!gattServer.open()) {
-            scheduleRestart()
+            scheduleRestart("GATT server unavailable")
             return
         }
         server = gattServer
-        advertiser =
-            BleAdvertiser(adapter, handler) { code ->
+        advert.sink =
+            BleAdvertiser(
+                host = BleAdvertiser.platformHost(adapter, handler),
+                scheduler = scheduler,
+                currentData = { advertClock.serviceData },
+            ) { code ->
                 Log.w(TAG, "advertising unavailable ($code); this phone can only dial out")
             }
         scanner =
@@ -349,14 +405,16 @@ class MeshRadio internal constructor(
             ).also { it.start() }
         radioOn = true
         up.value = true
-        Log.i(TAG, "radio up as $localShortIdHex")
+        windowAlarm.arm(advertClock.delayToNextWindowMs(System.currentTimeMillis()))
+        scheduleTick()
+        Log.i(TAG, "radio up")
     }
 
     /** Retries a failed start (1 s doubling to 30 s) until it works, Bluetooth goes off, or [stop]. */
-    private fun scheduleRestart() {
+    private fun scheduleRestart(reason: String) {
         if (stopped || restartTimer != null) return
         val delay = restartBackoff.nextDelayMs()
-        Log.w(TAG, "GATT server unavailable; retrying radio start in ${delay}ms")
+        Log.w(TAG, "$reason; retrying radio start in ${delay}ms")
         restartTimer =
             scheduler.schedule(delay) {
                 restartTimer = null
@@ -383,9 +441,14 @@ class MeshRadio internal constructor(
         if (!radioOn) return
         radioOn = false
         up.value = false
-        serviceReady = false
         scanner?.stop()
-        advertiser?.stop()
+        advert.stop()
+        tick?.cancel()
+        tick = null
+        windowAlarm.disarm()
+        lastSightingCheckMs = null
+        seenAdverts.clear()
+        classifyCache.clear()
         // No BYE: the transport closes at once (or Bluetooth is already going off), and
         // the remote sees the disconnect through its own GATT callbacks.
         links.keys.toList().forEach { closeLink(it, reason, sendBye = false) }
@@ -395,61 +458,265 @@ class MeshRadio internal constructor(
         server?.close()
         server = null
         scanner = null
-        advertiser = null
         Log.i(TAG, "radio down: $reason")
     }
 
-    private fun advertisement() =
-        MeshAdvertisement(
-            MeshAdvertisement.VERSION,
-            if (pairingMode) MeshAdvertisement.FLAG_PAIRING else 0,
-            localShortId,
-        )
+    private fun nowSecs(): Long = System.currentTimeMillis() / 1000
+
+    /**
+     * Reads the node's advert for now into [advertClock] (DESIGN.md §B14.2). False if the node
+     * cannot answer: the radio then never comes up with an all-zero token.
+     */
+    private fun readAdvertState(): Boolean = readAdvert(force = true) != null
+
+    /**
+     * DESIGN.md §B14.2: at every window, and whenever the node's contacts version moves (a
+     * pairing, a forget, a reset, pairing mode or the relay switch), read the advert state;
+     * a new window or token starts a new advertising set (so a new address), a flag change
+     * updates the running one.
+     */
+    private fun refreshAdvertIfDue(force: Boolean = false) {
+        if (!radioOn) return
+        val action = readAdvert(force) ?: return
+        if (!advert.ready) return // the service-added callback starts the set
+        val data = advertClock.serviceData ?: return
+        when (action) {
+            AdvertClock.Action.NEW_SET -> logAdvertising()
+            AdvertClock.Action.UPDATE_DATA -> Log.i(TAG, "advert flags now 0x%02x".format(data[1].toInt() and 0xFF))
+            AdvertClock.Action.NONE -> Unit
+        }
+    }
+
+    /** The clock's action for a fresh read, or null when nothing was due or the node could not answer. */
+    private fun readAdvert(force: Boolean): AdvertClock.Action? {
+        val now = nowSecs()
+        if (!force) {
+            val version =
+                try {
+                    node.contactsVersion().toLong()
+                } catch (e: Exception) {
+                    Log.w(TAG, "contacts version unavailable", e)
+                    return null
+                }
+            if (!advertClock.due(now, version)) return null
+        }
+        val state =
+            try {
+                node.advertState(now.toULong())
+            } catch (e: Exception) {
+                Log.w(TAG, "advert state unavailable", e)
+                return null
+            }
+        ownToken = state.ownToken
+        val action =
+            advert.onState(
+                window = state.window.toLong(),
+                serviceData = state.serviceData,
+                nextWindowAtSecs = state.nextWindowAt.toLong(),
+                version = state.contactsVersion.toLong(),
+                readAtSecs = now,
+            )
+        if (radioOn && action != AdvertClock.Action.NONE) {
+            windowAlarm.arm(advertClock.delayToNextWindowMs(System.currentTimeMillis()))
+        }
+        return action
+    }
+
+    /** For the device test: the window and the token's first bytes (public on the air), never the whole token. */
+    private fun logAdvertising() {
+        Log.i(TAG, "advertising window ${advertClock.window} token ${ServiceData.hexPrefix(ownToken)} (new set)")
+    }
+
+    private fun scheduleTick() {
+        tick?.cancel()
+        tick =
+            scheduler.schedule(TICK_MS) {
+                tick = null
+                if (!radioOn) return@schedule
+                onTick()
+                scheduleTick()
+            }
+    }
+
+    private fun onTick() {
+        refreshAdvertIfDue()
+        refreshLinkKinds()
+        enforceRelayCap()
+        // A verification that arrived after its link closed.
+        verifiedEver.retainAll(peers.peers())
+    }
+
+    /** The while-idle backstop: check the clock, then aim at the next window again (never a tight loop). */
+    private fun onWindowAlarm() {
+        refreshAdvertIfDue()
+        if (radioOn) {
+            windowAlarm.arm(advertClock.delayToNextWindowMs(System.currentTimeMillis()).coerceAtLeast(ALARM_MIN_MS))
+        }
+    }
 
     // ---- discovery -------------------------------------------------------
 
+    /**
+     * One `classifyAdvert` per advert per window and contacts version. The version is read live
+     * (an atomic load in the node) at every sighting, and the cache is used only while
+     * [advertClock] covers now at that version: a removed, forgotten or reset contact, or a
+     * window boundary the clock has not caught up with yet, always goes to the node.
+     */
+    private fun classify(data: ByteArray): AdvertMatch {
+        val now = nowSecs()
+        val version =
+            try {
+                node.contactsVersion().toLong()
+            } catch (e: Exception) {
+                null
+            }
+        if (version == null || !advertClock.covers(now, version)) return classifyNow(data, now) ?: AdvertMatch.Ignore
+        val key = data.joinToString("") { "%02x".format(it.toInt() and 0xFF) }
+        return classifyCache.get(key, advertClock.window, version) { classifyNow(data, now) } ?: AdvertMatch.Ignore
+    }
+
+    /** The node's answer, or null if it failed (never cached: the next sighting asks again). */
+    private fun classifyNow(
+        data: ByteArray,
+        now: Long,
+    ): AdvertMatch? =
+        try {
+            when (val m = node.classifyAdvert(data, now.toULong())) {
+                is FfiAdvertMatch.Contact -> AdvertMatch.Contact(m.inboxId, m.dialFirst)
+                is FfiAdvertMatch.Stranger -> AdvertMatch.Stranger(m.relayOffered, m.dialFirst)
+                is FfiAdvertMatch.Pairing -> AdvertMatch.Pairing(m.dialFirst)
+                else -> AdvertMatch.Ignore
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "classifyAdvert failed", e)
+            null
+        }
+
     private fun onSighting(
-        ad: MeshAdvertisement,
+        data: ByteArray,
         device: BluetoothDevice,
         rssi: Int,
     ) {
         if (!radioOn) return
-        val shortId = ShortId.hex(ad.shortId)
-        if (shortId == localShortIdHex) return
         val now = scheduler.nowMs()
         lastSightingMs = now
+        // A BLE event is also a clock check, at most once a second.
+        val lastCheck = lastSightingCheckMs
+        if (lastCheck == null || now - lastCheck >= SIGHTING_CHECK_MS) {
+            lastSightingCheckMs = now
+            refreshAdvertIfDue()
+        }
+        if (ServiceData.isV2(data)) {
+            val seen = device.address + ":" + ServiceData.hexPrefix(ServiceData.token(data))
+            if (seenAdverts.add(seen)) {
+                if (seenAdverts.size > MAX_SIGHTINGS) seenAdverts.remove(seenAdverts.first())
+                Log.i(TAG, "saw advert from ${device.address} token ${ServiceData.hexPrefix(ServiceData.token(data))}")
+            }
+        }
+        val match = classify(data)
+        val key = planner.sightingKey(match, device.address) ?: return
         pruneSightings(now)
-        val sighting = sightings.getOrPut(shortId) { Sighting(device, now, now) }
-        sighting.firstSeenMs = policy.sightingStart(sighting.firstSeenMs, sighting.lastSeenMs, now)
+        val sighting = sightings.getOrPut(key) { Sighting(device, now, now) }
+        sighting.firstSeenMs = planner.sightingStart(sighting.firstSeenMs, sighting.lastSeenMs, now)
         sighting.device = device
         sighting.lastSeenMs = now
-        // Never dial a phone we already have (or are building) a link to: a same-role
-        // duplicate could make both phones close different links.
-        val busy =
-            peers.activeKey(shortId) != null ||
-                pendingByKey.containsValue(shortId) ||
-                links.values.any { it.shortId == shortId || (it.shortId == null && it.expectedShortId == shortId) }
-        val go =
-            policy.shouldConnect(
-                localPeerId = localShortIdHex,
-                remotePeerId = shortId,
-                firstSeenMs = sighting.firstSeenMs,
-                lastLostMs = lastLost[shortId],
-                nowMs = now,
-                hasLinkOrPending = busy,
-                openConnections = links.size + pendingByKey.size,
-                backoffAllows = backoff.canAttempt(shortId, now),
+        val dialKey = DialPlanner.dialKey(key, device.address)
+        val lost = lastLost[dialKey]
+        val dialedKeys = pendingByKey.values.map { it.dialKey } + links.values.mapNotNull { it.dialed?.dialKey }
+        val decision =
+            planner.decide(
+                DialPlanner.Inputs(
+                    match = match,
+                    waitingSinceMs = maxOf(sighting.firstSeenMs, lost ?: sighting.firstSeenMs),
+                    lastLostMs = lost,
+                    nowMs = now,
+                    relayOn = node.relayEnabled(),
+                    busy = planner.isBusy(dialKey, dialedKeys, verified.value.values.map { it.inboxId }),
+                    backoffAllows =
+                        backoff.canAttempt(dialKey, now) &&
+                            contactBackoff.canAttempt(dialKey, now) &&
+                            backoff.canAttempt(DialPlanner.DEVICE_PREFIX + device.address, now),
+                    openConnections = links.size + pendingByKey.size,
+                    relayLinks = relayLinkCount(),
+                    evictableRelayKey = oldestRelayKey(),
+                ),
             )
-        if (!go) return
+        val dial = decision as? DialPlanner.Decision.Dial ?: return
         val conn = GattClientConnection(context, device, handler, gattEvents)
         if (clients.containsKey(conn.key)) return
-        Log.i(TAG, "connecting to $shortId (rssi $rssi)")
+        dial.evictKey?.let { closeLink(it, "slot for a contact", sendBye = true, hard = true) }
+        Log.i(TAG, "dialing ${label(dial.intent)} (rssi $rssi)")
         clients[conn.key] = conn
-        pendingByKey[conn.key] = shortId
+        pendingByKey[conn.key] = PendingDial(key, dial.intent, device.address)
         conn.connect()
     }
 
+    private fun label(intent: DialPlanner.Intent): String =
+        when (intent) {
+            is DialPlanner.Intent.Contact -> "a contact"
+            DialPlanner.Intent.Relay -> "a relay stranger"
+            DialPlanner.Intent.Pairing -> "a pairing phone"
+        }
+
+    private fun roleFor(intent: DialPlanner.Intent): FfiLinkRole =
+        when (intent) {
+            is DialPlanner.Intent.Contact -> FfiLinkRole.DialContact(intent.inboxId)
+            DialPlanner.Intent.Relay -> FfiLinkRole.DialRelay
+            DialPlanner.Intent.Pairing -> FfiLinkRole.DialPairing
+        }
+
+    /**
+     * Relay links against the cap: those the node reports as relay, our relay dials whose
+     * handshake has not finished yet, and relay dials still connecting.
+     */
+    private fun relayLinkCount(): Int =
+        links.values.count { slot ->
+            val kind = linkKinds[slot.key]
+            kind == LinkKindTag.RELAY || (kind == null && slot.dialed?.intent == DialPlanner.Intent.Relay)
+        } + pendingByKey.values.count { it.intent == DialPlanner.Intent.Relay }
+
+    private fun oldestRelayKey(): String? =
+        linkKinds.filterValues { it == LinkKindTag.RELAY }.keys.minByOrNull { links[it]?.readyAtMs ?: Long.MAX_VALUE }
+
+    /** Asks the node each open link's kind (DESIGN.md §B14.3): none while its handshake runs. */
+    private fun refreshLinkKinds() {
+        for (slot in links.values) {
+            val id = slot.peerId ?: continue
+            val kind =
+                try {
+                    node.linkKind(id)
+                } catch (e: Exception) {
+                    null
+                }
+            when (kind) {
+                FfiLinkKind.CONTACT -> linkKinds[slot.key] = LinkKindTag.CONTACT
+                FfiLinkKind.RELAY -> linkKinds[slot.key] = LinkKindTag.RELAY
+                FfiLinkKind.PAIRING -> linkKinds[slot.key] = LinkKindTag.PAIRING
+                null -> Unit
+            }
+        }
+        linkKinds.keys.retainAll(links.keys)
+    }
+
+    /** Strangers that dialed us count against the relay cap too: close the newest beyond it. */
+    private fun enforceRelayCap() {
+        val relayOldestFirst =
+            linkKinds.filterValues { it == LinkKindTag.RELAY }.keys.sortedBy { links[it]?.readyAtMs ?: 0L }
+        for (key in planner.relayLinksToClose(relayOldestFirst)) {
+            // A stranger that dialed us would redial at once: refuse its address for a while.
+            if (links[key]?.role == PeerTable.Role.PERIPHERAL) {
+                inboundCooldown.start(key.substringAfter(':'), scheduler.nowMs())
+            }
+            closeLink(key, "relay slots full", sendBye = true, hard = true)
+        }
+    }
+
     private fun pruneSightings(now: Long) {
+        // Keyed per device for contacts, so rotating addresses must not grow it without bound.
+        if (lastLost.size >= MAX_SIGHTINGS) {
+            lastLost.values.removeAll { now - it > SIGHTING_TTL_MS }
+            while (lastLost.size >= MAX_SIGHTINGS) lastLost.remove(lastLost.keys.first())
+        }
         if (sightings.size < MAX_SIGHTINGS) return
         val it = sightings.entries.iterator()
         while (it.hasNext()) {
@@ -466,12 +733,16 @@ class MeshRadio internal constructor(
                 role: PeerTable.Role,
                 mtu: Int,
             ) {
-                val expected = pendingByKey.remove(key)
+                val dialed = pendingByKey.remove(key)
                 if (!radioOn) return
-                if (role == PeerTable.Role.PERIPHERAL && !policy.acceptInbound(links.size + pendingByKey.size)) {
-                    Log.i(TAG, "refusing inbound $key: at ${config.maxConnections} connections")
-                    server?.disconnect(key)
-                    return
+                if (role == PeerTable.Role.PERIPHERAL) {
+                    val coolingDown = inboundCooldown.active(key.substringAfter(':'), scheduler.nowMs())
+                    if (!planner.acceptInbound(links.size + pendingByKey.size, coolingDown)) {
+                        val why = if (coolingDown) "cooling down" else "at ${config.maxConnections} connections"
+                        Log.i(TAG, "refusing inbound $key: $why")
+                        server?.disconnect(key)
+                        return
+                    }
                 }
                 val queue =
                     WriteQueue(
@@ -480,12 +751,11 @@ class MeshRadio internal constructor(
                         submit = { packet -> writeTransport(key, role, packet) },
                         onOverflow = { closeLink(key, "write queue overflow", sendBye = false) },
                     )
-                val slot = LinkSlot(key, role, queue, expected)
+                val slot = LinkSlot(key, role, queue, dialed)
                 val link =
                     ReliableLink(
                         config =
                             LinkConfig(
-                                localShortId = localShortId,
                                 // One chunk per ATT payload: MTU minus the 3-byte ATT header.
                                 maxPacketBytes = (mtu - 3).coerceAtLeast(LinkLimits.MIN_ATT_PAYLOAD),
                                 window = config.window,
@@ -536,16 +806,16 @@ class MeshRadio internal constructor(
                 key: String,
                 status: Int,
             ) {
-                val expected = pendingByKey.remove(key)
-                if (expected != null) {
+                val pending = pendingByKey.remove(key)
+                if (pending != null) {
                     clients.remove(key)?.close()
-                    val delay = backoff.onFailure(expected, scheduler.nowMs())
-                    Log.i(TAG, "connect to $expected failed, status $status (133 = GATT_ERROR); retry in ${delay}ms")
+                    val delay = backoff.onFailure(pending.dialKey, scheduler.nowMs())
+                    Log.i(TAG, "dial failed, status $status (133 = GATT_ERROR); retry in ${delay}ms")
                     return
                 }
                 val slot = links[key]
-                if (slot != null && slot.shortId == null) {
-                    slot.expectedShortId?.let { backoff.onFailure(it, scheduler.nowMs()) }
+                if (slot != null && slot.peerId == null) {
+                    slot.dialed?.let { backoff.onFailure(it.dialKey, scheduler.nowMs()) }
                 }
                 closeLink(key, "gatt closed, status $status", sendBye = false, transportDelayMs = 0)
             }
@@ -564,41 +834,38 @@ class MeshRadio internal constructor(
 
     // ---- links -----------------------------------------------------------
 
+    /**
+     * The accepting side reports Accept here, in the same radio-thread task that sent its
+     * link Hello, so the node hears it before the dialer can send its first frame.
+     */
     private fun onLinkReady(
         slot: LinkSlot,
         hello: LinkPacket.Hello,
     ) {
-        val shortId = ShortId.hex(hello.shortId)
-        slot.shortId = shortId
-        backoff.onSuccess(shortId)
-        // D23: a link that has carried nothing inbound recently may be half-open (its
-        // remote process died without the transport noticing); prefer the new, just-authenticated
-        // link over a stale existing one instead of the usual role tie-break. Each phone judges
-        // staleness from its own link's own inbound traffic, not a value the two sides compare —
-        // PeerTable.isStale's window is sized so a healthy, merely-idle link
-        // never crosses it on either side, so the two phones can only disagree while an existing
-        // link is genuinely dying (a narrow race that self-heals on the next redial), never while
-        // it's healthy. The side that lost its state entirely (a restarted process) has no
-        // existing link to compare against in the first place, so it always takes the new one.
-        val existingKey = peers.activeKey(shortId)
-        val existingLastInboundMs = existingKey?.let { links[it]?.link?.lastInboundMs }
-        val existingIsStale =
-            existingKey != null &&
-                PeerTable.isStale(existingLastInboundMs, scheduler.nowMs(), config.keepaliveIntervalMs)
-        val decision = peers.onLinkReady(shortId, PeerTable.LinkRef(slot.key, slot.role), existingIsStale)
-        // Order matters: retire the old Rust connection, announce the new one, then close.
-        decision.lostPeerId?.let { old ->
-            Log.i(TAG, "peer $shortId: connection $old replaced by ${slot.key}")
-            rust("onPeerLost") { node.onPeerLost(old) }
-        }
-        decision.connectedPeerId?.let { peerId ->
-            Log.i(TAG, "peer $shortId connected via ${slot.key} as $peerId")
-            rust("onPeerConnected") { node.onPeerConnected(peerId) }
-            publishPeers()
-        }
-        decision.closeKey?.let { closeLink(it, "duplicate link", sendBye = true) }
-        if (!decision.keep) return
+        val role =
+            when (val ready = LinkOutcome.onReady(slot.role == PeerTable.Role.PERIPHERAL, slot.dialed?.intent)) {
+                LinkOutcome.Ready.Accept -> FfiLinkRole.Accept
+                is LinkOutcome.Ready.Dial -> roleFor(ready.intent)
+                LinkOutcome.Ready.Close -> {
+                    closeLink(slot.key, "outbound link without a dial intent", sendBye = true)
+                    return
+                }
+            }
+        val peerId = peers.onLinkReady(slot.key)
+        slot.peerId = peerId
+        slot.readyAtMs = scheduler.nowMs()
+        slot.dialed?.let { backoff.onSuccess(it.dialKey) }
+        Log.i(TAG, "connection ${slot.key} up as $peerId (${slot.dialed?.let { label(it.intent) } ?: "accepted"})")
+        rust("onPeerConnected") { node.onPeerConnected(peerId, role) }
+        publishPeers()
         maybeProbeCoded(slot, hello)
+        // An inbound stranger over the relay cap closes within seconds, not at the next tick.
+        scheduler.schedule(KIND_CHECK_MS) {
+            if (links[slot.key] === slot) {
+                refreshLinkKinds()
+                enforceRelayCap()
+            }
+        }
     }
 
     private fun closeLink(
@@ -607,10 +874,11 @@ class MeshRadio internal constructor(
         sendBye: Boolean,
         hard: Boolean = false,
         transportDelayMs: Long = BYE_FLUSH_MS,
+        nodeRequested: Boolean = false,
     ) {
         // Removed before link.close(), so the listener's onClosed does not re-enter.
         val slot = links.remove(key) ?: return
-        Log.i(TAG, "link $key (${slot.shortId}) closed: $reason")
+        Log.i(TAG, "link $key (${slot.peerId}) closed: $reason")
         slot.link?.close(reason, sendBye)
         // Captured now: after the BYE delay the same key (Bluetooth address) may carry a
         // fresh link, which the delayed close must not touch.
@@ -633,12 +901,62 @@ class MeshRadio internal constructor(
         } else {
             closeTransport()
         }
-        val shortId = slot.shortId ?: return
-        val lostPeerId = peers.onLinkClosed(shortId, key) ?: return
-        Log.i(TAG, "peer $shortId lost (connection $lostPeerId)")
-        lastLost[shortId] = scheduler.nowMs()
+        val now = scheduler.nowMs()
+        val kind = linkKinds.remove(key)
+        val lostPeerId = peers.onLinkClosed(key)
+        val ever = lostPeerId != null && verifiedEver.remove(lostPeerId)
+        val intent = slot.dialed?.intent
+        val elsewhere =
+            intent is DialPlanner.Intent.Contact &&
+                verified.value.values.any { it.inboxId == intent.inboxId && it.peerId != lostPeerId }
+        val penalty =
+            LinkOutcome.onClose(
+                intent = intent,
+                everVerified = ever,
+                kind = kind,
+                nodeRequested = nodeRequested,
+                reason = reason,
+                wasReady = lostPeerId != null,
+                ownPowerDown = !radioOn,
+                inboxVerifiedElsewhere = elsewhere,
+            )
+        applyPenalty(penalty, slot.dialed, key, now)
+        if (lostPeerId == null) return
+        slot.dialed?.let { lastLost[it.dialKey] = now }
+        Log.i(TAG, "connection $lostPeerId lost")
         rust("onPeerLost") { node.onPeerLost(lostPeerId) }
         publishPeers()
+    }
+
+    /** A link to this inbox verified: clear its back-offs and last drops on every device. */
+    private fun onInboxVerified(contactPrefix: String) {
+        contactBackoff.onSuccessWithPrefix(contactPrefix)
+        backoff.onSuccessWithPrefix(contactPrefix)
+        lastLost.keys.removeAll { it.startsWith(contactPrefix) }
+    }
+
+    private fun applyPenalty(
+        penalty: LinkOutcome.Penalty,
+        dialed: PendingDial?,
+        key: String,
+        now: Long,
+    ) {
+        when (penalty) {
+            LinkOutcome.Penalty.CONTACT_BACKOFF ->
+                dialed?.let {
+                    val delay = contactBackoff.onFailure(it.dialKey, now)
+                    Log.i(TAG, "contact link $key never verified; backing off ${delay}ms")
+                }
+            LinkOutcome.Penalty.DEVICE_COOLDOWN -> {
+                backoff.penalize(DialPlanner.deviceKey(key), now)
+                Log.i(TAG, "cooling down the device of $key")
+            }
+            LinkOutcome.Penalty.CONTACT_RESET ->
+                (dialed?.intent as? DialPlanner.Intent.Contact)?.let {
+                    onInboxVerified(DialPlanner.contactBackoffPrefix(it.inboxId))
+                }
+            LinkOutcome.Penalty.NONE -> Unit
+        }
     }
 
     private fun publishPeers() {
@@ -667,8 +985,8 @@ class MeshRadio internal constructor(
     ) {
         if (!config.codedPhyProbe || slot.role != PeerTable.Role.CENTRAL) return
         if (!hello.codedHint || !localCodedHint()) return
-        val shortId = slot.shortId ?: return
-        if ((codedRejectedUntil[shortId] ?: 0L) > scheduler.nowMs()) return
+        val sightingKey = slot.dialed?.sightingKey ?: return
+        if ((codedRejectedUntil[sightingKey] ?: 0L) > scheduler.nowMs()) return
         val probe = CodedPhyProbe().also { slot.probe = it }
         // Arm the timeout as the probe starts, so a missing PHY callback still ends it.
         scheduler.schedule(PROBE_TIMEOUT_MS) {
@@ -687,12 +1005,12 @@ class MeshRadio internal constructor(
             is CodedPhyProbe.Action.SendProbes -> action.nonces.forEach { slot.link?.sendProbe(it) }
             CodedPhyProbe.Action.RevertTo1M -> {
                 client.request1mPhy()
-                slot.shortId?.let { codedRejectedUntil[it] = scheduler.nowMs() + CODED_RETRY_AFTER_MS }
-                Log.i(TAG, "coded PHY rejected for ${slot.shortId}; staying on 1M")
+                slot.dialed?.let { codedRejectedUntil[it.sightingKey] = scheduler.nowMs() + CODED_RETRY_AFTER_MS }
+                Log.i(TAG, "coded PHY rejected for ${slot.peerId}; staying on 1M")
             }
             CodedPhyProbe.Action.None ->
                 if (slot.probe?.state == CodedPhyProbe.State.VERIFIED) {
-                    Log.i(TAG, "coded PHY verified for ${slot.shortId}")
+                    Log.i(TAG, "coded PHY verified for ${slot.peerId}")
                 }
         }
     }
@@ -730,8 +1048,7 @@ class MeshRadio internal constructor(
         post("disconnect") {
             // A stale id must never close a newer connection to the same phone.
             val key = peers.keyForPeerId(peerId) ?: return@post
-            peers.shortIdOf(peerId)?.let { backoff.penalize(it, scheduler.nowMs()) }
-            closeLink(key, "mesh node requested disconnect", sendBye = true, hard = true)
+            closeLink(key, "mesh node requested disconnect", sendBye = true, hard = true, nodeRequested = true)
         }
     }
 
@@ -761,6 +1078,11 @@ class MeshRadio internal constructor(
         const val PROBE_TIMEOUT_MS = 5_000L
         const val CODED_RETRY_AFTER_MS = 60 * 60 * 1000L
         const val MAX_SIGHTINGS = 256
+        const val TICK_MS = 5_000L
+        const val ALARM_MIN_MS = 30_000L
+        const val SIGHTING_CHECK_MS = 1_000L
         const val SIGHTING_TTL_MS = 10 * 60 * 1000L
+        const val KIND_CHECK_MS = 3_000L
+        const val INBOUND_COOLDOWN_MS = 30_000L
     }
 }

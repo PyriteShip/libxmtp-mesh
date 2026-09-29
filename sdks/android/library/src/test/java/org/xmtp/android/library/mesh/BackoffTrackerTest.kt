@@ -44,4 +44,28 @@ class BackoffTrackerTest {
         assertFalse(b.canAttempt("p", 100 + 119_999))
         assertTrue(b.canAttempt("q", 0))
     }
+
+    /** Rotating addresses must not grow the tracker without bound: expired entries go first, then the oldest. */
+    @Test
+    fun staysBoundedUnderManyAddresses() {
+        val b = BackoffTracker(maxEntries = 256, random = ZeroRandom)
+        for (i in 0 until 1_000) b.onFailure("c:bob@$i", i.toLong())
+        assertTrue(b.size <= 256)
+        // The newest entry is still backing off.
+        assertFalse(b.canAttempt("c:bob@999", 999))
+    }
+
+    @Test
+    fun expiredEntriesArePrunedBeforeLiveOnes() {
+        val b = BackoffTracker(maxEntries = 2, random = ZeroRandom)
+        b.onFailure("a", 0) // allowed again at 800
+        b.penalize("b", 0) // blocked until 120_000
+        b.onFailure("c", 10_000) // at the cap: "a" has expired and goes
+        assertFalse(b.canAttempt("b", 10_000))
+        assertFalse(b.canAttempt("c", 10_000))
+        assertEquals(2, b.size)
+        b.onFailure("d", 10_000) // nothing expired: the oldest ("b") goes
+        assertTrue(b.canAttempt("b", 10_000))
+        assertFalse(b.canAttempt("d", 10_000))
+    }
 }

@@ -10,7 +10,7 @@ import java.io.File
  * [org.xmtp.android.library.Client.meshRebaseInstallation] actually fixes the log -- but only
  * then (never on a failed or no-op re-base), and never at the cost of wiping a fresher event that
  * races it. `FfiMeshNode`/`FfiXmtpClient` need the native library and can't be constructed in a
- * plain JVM test (the same limitation [MeshStartShortIdTest] and [MeshForegroundServiceStopTest]
+ * plain JVM test (the same limitation [MeshStartKeyOrderTest] and [MeshForegroundServiceStopTest]
  * work around), so this reads the source (comments stripped) and checks the control flow
  * structurally: a linear function body with only an early `return` has only one order events can
  * happen in, so textual order here is execution order. The compare-and-clear logic itself is

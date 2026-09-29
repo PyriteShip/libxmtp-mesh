@@ -35,17 +35,14 @@ import java.io.File
  * rotates twice (the host's rotate, then [forClient]), and each carries. Recovery rotations
  * ([rotateAll], or [rotate] with no carrier) start empty.
  *
- * [context], when given, is also used to forget the retired generations' BLE short ids
- * ([MeshIdentity], D22) on [rotate], so a rotated-away node's id is never left behind to
- * link it to whatever node replaces it.
+ * [context] is no longer used: older builds kept a BLE short id per node generation (D22),
+ * which private discovery (DESIGN.md §B14) removed; [Mesh.start] deletes the stored ids.
  */
 class MeshNodeFiles(
     private val dir: File,
     private val inboxId: String,
-    // Optional (D22): when given, rotate() also forgets the short id of the generations it
-    // retires. Callers that don't have a Context on hand (e.g. plain-JVM tests of file layout
-    // alone) still work; they just skip that cleanup.
-    private val context: Context? = null,
+    // Kept so existing callers still compile; see the class doc.
+    @Suppress("UNUSED_PARAMETER") context: Context? = null,
 ) {
     init {
         // Letters and digits only: the inbox id is part of file names and of the prefix that
@@ -91,11 +88,6 @@ class MeshNodeFiles(
             ?.forEach { stale ->
                 if (!stale.delete()) {
                     Log.w(TAG, "could not delete stale mesh node file ${stale.name}")
-                }
-                // D22: forget the retired generation's short id too (only for the node db
-                // file itself, not its -wal/-shm sidecars, which were never keys).
-                if (stale.name.endsWith(SUFFIX)) {
-                    context?.let { MeshIdentity.forget(it, stale.name) }
                 }
             }
         return current()

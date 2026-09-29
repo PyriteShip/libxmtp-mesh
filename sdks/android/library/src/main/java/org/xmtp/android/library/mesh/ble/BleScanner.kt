@@ -12,14 +12,14 @@ import android.os.ParcelUuid
 import android.util.Log
 import org.xmtp.android.library.mesh.link.Cancellable
 import org.xmtp.android.library.mesh.link.Scheduler
-import org.xmtp.android.library.mesh.policy.MeshAdvertisement
 import org.xmtp.android.library.mesh.policy.ScanSchedule
 import org.xmtp.android.library.mesh.policy.ScanStartLimiter
+import org.xmtp.android.library.mesh.policy.ServiceData
 
 /**
  * Duty-cycled, filtered scan (filtered scans keep running with the screen off).
  * Active scanning is Android's default, which is what delivers the scan response
- * carrying the short id **(verify on device)**.
+ * carrying the service data **(verify on device)**.
  */
 @SuppressLint("MissingPermission")
 internal class BleScanner(
@@ -27,7 +27,7 @@ internal class BleScanner(
     private val handler: Handler,
     private val scheduler: Scheduler,
     private val schedule: ScanSchedule,
-    private val onSighting: (MeshAdvertisement, BluetoothDevice, Int) -> Unit,
+    private val onSighting: (ByteArray, BluetoothDevice, Int) -> Unit,
     private val nearbyState: () -> Pair<Long?, Int>,
     /** Shared across scanner instances by the radio, so restarts count too. */
     private val startLimiter: ScanStartLimiter = ScanStartLimiter(),
@@ -45,10 +45,11 @@ internal class BleScanner(
                 callbackType: Int,
                 result: ScanResult,
             ) {
-                val ad = MeshAdvertisement.decode(result.scanRecord?.getServiceData(uuid)) ?: return
+                val data = result.scanRecord?.getServiceData(uuid) ?: return
+                if (!ServiceData.isV2(data)) return
                 val device = result.device
                 val rssi = result.rssi
-                handler.post { if (running) onSighting(ad, device, rssi) }
+                handler.post { if (running) onSighting(data, device, rssi) }
             }
 
             override fun onBatchScanResults(results: MutableList<ScanResult>) {

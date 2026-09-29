@@ -16,11 +16,13 @@ import org.xmtp.android.library.ClientOptions
 import org.xmtp.android.library.XMTPEnvironment
 import org.xmtp.android.library.libxmtp.DecodedMessage
 import org.xmtp.android.library.messages.PrivateKeyBuilder
+import uniffi.xmtpv3.FfiMeshNode
 import uniffi.xmtpv3.openMeshNode
 import java.io.File
 
 /**
  * Runs on two phones at once via dev/mesh-two-device-test. Skipped otherwise.
+ * Each test pairs the phones first (the test stands in for the two people comparing codes).
  * alpha creates the DM (and is its sequencer) and sends a ping; bravo answers with a pong.
  */
 @RunWith(AndroidJUnit4::class)
@@ -43,6 +45,8 @@ class MeshTwoDeviceTest {
         val client: Client,
         val mesh: MeshOptions,
         val otherInbox: String,
+        /** The account key, for Mesh.start and setAccountKey; pass copies (both wipe theirs). */
+        val key: ByteArray,
     )
 
     private suspend fun peer(
@@ -71,7 +75,23 @@ class MeshTwoDeviceTest {
                 api,
                 PrivateKeyBuilder(PrivateKeyBuilder.buildFromPrivateKeyData(theirs)).publicIdentity,
             )
-        return Peer(client, mesh, otherInbox)
+        return Peer(client, mesh, otherInbox, mine.copyOf())
+    }
+
+    /** Both phones enter pairing mode and confirm the code their node shows (DESIGN.md §B14.4). */
+    private suspend fun pairOverBle(
+        node: FfiMeshNode,
+        radio: MeshRadio,
+        otherInbox: String,
+    ) {
+        node.setPairingMode(true)
+        radio.refreshAdvert()
+        eventually("a pairing code", 180_000) { node.pendingPairings().isNotEmpty() }
+        val p = node.pendingPairings().first()
+        mark("pairing code ${p.code}")
+        node.confirmPairing(p.peerId)
+        eventually("paired", 120_000) { node.contacts().any { it.inboxId == otherInbox } }
+        mark("paired")
     }
 
     @Test
@@ -83,11 +103,13 @@ class MeshTwoDeviceTest {
             val otherInbox = peer.otherInbox
             val mesh = peer.mesh
             val node = openMeshNode(mesh.dbPath, mesh.encryptionKey)
-            val radio = MeshRadio(context, node, MeshIdentity.shortId(context, File(mesh.dbPath).name))
+            val radio = MeshRadio(context, node)
+            node.setAccountKey(if (role == "alpha") alphaKey.copyOf() else bravoKey.copyOf())
             node.startSync(client.ffiClientForMesh, radio)
             radio.start()
-            mark("$role radio started as ${radio.localShortIdHex}")
+            mark("$role radio started")
             try {
+                pairOverBle(node, radio, otherInbox)
                 eventually("BLE link and mesh auth", 180_000) {
                     radio.connectedPeers.value.isNotEmpty() && radio.authenticatedPeers().isNotEmpty()
                 }
@@ -145,16 +167,27 @@ class MeshTwoDeviceTest {
             val peer = peer(role, "mesh-two-device-restart")
             val seenBefore = HashSet<String>()
             try {
-                val first = Mesh.start(context, peer.client, peer.mesh)
+                val first = Mesh.start(context, peer.client, peer.mesh, peer.key.copyOf())
                 eventually("radio up (first start)", 30_000) { first.radioUp.value }
                 mark("$role first start: radio up")
+                Mesh.setPairingMode(true)
+                eventually("a pairing code", 180_000) { Mesh.pairingState()?.pending?.isNotEmpty() == true }
+                Mesh.confirmPairing(
+                    Mesh
+                        .pairingState()!!
+                        .pending
+                        .first()
+                        .peerId,
+                )
+                eventually("paired", 120_000) { Mesh.contacts()?.any { it.inboxId == peer.otherInbox } == true }
+                mark("paired through Mesh")
                 delay(5_000)
                 seenBefore += first.verifiedPeers.value.keys
                 Mesh.stop(context)
                 eventually("radio down after stop", 30_000) { !first.radioUp.value }
                 mark("stopped (peers seen before restart: $seenBefore)")
 
-                val second = Mesh.start(context, peer.client, peer.mesh)
+                val second = Mesh.start(context, peer.client, peer.mesh, peer.key.copyOf())
                 assertNotSame(first, second)
                 eventually("radio up (second start)", 30_000) { second.radioUp.value }
                 mark("second start: radio up")

@@ -57,7 +57,7 @@ class ReliableLinkTest {
         init {
             a =
                 ReliableLink(
-                    config = LinkConfig(idA, maxPacket, window = window),
+                    config = LinkConfig(maxPacket, window = window),
                     isCentral = true,
                     scheduler = scheduler,
                     write = { bytes ->
@@ -69,7 +69,7 @@ class ReliableLinkTest {
                 )
             b =
                 ReliableLink(
-                    config = LinkConfig(idB, maxPacket, window = window),
+                    config = LinkConfig(maxPacket, window = window),
                     isCentral = false,
                     scheduler = scheduler,
                     write = { bytes ->
@@ -94,7 +94,7 @@ class ReliableLinkTest {
     ): Triple<ReliableLink, Recorder, MutableList<ByteArray>> {
         val rec = Recorder()
         val written = mutableListOf<ByteArray>()
-        val config = LinkConfig(idB, 20, maxQueuedBytes = maxQueuedBytes)
+        val config = LinkConfig(20, maxQueuedBytes = maxQueuedBytes)
         val link = ReliableLink(config, isCentral, FakeScheduler(), { written += it }, rec)
         link.start()
         return Triple(link, rec, written)
@@ -134,7 +134,7 @@ class ReliableLinkTest {
 
     @Test
     fun close_inside_hello_write_does_not_resurrect_link() {
-        val r = Reentrant(isCentral = false, closeOnCall = 1, config = LinkConfig(idB, 20))
+        val r = Reentrant(isCentral = false, closeOnCall = 1, config = LinkConfig(20))
         r.link.start()
         r.link.onPacket(helloFromA)
         assertEquals(null, r.rec.ready)
@@ -143,7 +143,7 @@ class ReliableLinkTest {
 
     @Test
     fun close_inside_ack_write_does_not_deliver_frame() {
-        val r = Reentrant(isCentral = false, closeOnCall = 2, config = LinkConfig(idB, 20))
+        val r = Reentrant(isCentral = false, closeOnCall = 2, config = LinkConfig(20))
         r.link.start()
         r.link.onPacket(helloFromA)
         r.link.onPacket(LinkPacket.Data(0, 0, 1, byteArrayOf(1)).encode())
@@ -153,7 +153,7 @@ class ReliableLinkTest {
 
     @Test
     fun close_inside_chunk_write_stops_pump() {
-        val r = Reentrant(isCentral = true, closeOnCall = 3, config = LinkConfig(idA, 20))
+        val r = Reentrant(isCentral = true, closeOnCall = 3, config = LinkConfig(20))
         r.link.start()
         r.link.onPacket(LinkPacket.Hello(LinkPacket.LINK_VERSION, idB, 0, 4).encode())
         assertTrue(r.link.send(Random(7).nextBytes(100))) // 8 chunks, window 4
@@ -162,7 +162,7 @@ class ReliableLinkTest {
 
     @Test
     fun close_inside_retransmit_write_stops_timers() {
-        val r = Reentrant(isCentral = true, closeOnCall = 3, config = LinkConfig(idA, 20))
+        val r = Reentrant(isCentral = true, closeOnCall = 3, config = LinkConfig(20))
         r.link.start()
         r.link.onPacket(LinkPacket.Hello(LinkPacket.LINK_VERSION, idB, 0, 4).encode())
         assertTrue(r.link.send(ByteArray(10) { 1 })) // one chunk
@@ -186,7 +186,7 @@ class ReliableLinkTest {
     @Test
     fun queue_cap_frees_as_frames_are_sent() {
         val rec = Recorder()
-        val link = ReliableLink(LinkConfig(idA, 20, maxQueuedBytes = 100), true, FakeScheduler(), {}, rec)
+        val link = ReliableLink(LinkConfig(20, maxQueuedBytes = 100), true, FakeScheduler(), {}, rec)
         link.start()
         link.onPacket(LinkPacket.Hello(LinkPacket.LINK_VERSION, idB, 0, 4).encode())
         assertTrue(link.send(ByteArray(60) { 1 })) // msg 0 goes straight into flight (5 chunks)
@@ -216,11 +216,16 @@ class ReliableLinkTest {
     }
 
     @Test
-    fun handshake_reports_remote_short_id_on_both_sides() {
+    fun handshake_completes_and_no_hello_carries_a_token() {
         val p = LinkPair()
         p.start()
-        assertArrayEquals(idB, p.recA.ready!!.shortId)
-        assertArrayEquals(idA, p.recB.ready!!.shortId)
+        val zero = ByteArray(LinkPacket.TOKEN_BYTES)
+        // DESIGN.md §B14.2: the link Hello's token field is 8 zero bytes both ways.
+        assertArrayEquals(zero, p.recA.ready!!.token)
+        assertArrayEquals(zero, p.recB.ready!!.token)
+        val hellos = (p.sentByA + p.sentByB).filterIsInstance<LinkPacket.Hello>()
+        assertEquals(2, hellos.size)
+        hellos.forEach { assertArrayEquals(zero, it.token) }
         assertEquals(ReliableLink.State.READY, p.a.state)
         assertEquals(ReliableLink.State.READY, p.b.state)
     }
@@ -362,9 +367,18 @@ class ReliableLinkTest {
     @Test
     fun unknown_link_version_closes_with_bye() {
         val (link, rec, written) = lone(isCentral = false)
-        link.onPacket(LinkPacket.Hello(2, idA, 0, 4).encode())
-        assertEquals(listOf("link version 2"), rec.closed)
+        link.onPacket(LinkPacket.Hello(3, idA, 0, 4).encode())
+        assertEquals(listOf("link version 3"), rec.closed)
         assertTrue(LinkPacket.decode(written.single()) is LinkPacket.Bye)
+    }
+
+    /** A mesh.10 phone speaks link version 1: the link closes at once (DESIGN.md D36). */
+    @Test
+    fun aVersion1HelloFromAnOlderBuildClosesTheLink() {
+        val (link, rec, _) = lone(isCentral = false)
+        link.onPacket(LinkPacket.Hello(1, idA, 0, 4).encode())
+        assertEquals(listOf("link version 1"), rec.closed)
+        assertEquals(ReliableLink.State.CLOSED, link.state)
     }
 
     @Test
@@ -446,5 +460,22 @@ class ReliableLinkTest {
         assertEquals(before, written.size)
         assertTrue(rec.closed.isEmpty())
         assertEquals(ReliableLink.State.READY, link.state)
+    }
+
+    /**
+     * The accepting side is ready (and reports Accept to the node) before the dialer can send
+     * a frame (xmtp_mesh MeshTransport contract).
+     */
+    @Test
+    fun thePeripheralIsReadyBeforeTheCentralSendsAFrame() {
+        val p = LinkPair()
+        p.a.send(byteArrayOf(1, 2, 3))
+        p.b.start()
+        p.a.start()
+        var steps = 0
+        while (p.recB.ready == null && steps++ < 1_000) p.scheduler.advanceBy(1)
+        assertTrue("the peripheral became ready", p.recB.ready != null)
+        assertEquals(null, p.recA.ready)
+        assertTrue(p.sentByA.none { it is LinkPacket.Data })
     }
 }

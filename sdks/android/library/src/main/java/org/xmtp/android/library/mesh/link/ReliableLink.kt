@@ -1,7 +1,6 @@
 package org.xmtp.android.library.mesh.link
 
 class LinkConfig(
-    val localShortId: ByteArray,
     val maxPacketBytes: Int,
     val window: Int = 4,
     val ackTimeoutMs: Long = 1_500,
@@ -30,7 +29,6 @@ class LinkConfig(
     val livenessTimeoutMs: Long = 24_000,
 ) {
     init {
-        require(localShortId.size == LinkPacket.SHORT_ID_BYTES) { "short id must be 8 bytes" }
         require(maxPacketBytes >= LinkLimits.MIN_ATT_PAYLOAD) { "packet size below ATT minimum" }
         require(window in 1..MAX_WINDOW) { "window must be 1..$MAX_WINDOW" }
         require(maxQueuedBytes > 0) { "maxQueuedBytes must be positive" }
@@ -180,7 +178,11 @@ class ReliableLink(
 
     private fun sendHello() {
         val flags = if (config.codedHint) LinkPacket.FLAG_CODED_HINT else 0
-        write(LinkPacket.Hello(LinkPacket.LINK_VERSION, config.localShortId, flags, config.window).encode())
+        // The token field stays zero (DESIGN.md §B14.2): the central connects from the adapter's own
+        // address, so a token here would tie that address to its adverts across windows.
+        write(
+            LinkPacket.Hello(LinkPacket.LINK_VERSION, ByteArray(LinkPacket.TOKEN_BYTES), flags, config.window).encode(),
+        )
     }
 
     private fun onHello(hello: LinkPacket.Hello) {
