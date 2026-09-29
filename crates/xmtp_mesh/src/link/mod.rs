@@ -335,6 +335,23 @@ pub(crate) struct PairingEntry {
     pub(crate) peer_confirmed: bool,
 }
 
+/// Most pairing refusals remembered; older ones are dropped.
+pub const MAX_PAIRING_REFUSALS: usize = 8;
+
+/// A confirmed pairing whose card was refused because its static key is on
+/// file for another contact (§B14.4). The app names that contact and offers
+/// to forget it. Either side may be the honest one (the contact on file, or
+/// the phone just paired): the app asks the user which person they trust and
+/// never assumes the stored contact is the impostor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairingRefusal {
+    pub peer: PeerId,
+    /// The code the people compared (empty if the pairing already ended).
+    pub code: String,
+    /// The contact, live or removed, that holds the key.
+    pub conflicting_inbox_id: String,
+}
+
 /// The node's link state (§B14). Keys live in memory only and are zeroized
 /// on drop. Lock order: `prk`, then the store, then `keys`, then
 /// `dialers`.
@@ -360,6 +377,8 @@ pub(crate) struct LinkState {
     pub(crate) pairings: Mutex<HashMap<PeerId, PairingEntry>>,
     /// Unfinished pairings since pairing mode was last turned on.
     pub(crate) pairing_failures: AtomicU32,
+    /// Refused pairings since pairing mode was last turned on.
+    pub(crate) pairing_refusals: Mutex<Vec<PairingRefusal>>,
     /// Test only: the static key this phone's own card claims.
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) card_static_for_test: Mutex<Option<[u8; 32]>>,

@@ -16,7 +16,9 @@ use crate::link::{
     FLAG_RELAY, LinkCounters, LinkKeyInfo, RESTORE_WINDOW_SECS, Token, WINDOW_SECS, advert_token,
     parse_service_data, restore_window_open, service_data, window_at,
 };
-use crate::link::{MAX_UNFINISHED_PAIRINGS, PairingEntry, PendingPairing};
+use crate::link::{
+    MAX_PAIRING_REFUSALS, MAX_UNFINISHED_PAIRINGS, PairingEntry, PairingRefusal, PendingPairing,
+};
 use crate::store::{Contact, ContactUpdate, RestoreWindow};
 use crate::sync::MeshTransport;
 use crate::sync::frames::ContactCard;
@@ -75,6 +77,22 @@ impl MeshNode {
         Ok(info)
     }
 
+    /// [`Self::set_account_key`] for a caller handing over its own copy of
+    /// the key (the FFI): that copy is wiped when this returns. Copies made
+    /// on the way in (uniffi's transfer buffer, which is freed without
+    /// zeroing) are not.
+    pub fn set_account_key_owned(&self, account_secret: Vec<u8>) -> Result<LinkKeyInfo, MeshError> {
+        let secret = Zeroizing::new(account_secret);
+        self.set_account_key(&secret)
+    }
+
+    /// Moves whenever the advert or the token map would change: contacts,
+    /// keys, pairing mode, the relay switch (§B14.2). Cheap; the radio polls
+    /// it and re-reads `advert_state` when it moves.
+    pub fn contacts_version(&self) -> u64 {
+        self.inner.link.contacts_version()
+    }
+
     pub fn has_account_key(&self) -> bool {
         self.inner.link.keys.lock().is_some()
     }
@@ -93,8 +111,9 @@ impl MeshNode {
 
     /// Start advertising under a new discovery key (§B14.4): contacts that
     /// have not received the new card stop recognising this phone, which
-    /// still recognises them and sends the card on its next contact link.
-    /// The new key mixes in fresh randomness, stored on this phone
+    /// still recognises them. The new card goes at once on every open
+    /// contact link and finished pairing link, and otherwise on the next
+    /// contact link. The new key mixes in fresh randomness, stored on this phone
     /// (§B14.1), so no reset ever repeats a key an ex-contact held, even
     /// after a restore.
     pub fn reset_discovery_key(&self) -> Result<u32, MeshError> {
@@ -121,6 +140,7 @@ impl MeshNode {
         )?));
         self.inner.link.counters.count_discovery_reset();
         self.inner.link.bump_contacts_version();
+        self.emit(vec![super::NodeEvent::OwnCardChanged]);
         Ok(generation)
     }
 
@@ -138,6 +158,7 @@ impl MeshNode {
     /// people have not both confirmed.
     pub fn set_pairing_mode(&self, on: bool) {
         if on {
+            self.inner.link.pairing_refusals.lock().clear();
             self.inner.link.pairing_failures.store(0, Ordering::Relaxed);
             self.inner.link.pairing_mode.store(true, Ordering::Relaxed);
             self.inner.link.bump_contacts_version();
@@ -280,9 +301,9 @@ impl MeshNode {
     }
 
     /// Stop recognising and accepting `inbox_id` (§B14.4), and close its
-    /// open contact links. Its static key stays on file, so an IK link from
-    /// it is refused. Follow with `reset_discovery_key` so it can no longer
-    /// recognise this phone.
+    /// open contact links (and a finished pairing link still open). Its
+    /// static key stays on file, so an IK link from it is refused. Follow
+    /// with `reset_discovery_key` so it can no longer recognise this phone.
     pub fn remove_contact(&self, inbox_id: &str) -> Result<bool, MeshError> {
         let removed = {
             let mut store = self.inner.store.lock();
@@ -301,6 +322,78 @@ impl MeshNode {
             }
         }
         Ok(removed)
+    }
+
+    /// Remove `inbox_id` if it is live (closing its links) and drop its row
+    /// and tombstone, so its static key is free again (§B14.4): the way out
+    /// when a pairing partner claimed a key that belongs to someone else. A
+    /// forgotten contact is a stranger; a confirmed pairing, or a restore
+    /// window, can add it back. Follow with `reset_discovery_key`, as for
+    /// [`Self::remove_contact`], so it can no longer recognise this phone.
+    /// Returns whether a row was dropped.
+    pub fn forget_contact(&self, inbox_id: &str) -> Result<bool, MeshError> {
+        // One critical section: no card for `inbox_id` can be stored between
+        // the removal and the delete.
+        let (changed, result) = {
+            let mut store = self.inner.store.lock();
+            let removed = store.remove_contact(inbox_id, Self::now_ns());
+            let forgotten = match removed {
+                Ok(_) => store.forget_contact(inbox_id),
+                Err(_) => Ok(false),
+            };
+            let changed = matches!(removed, Ok(true)) || matches!(forgotten, Ok(true));
+            if changed {
+                self.refresh_allowed_dialers(&mut store);
+                self.inner.link.bump_contacts_version();
+            }
+            (changed, removed.and(forgotten))
+        };
+        if changed {
+            // Also closes a contact link that opened while the row existed.
+            for handle in self.inner.sessions.lock().values() {
+                let _ = handle
+                    .tx
+                    .send(Inbound::ContactRemoved(inbox_id.to_string()));
+            }
+        }
+        result
+    }
+
+    /// Pairings refused since pairing mode was last turned on, oldest
+    /// first (§B14.4).
+    pub fn pairing_refusals(&self) -> Vec<PairingRefusal> {
+        self.inner.link.pairing_refusals.lock().clone()
+    }
+
+    /// A confirmed pairing's card claimed `claimed_static`, which is on file
+    /// for another contact: remember which, for the app.
+    pub(crate) fn note_pairing_refused(&self, peer: &str, session_id: u64, claimed_static: &[u8]) {
+        let owner = match self.inner.store.lock().contact_by_static(claimed_static) {
+            Ok(Some(c)) => c.inbox_id,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "pairing refusal: owner lookup failed");
+                return;
+            }
+        };
+        let code = self
+            .inner
+            .link
+            .pairings
+            .lock()
+            .get(peer)
+            .filter(|e| e.session_id == session_id)
+            .map(|e| e.code.clone())
+            .unwrap_or_default();
+        let mut refusals = self.inner.link.pairing_refusals.lock();
+        if refusals.len() >= MAX_PAIRING_REFUSALS {
+            refusals.remove(0);
+        }
+        refusals.push(PairingRefusal {
+            peer: peer.to_string(),
+            code,
+            conflicting_inbox_id: owner,
+        });
     }
 
     /// Re-read which IK dialers get a contact link (§B14.2, §B14.7) after

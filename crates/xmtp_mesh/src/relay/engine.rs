@@ -1000,6 +1000,7 @@ impl MeshNode {
         }
         let old = self.inner.relay.lock().replace(engine.clone());
         drop(old);
+        self.inner.link.bump_contacts_version(); // the advert's relay flag (§B14.2)
         runtime.spawn(RelayEngine::run(Arc::downgrade(&engine), events, stop_rx));
         let live: Vec<(String, (Vec<u8>, String))> = self
             .inner
@@ -1024,7 +1025,11 @@ impl MeshNode {
     /// `disable_relay` for a caller already holding `sync_lifecycle`.
     pub(crate) fn disable_relay_locked(&self) {
         let old = self.inner.relay.lock().take();
+        let was_on = old.is_some();
         drop(old); // dropping `_stop` ends the engine task
+        if was_on {
+            self.inner.link.bump_contacts_version(); // the advert's relay flag (§B14.2)
+        }
         self.close_relay_only_links();
     }
 

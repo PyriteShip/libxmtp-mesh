@@ -1048,6 +1048,84 @@ async fn a_reset_reaches_contacts_on_the_next_contact_link() {
     assert_eq!(b.node.mesh_stats().discovery_resets, 1);
 }
 
+/// `p` holds `q`'s card at `generation`, and recognises `q`'s current
+/// advert as a contact's.
+async fn holds_generation(p: &TestPeer, q: &TestPeer, generation: u32) {
+    eventually("the peer holds the new card", || async {
+        p.node
+            .contact(&inbox(q))
+            .unwrap()
+            .is_some_and(|c| c.generation == generation)
+    })
+    .await;
+    let now = p.node.unix_now();
+    let token = q.node.own_advert_token(now).unwrap();
+    assert!(matches!(
+        p.node
+            .classify_advert(&service_data(0, &token), now)
+            .unwrap(),
+        AdvertMatch::Contact { .. }
+    ));
+}
+
+/// §B14.4 reset with a contact link open: the new card goes on that link
+/// at once; the peer does not wait for a reconnect.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_reaches_a_contact_on_an_open_link_at_once() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    hub.link("a", "b");
+    verified_pair(&a, &b).await;
+    assert_eq!(a.node.link_kind("b"), Some(LinkKind::Contact));
+    assert_eq!(b.node.reset_discovery_key().unwrap(), 1);
+    holds_generation(&a, &b, 1).await;
+    assert!(hub.is_linked("a", "b"), "the link stays up");
+}
+
+/// §B14.4 reset with a finished pairing link still open: the new card goes
+/// on it, and the peer stores it like a contact card.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reset_reaches_the_partner_on_a_finished_pairing_link() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    open_pairing(&hub, &a, &b).await;
+    confirm_both(&a, &b).await;
+    verified_pair(&a, &b).await;
+    assert_eq!(a.node.link_kind("b"), Some(LinkKind::Pairing));
+    assert_eq!(b.node.reset_discovery_key().unwrap(), 1);
+    holds_generation(&a, &b, 1).await;
+    assert!(hub.is_linked("a", "b"), "the pairing link stays up");
+    // A second reset moves it again: the pairing link keeps taking cards.
+    assert_eq!(b.node.reset_discovery_key().unwrap(), 2);
+    holds_generation(&a, &b, 2).await;
+}
+
+/// Both phones reset while linked: each hands the other its new card on
+/// the open link, so they still recognise each other afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn both_phones_reset_while_linked_and_still_recognise_each_other() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    hub.link("a", "b");
+    verified_pair(&a, &b).await;
+    assert_eq!(a.node.reset_discovery_key().unwrap(), 1);
+    assert_eq!(b.node.reset_discovery_key().unwrap(), 1);
+    holds_generation(&a, &b, 1).await;
+    holds_generation(&b, &a, 1).await;
+    hub.unlink("a", "b");
+    hub.link_as(
+        "a",
+        "b",
+        DialIntent::Contact {
+            inbox_id: inbox(&b),
+        },
+    );
+    verified_pair(&a, &b).await;
+}
+
 /// A phone that re-derived generation 0 (restored after a reset) sends an
 /// older card; the contact keeps the newer one and the link stays up.
 #[tokio::test(flavor = "multi_thread")]
@@ -1704,6 +1782,158 @@ async fn a_pairing_card_claiming_another_contacts_static_is_refused() {
     }
 }
 
+/// A pairing partner that put a key not yet on file in its card blocks the
+/// key's real owner: that later pairing is refused, naming the contact that
+/// holds the key; forgetting that contact frees the key (§B14.4).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_pairing_names_the_contact_holding_the_key_and_forget_frees_it() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let c = peer(&hub, "c").await;
+    let m = peer(&hub, "m").await;
+    let c_static: [u8; 32] = c
+        .node
+        .own_contact_card_for_test()
+        .unwrap()
+        .noise_static_pub
+        .try_into()
+        .unwrap();
+    m.node.set_card_static_for_test(Some(c_static));
+    open_pairing(&hub, &m, &a).await;
+    confirm_both(&m, &a).await;
+
+    let (_, pa) = open_pairing(&hub, &c, &a).await;
+    c.node.confirm_pairing("a").unwrap();
+    a.node.confirm_pairing("c").unwrap();
+    eventually("a refuses c's card and closes", || async {
+        !hub.is_linked("c", "a")
+    })
+    .await;
+    let refusals = a.node.pairing_refusals();
+    assert_eq!(refusals.len(), 1);
+    assert_eq!(refusals[0].peer, "c");
+    assert_eq!(refusals[0].code, pa.code);
+    assert_eq!(refusals[0].conflicting_inbox_id, inbox(&m));
+
+    assert!(a.node.forget_contact(&inbox(&m)).unwrap());
+    assert!(a.node.contact(&inbox(&m)).unwrap().is_none());
+    open_pairing(&hub, &c, &a).await;
+    assert!(
+        a.node.pairing_refusals().is_empty(),
+        "entering pairing mode clears old refusals"
+    );
+    confirm_both(&c, &a).await;
+}
+
+/// The radio re-reads its advert when the contacts version moves; a forget
+/// moves it too (§B14.2).
+#[tokio::test(flavor = "multi_thread")]
+async fn forget_moves_the_contacts_version() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    hub.make_contacts("a", "b");
+    let v = a.node.contacts_version();
+    assert!(a.node.forget_contact(&inbox(&b)).unwrap());
+    assert!(a.node.contacts_version() > v);
+    assert!(a.node.contact(&inbox(&b)).unwrap().is_none());
+}
+
+/// Forgetting a live contact closes its open contact link at once, like a
+/// removal (§B14.4); other contacts stay linked.
+#[tokio::test(flavor = "multi_thread")]
+async fn forgetting_a_live_contact_closes_its_open_link() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    let c = peer(&hub, "c").await;
+    hub.link("a", "b");
+    hub.link("a", "c");
+    verified_pair(&a, &b).await;
+    verified_pair(&a, &c).await;
+    assert!(a.node.forget_contact(&inbox(&b)).unwrap());
+    eventually("a closes b's link", || async { !hub.is_linked("a", "b") }).await;
+    assert!(hub.is_linked("a", "c"), "other contacts stay linked");
+    assert!(a.node.contact(&inbox(&b)).unwrap().is_none());
+}
+
+/// Removing or forgetting a contact also closes a pairing link to it that
+/// is still open after the pairing (§B14.4): closed, not counted as a
+/// failure; the other side's link to an unrelated contact stays up.
+async fn a_pairing_link_still_open_closes_on(forget: bool) {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let b = peer(&hub, "b").await;
+    let c = peer(&hub, "c").await;
+    hub.link("a", "c");
+    verified_pair(&a, &c).await;
+    open_pairing(&hub, &a, &b).await;
+    confirm_both(&a, &b).await;
+    eventually("the pairing link verified b", || async {
+        a.node
+            .verified_peers()
+            .iter()
+            .any(|p| p.installation == b.installation())
+    })
+    .await;
+    assert!(hub.is_linked("a", "b"), "the pairing link is still open");
+    let before = a.node.mesh_stats();
+    if forget {
+        assert!(a.node.forget_contact(&inbox(&b)).unwrap());
+    } else {
+        assert!(a.node.remove_contact(&inbox(&b)).unwrap());
+    }
+    eventually("a closes the pairing link", || async {
+        !hub.is_linked("a", "b")
+    })
+    .await;
+    assert!(hub.is_linked("a", "c"), "other contacts stay linked");
+    let after = a.node.mesh_stats();
+    assert_eq!(
+        (after.handshake_failed, after.link_frame_rejected),
+        (before.handshake_failed, before.link_frame_rejected),
+        "a close, not a failure"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_contact_closes_a_pairing_link_still_open() {
+    a_pairing_link_still_open_closes_on(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn forgetting_a_contact_closes_a_pairing_link_still_open() {
+    a_pairing_link_still_open_closes_on(true).await;
+}
+
+/// A forgotten contact that still holds our static key and dials IK
+/// outside a restore window is answered as a stranger (NN), and is not
+/// added back (§B14.2, §B14.4).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forgotten_contact_dialing_ik_gets_the_stranger_answer() {
+    let hub = LoopbackHub::new();
+    let a = peer(&hub, "a").await;
+    let (b, _) = relay_peer(&hub, "b").await;
+    hub.make_contacts("a", "b");
+    assert!(b.node.forget_contact(&inbox(&a)).unwrap());
+    hub.link_as(
+        "a",
+        "b",
+        DialIntent::Contact {
+            inbox_id: inbox(&b),
+        },
+    );
+    eventually("a gives up", || async { !hub.is_linked("a", "b") }).await;
+    assert_eq!(a.node.mesh_stats().handshake_failed, 1);
+    eventually("b answered as to a stranger", || async {
+        let stats = b.node.mesh_stats();
+        (stats.links_contact, stats.links_relay) == (0, 1)
+    })
+    .await;
+    assert!(a.node.authenticated_peers().is_empty() && b.node.authenticated_peers().is_empty());
+    assert!(b.node.contact(&inbox(&a)).unwrap().is_none());
+}
+
 /// An online guesser gets few tries: after the cap of unfinished pairing
 /// handshakes the phone leaves pairing mode (counted) and refuses the next.
 #[tokio::test(flavor = "multi_thread")]
@@ -1735,28 +1965,29 @@ async fn unfinished_pairings_end_pairing_mode_at_the_cap() {
     assert_eq!(pb.peer, "a");
 }
 
-/// Once a pairing stored the peer's card, later cards on that link are
-/// ignored: one forced store per pairing.
+/// Once a pairing stored the peer's card (one forced store per pairing),
+/// later cards on that link are stored like contact cards: a newer one
+/// (after a discovery-key reset) replaces it, an older one never does.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_paired_link_stores_no_second_card() {
+async fn a_paired_link_stores_later_cards_only_when_newer() {
     let hub = LoopbackHub::new();
     let a = peer(&hub, "a").await;
     let b = peer(&hub, "b").await;
     open_pairing(&hub, &a, &b).await;
     confirm_both(&a, &b).await;
-    assert!(b.node.remove_contact(&inbox(&a)).unwrap());
-    assert!(a.node.send_frame_for_test(
-        "b",
-        Body::ContactCard(a.node.own_contact_card_for_test().unwrap())
-    ));
+    assert_eq!(b.node.contact(&inbox(&a)).unwrap().unwrap().generation, 0);
+    a.node.reset_discovery_key().unwrap();
+    holds_generation(&b, &a, 1).await;
+    a.node.set_discovery_generation_for_test(0).unwrap();
+    let older = a.node.own_contact_card_for_test().unwrap();
+    assert_eq!(older.generation, 0);
+    assert!(a.node.send_frame_for_test("b", Body::ContactCard(older)));
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(hub.is_linked("a", "b"));
-    assert!(
-        b.node
-            .contact(&inbox(&a))
-            .unwrap()
-            .is_some_and(|c| c.removed),
-        "the removal stands"
+    assert!(hub.is_linked("a", "b"), "a stale card is not an error");
+    assert_eq!(
+        b.node.contact(&inbox(&a)).unwrap().unwrap().generation,
+        1,
+        "the older card did not replace the newer one"
     );
 }
 

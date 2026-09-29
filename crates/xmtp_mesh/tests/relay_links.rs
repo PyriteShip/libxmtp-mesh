@@ -147,6 +147,31 @@ async fn disable_relay_stops_and_enable_resumes() {
     .await;
 }
 
+/// The advert's relay flag follows the relay switch, so the radio's one
+/// re-read rule (the contacts version) covers it (DESIGN.md §B14.2).
+#[tokio::test(flavor = "multi_thread")]
+async fn relay_toggles_move_the_contacts_version() {
+    let hub = LoopbackHub::new();
+    let (b, _) = relay_peer(&hub, "b").await;
+    let before = b.node.contacts_version();
+    b.node.disable_relay();
+    let off = b.node.contacts_version();
+    assert!(off > before, "disable moves it");
+    b.node
+        .enable_relay_with(
+            std::sync::Arc::new(xmtp_mesh::ClientRelayExporter(b.client.clone())),
+            fast_relay_config(),
+        )
+        .unwrap();
+    let on = b.node.contacts_version();
+    assert!(on > off, "enable moves it");
+    b.node.disable_relay();
+    let off = b.node.contacts_version();
+    assert!(off > on);
+    b.node.disable_relay();
+    assert_eq!(b.node.contacts_version(), off, "already off: no move");
+}
+
 /// §R4.5: after pairing, both hold the same confirmed relay key; a
 /// stranger gets no offer.
 #[tokio::test(flavor = "multi_thread")]

@@ -553,13 +553,23 @@ impl Session {
         }
     }
 
-    /// The user removed `inbox_id` (§B14.4): a contact link to it closes
-    /// now, like a superseded link (no failure is counted). That covers a
-    /// verified link and one still proving itself.
+    /// The user removed (or forgot) `inbox_id` (§B14.4): a contact link to
+    /// it closes now, like a superseded link (no failure is counted). That
+    /// covers a verified link and one still proving itself. A pairing link
+    /// still open after the pairing (both confirmed, the peer verified and
+    /// its card stored) closes too; a pairing still in progress is left to
+    /// the people pairing.
     fn on_contact_removed(&mut self, inbox_id: &str) {
-        let ours = self.link_kind == Some(LinkKind::Contact)
-            && (self.peer_inbox.as_deref() == Some(inbox_id)
-                || self.expected_inbox.as_deref() == Some(inbox_id));
+        let ours = match self.link_kind {
+            Some(LinkKind::Contact) => {
+                self.peer_inbox.as_deref() == Some(inbox_id)
+                    || self.expected_inbox.as_deref() == Some(inbox_id)
+            }
+            Some(LinkKind::Pairing) => {
+                self.paired && self.verified && self.peer_inbox.as_deref() == Some(inbox_id)
+            }
+            _ => false,
+        };
         if !ours || self.superseded {
             return;
         }
@@ -901,11 +911,17 @@ impl Session {
             return Ok(()); // unreachable: nothing but confirmations before that
         }
         if self.paired {
-            // One forced store per pairing: later cards on this link are
-            // ignored.
-            return Ok(());
+            // One forced store per pairing. A later card on this link (the
+            // peer reset its discovery key) is stored like a contact card:
+            // only a newer one for the same static key replaces ours.
+            return match self.node.store_contact_card_with(&card, false, false)? {
+                ContactUpdate::StaticTaken => self.refuse_taken_static(),
+                _ => Ok(()),
+            };
         }
         if self.node.store_contact_card(&card, true)? == ContactUpdate::StaticTaken {
+            self.node
+                .note_pairing_refused(&self.peer, self.id, &card.noise_static_pub);
             return self.refuse_taken_static();
         }
         self.paired = true;
@@ -1992,6 +2008,18 @@ impl Session {
                 if self.link_kind == Some(LinkKind::Contact)
                     && self.peer_inbox.as_deref() == Some(inbox_id.as_str()) =>
             {
+                self.send_own_card();
+                Ok(())
+            }
+            // Our discovery key changed (§B14.4): the peer gets the new
+            // card now, not on the next link. `send_own_card` still skips a
+            // contact the restore window added and the user has not
+            // confirmed.
+            NodeEvent::OwnCardChanged
+                if self.link_kind == Some(LinkKind::Contact)
+                    || (self.link_kind == Some(LinkKind::Pairing) && self.paired) =>
+            {
+                self.card_sent = false;
                 self.send_own_card();
                 Ok(())
             }

@@ -260,6 +260,15 @@ impl MeshStore {
         Ok(n > 0)
     }
 
+    /// Drop `inbox_id`'s row, live or removed, tombstone included. Returns
+    /// whether a row was dropped.
+    pub fn forget_contact(&mut self, inbox_id: &str) -> Result<bool, MeshError> {
+        let n = sql_query("DELETE FROM contacts WHERE inbox_id = ?")
+            .bind::<Text, _>(inbox_id)
+            .execute(&mut self.conn)?;
+        Ok(n > 0)
+    }
+
     /// The user confirmed a contact the phone added by itself during a
     /// restore window (§B14.7). Returns whether such a live contact was
     /// flagged.

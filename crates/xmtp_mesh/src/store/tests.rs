@@ -672,6 +672,25 @@ fn a_card_claiming_another_contacts_static_is_refused() {
     );
 }
 
+/// Forgetting drops a contact's row and its tombstone, so its static key can
+/// name another inbox (the way out of a key claimed first, §B14.4).
+#[test]
+fn forgetting_a_contact_frees_its_static() {
+    let mut s = MeshStore::open_in_memory().unwrap();
+    s.upsert_contact(&card("m", 1, 0), 10, false).unwrap();
+    assert!(s.remove_contact("m", 11).unwrap());
+    assert!(s.forget_contact("m").unwrap());
+    assert!(s.contact("m").unwrap().is_none());
+    let statics = s.contact_statics().unwrap();
+    assert!(statics.live.is_empty() && statics.removed.is_empty());
+    assert!(!s.forget_contact("m").unwrap(), "nothing left to forget");
+    assert_eq!(
+        s.upsert_contact(&card("c", 1, 0), 12, true).unwrap(),
+        ContactUpdate::Inserted,
+        "the key is free again"
+    );
+}
+
 #[test]
 fn malformed_contact_cards_are_refused() {
     let mut s = MeshStore::open_in_memory().unwrap();

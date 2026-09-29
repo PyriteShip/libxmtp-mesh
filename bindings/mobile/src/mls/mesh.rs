@@ -379,6 +379,28 @@ impl From<xmtp_mesh::PendingPairing> for FfiPendingPairing {
     }
 }
 
+/// A pairing refused because the other phone's key is on file for another
+/// contact (DESIGN.md §B14.4): name that contact and offer `forget_contact`.
+/// The contact on file may be the honest one and the phone just paired the
+/// impostor: ask the user which person they trust; never assume the stored
+/// contact is the impostor.
+#[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
+pub struct FfiPairingRefusal {
+    pub peer_id: String,
+    pub code: String,
+    pub conflicting_inbox_id: String,
+}
+
+impl From<xmtp_mesh::PairingRefusal> for FfiPairingRefusal {
+    fn from(r: xmtp_mesh::PairingRefusal) -> Self {
+        Self {
+            peer_id: r.peer,
+            code: r.code,
+            conflicting_inbox_id: r.conflicting_inbox_id,
+        }
+    }
+}
+
 /// Public facts about the link keys derived from the account key.
 #[derive(uniffi::Record, Clone, Debug, PartialEq, Eq)]
 pub struct FfiLinkKeyInfo {
@@ -765,11 +787,13 @@ impl FfiMeshNode {
     /// Derive the link keys (DESIGN.md §B14.1) from the account's
     /// secp256k1 private key (32 bytes, the key the recovery phrase
     /// restores). Call after registration and before `start_sync`, once per
-    /// process start. The node keeps only derived keys, in memory.
+    /// process start. The node keeps only derived keys, in memory. The
+    /// lifted copy of the key is wiped when this returns; uniffi's transfer
+    /// buffer is freed without zeroing. Wipe the caller's copy too.
     pub fn set_account_key(&self, account_key: Vec<u8>) -> Result<FfiLinkKeyInfo, FfiError> {
         let info = self
             .node
-            .set_account_key(&account_key)
+            .set_account_key_owned(account_key)
             .map_err(mesh_error)?;
         Ok(FfiLinkKeyInfo {
             noise_static_pub: info.noise_static_pub.to_vec(),
@@ -857,6 +881,30 @@ impl FfiMeshNode {
     /// too.
     pub fn remove_contact(&self, inbox_id: String) -> Result<bool, FfiError> {
         self.node.remove_contact(&inbox_id).map_err(mesh_error)
+    }
+
+    /// Remove `inbox_id` (if live) and forget it completely, tombstone
+    /// included, so its static key is free again (DESIGN.md §B14.4). Use it
+    /// when a pairing was refused because another contact holds the key.
+    /// Like `remove_contact`, offer `reset_discovery_key` right after, so
+    /// the forgotten contact stops recognising this phone too.
+    pub fn forget_contact(&self, inbox_id: String) -> Result<bool, FfiError> {
+        self.node.forget_contact(&inbox_id).map_err(mesh_error)
+    }
+
+    /// Pairings refused since pairing mode was last turned on.
+    pub fn pairing_refusals(&self) -> Vec<FfiPairingRefusal> {
+        self.node
+            .pairing_refusals()
+            .into_iter()
+            .map(Into::into)
+            .collect()
+    }
+
+    /// Moves whenever `advert_state` would change (DESIGN.md §B14.2): poll
+    /// it and re-read the advert state when it moves.
+    pub fn contacts_version(&self) -> u64 {
+        self.node.contacts_version()
     }
 
     /// The kind of `peer_id`'s open link (DESIGN.md §B14.3), or `None`
@@ -2059,6 +2107,21 @@ mod tests {
         node.end_restore_window().unwrap();
         assert_eq!(node.restore_window_until(), None);
         assert_eq!(node.mesh_stats().restore_contacts_added, 0);
+    }
+
+    /// Forget, pairing refusals and the contacts version over FFI
+    /// (DESIGN.md §B14.4).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn forget_refusals_and_the_contacts_version_over_ffi() {
+        let (client, node) = registered_mesh_client().await;
+        let v0 = node.contacts_version();
+        ready_to_pair(&client, &node);
+        assert!(
+            node.contacts_version() > v0,
+            "keys and pairing mode move it"
+        );
+        assert!(node.pairing_refusals().is_empty());
+        assert!(!node.forget_contact("nobody".into()).unwrap());
     }
 
     /// The radio's and the app's surface (DESIGN.md §B14): pair over FFI,

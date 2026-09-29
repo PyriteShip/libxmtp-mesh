@@ -225,6 +225,10 @@ pub enum NodeEvent {
     /// The user confirmed a contact this phone added by itself during a
     /// restore window (§B14.7): it may now get our contact card.
     ContactConfirmed(String),
+    /// This phone started advertising under a new discovery key (§B14.4):
+    /// its open contact links, and pairing links that finished, send the
+    /// new card at once.
+    OwnCardChanged,
 }
 
 impl MeshNode {
