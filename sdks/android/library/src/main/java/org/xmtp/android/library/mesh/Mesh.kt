@@ -1,6 +1,7 @@
 package org.xmtp.android.library.mesh
 
 import android.annotation.SuppressLint
+import android.app.Application
 import android.content.Context
 import android.util.Log
 import kotlinx.coroutines.CoroutineExceptionHandler
@@ -69,6 +70,7 @@ object Mesh {
     private var node: FfiMeshNode? = null
     private var relayClient: FfiXmtpClient? = null
     private var battery: MeshBatteryWatch? = null
+    private var repost: MeshNotificationRepost? = null
 
     // A SupervisorJob keeps one onBattery failure from cancelling the scope, but that alone
     // still lets an uncaught exception crash the process; this handler catches and logs it.
@@ -177,7 +179,13 @@ object Mesh {
                         relayClient = client.ffiClientForMesh
                         // Inside the try: if the platform refuses the foreground service, undo the start.
                         MeshForegroundService.start(app)
+                        repost =
+                            (app as? Application)
+                                ?.let { a -> MeshNotificationRepost(a) { relayScope.launch { repostNotification(a) } } }
+                                ?.also { it.register() }
                     } catch (e: Exception) {
+                        repost?.unregister()
+                        repost = null
                         battery?.stop()
                         battery = null
                         relayClient = null
@@ -213,6 +221,8 @@ object Mesh {
     suspend fun stop(context: Context) =
         lock.withLock {
             node?.stopSync() // cancels sessions and clears presence before the radio goes away
+            repost?.unregister()
+            repost = null
             battery?.stop()
             battery = null
             relayClient = null
@@ -224,6 +234,21 @@ object Mesh {
             node = null
             radio = null
             MeshForegroundService.stop(context.applicationContext)
+        }
+
+    /**
+     * Posts the foreground notification again if the user dismissed it (Android 14+), when the
+     * app comes to the front. Under the lock, so it can't restart the service after [stop].
+     */
+    private suspend fun repostNotification(app: Context) =
+        lock.withLock {
+            if (radio == null || MeshForegroundService.notificationShowing(app)) return@withLock
+            try {
+                MeshForegroundService.start(app)
+            } catch (e: IllegalStateException) {
+                // The app went to the background again before this ran (API 31+).
+                Log.w(TAG, "notification repost refused", e)
+            }
         }
 
     /**

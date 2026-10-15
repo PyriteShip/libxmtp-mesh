@@ -103,6 +103,13 @@ class MeshForegroundService : Service() {
         private const val CHANNEL_ID = "xmtp_mesh"
         private const val NOTIFICATION_ID = 0x6d657368
 
+        /** Whether the service's notification is in the shade (false once the user dismissed it). */
+        fun notificationShowing(context: Context): Boolean =
+            context
+                .getSystemService(NotificationManager::class.java)
+                .activeNotifications
+                .any { it.id == NOTIFICATION_ID }
+
         fun start(context: Context) {
             send(context, Intent(context, MeshForegroundService::class.java))
         }
