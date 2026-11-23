@@ -727,14 +727,14 @@ pub struct JsonSchema {
     pub multiple_of: f64,
     /// Maximum represents an inclusive upper limit for a numeric instance. The
     /// value of MUST be a number,
-    #[prost(double, tag = "11")]
-    pub maximum: f64,
+    #[prost(double, optional, tag = "11")]
+    pub maximum: ::core::option::Option<f64>,
     #[prost(bool, tag = "12")]
     pub exclusive_maximum: bool,
     /// minimum represents an inclusive lower limit for a numeric instance. The
     /// value of MUST be a number,
-    #[prost(double, tag = "13")]
-    pub minimum: f64,
+    #[prost(double, optional, tag = "13")]
+    pub minimum: ::core::option::Option<f64>,
     #[prost(bool, tag = "14")]
     pub exclusive_minimum: bool,
     #[prost(uint64, tag = "15")]

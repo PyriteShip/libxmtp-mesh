@@ -24,7 +24,9 @@ hex.workspace = true
 hkdf = { workspace = true }
 hmac = "0.12.1"
 http = "1.2"
-libsqlite3-sys = { version = "0.35", features = ["bundled-sqlcipher-vendored-openssl"] }
+libsqlite3-sys = { version = "0.35", features = [
+  "bundled-sqlcipher-vendored-openssl",
+] }
 openmls = { workspace = true }
 openmls_rust_crypto = { workspace = true }
 parking_lot.workspace = true
@@ -33,7 +35,12 @@ rand = { workspace = true }
 sha2.workspace = true
 # Noise links (DESIGN.md §B14). No `std`/default features: snow's `std`
 # feature pulls in its optional `ring` and `blake2` dependencies.
-snow = { version = "=0.10.0", default-features = false, features = ["use-chacha20poly1305", "use-sha2", "use-curve25519", "use-getrandom"] }
+snow = { version = "=0.10.0", default-features = false, features = [
+  "use-chacha20poly1305",
+  "use-sha2",
+  "use-curve25519",
+  "use-getrandom",
+] }
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros", "time"] }
 tonic = { workspace = true }
@@ -54,13 +61,18 @@ libc = "0.2"
 
 [dev-dependencies]
 # The integration tests use the crate's test-only hooks.
-xmtp_mesh = { path = ".", features = ["test-utils"] }
-tokio = { workspace = true, features = ["sync", "rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = [
+  "sync",
+  "rt-multi-thread",
+  "macros",
+  "time",
+] }
 xmtp_api_d14n = { workspace = true }
 xmtp_common = { workspace = true, features = ["test-utils"] }
 xmtp_cryptography.workspace = true
 xmtp_db = { workspace = true }
 xmtp_id = { workspace = true, features = ["test-utils"] }
+xmtp_mesh = { path = ".", features = ["test-utils"] }
 xmtp_mls = { workspace = true, features = ["test-utils"] }
 
 [[test]]
